@@ -124,8 +124,10 @@ bundled (launcher switch) and drawn once even when a system MangoHud or Steam's 
 
 ## Useful variables
 
-`BB_GAMEPAD` (controller for port 1), `BB_NEO=1` (PS4 Pro mode), `BB_FPS=30|60` (virtual
-vblank; the 60 FPS patch sets 480 Hz by itself), `BB_FRAME_STATS=1` (frame statistics in the
+`BB_GAMEPAD` (controller for port 1), `BB_NEO=1` (PS4 Pro mode), `BB_FPS=30|60|uncap` (virtual
+vblank; the 60 FPS patch sets 480 Hz and a 60 FPS limit by itself: the patch removes the game's
+cap altogether, and above 60 FPS its physics misbehave, slopes bleed speed and karts stick on
+ledges; `BB_FPS=uncap` or `BB_FPS_LIMIT=0` lifts the limit, `BB_FPS_LIMIT=<n>` sets another), `BB_FRAME_STATS=1` (frame statistics in the
 log, including VRAM, GTT and RSS), `BB_CLEAR_SHADER_CACHE=1`, `BB_VK_VALIDATION=1` (validation
 layer), `BB_FULLSCREEN=1`, `BB_PRESENT_MODE`, `BB_TIMEOUT=N` (stop after N seconds with thread
 stacks; 0 = never), `BB_GAME_DIR`, `BB_USER_DIR`, `BB_DATA_DIR`, `BB_CONFIG`, `BB_PATCHES_DIR`,

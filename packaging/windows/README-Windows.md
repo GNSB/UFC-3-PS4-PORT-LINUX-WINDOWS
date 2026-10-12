@@ -67,7 +67,9 @@ SDL3 gamepads (XInput, DualShock, DualSense, Switch Pro); the keyboard works bes
 (WASD left stick, arrows right stick, Space Cross, LShift Circle, E Square, Q Triangle, 1/3
 L1/R1, R/F L2/R2, Enter Options). The in-game menu (Insert, or L3+R3) switches the 60 FPS and
 motion blur patches, assigns controller ports for split screen and the FPS counter; patches
-apply after a restart.
+apply after a restart. The 60 FPS patch runs capped at 60: it removes the game's own cap
+altogether, and above 60 FPS the game's physics misbehave (slopes bleed speed, karts stick on
+ledges). `BB_FPS=uncap` or `BB_FPS_LIMIT=0` lifts the cap, `BB_FPS_LIMIT=<n>` sets another.
 
 ## Logs and problems
 

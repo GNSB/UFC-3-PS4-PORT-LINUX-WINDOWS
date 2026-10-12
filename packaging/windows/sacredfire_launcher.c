@@ -352,9 +352,16 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     if (!env_or(L"BB_GPU_WRITE_TWINS_MAX", NULL)) SetEnvironmentVariableW(L"BB_GPU_WRITE_TWINS_MAX", L"65536");
     SetEnvironmentVariableW(L"BB_UFFD", L"0");            /* Linux only */
     SetEnvironmentVariableW(L"BB_GUEST_IN_PLACE", L"0");  /* dma-buf memory model: Linux only */
-    if (!env_or(L"BB_VBLANK_HZ", NULL)) {
+    {
         const wchar_t *fps = env_or(L"BB_FPS", L"30");
-        SetEnvironmentVariableW(L"BB_VBLANK_HZ", ini_flag("patch_60fps") ? L"480" : !wcscmp(fps, L"uncap") ? L"480" : !wcscmp(fps, L"90") ? L"90" : L"60");
+        const int sixty = ini_flag("patch_60fps");
+        if (!env_or(L"BB_VBLANK_HZ", NULL))
+            SetEnvironmentVariableW(L"BB_VBLANK_HZ", sixty ? L"480" : !wcscmp(fps, L"uncap") ? L"480" : !wcscmp(fps, L"90") ? L"90" : L"60");
+        /* The 60 FPS patch removes the game's cap altogether; above 60 FPS its physics misbehave
+         * (slopes bleed speed, karts stick on ledges), so the present thread caps at 60 unless
+         * BB_FPS=uncap or BB_FPS_LIMIT (0: none) says otherwise. */
+        if (sixty && !env_or(L"BB_FPS_LIMIT", NULL)) SetEnvironmentVariableW(L"BB_FPS_LIMIT", !wcscmp(fps, L"uncap") ? L"0" : L"60");
+        if (sixty) logw(L"60 FPS patch on: frame limit %ls FPS (BB_FPS=uncap or BB_FPS_LIMIT=0 for none)\n", env_or(L"BB_FPS_LIMIT", L"60"));
     }
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
         wchar_t cache[PATHW]; join(cache, PATHW, env_or(L"BB_USER_DIR", user_dir), L"cache\\CUSA13795");

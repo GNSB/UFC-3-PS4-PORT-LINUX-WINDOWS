@@ -93,9 +93,13 @@ fi
 # With the 60 FPS patch the game's own limiter paces frames; a 60 Hz virtual vblank would
 # quantize a slightly late frame to 30 FPS (measured: 40-44 FPS alternating 16.7/33 ms).
 # A 480 Hz vblank lets frames flip as they come (menus 60 FPS instead of 50).
+# The patch removes the game's 30 FPS cap altogether, and above 60 FPS its physics misbehave
+# (a report: slopes bleed speed, karts stick on ledges at 120+ FPS), so the present thread caps
+# at 60 (BB_FPS_LIMIT) unless BB_FPS=uncap or BB_FPS_LIMIT says otherwise (0: no limit).
 if [[ -f $BB_CONFIG ]] && grep -qx 'patch_60fps=1' "$BB_CONFIG"; then
     export BB_VBLANK_HZ=${BB_VBLANK_HZ:-480}
-    echo "60 FPS patch on: virtual vblank ${BB_VBLANK_HZ} Hz"
+    if [[ $fps == uncap ]]; then export BB_FPS_LIMIT=${BB_FPS_LIMIT:-0}; else export BB_FPS_LIMIT=${BB_FPS_LIMIT:-60}; fi
+    echo "60 FPS patch on: virtual vblank ${BB_VBLANK_HZ} Hz, frame limit ${BB_FPS_LIMIT} FPS (0: none; BB_FPS=uncap)"
 fi
 # Background upload of the game's GPU memory into VRAM ahead of use (BufferCache::Preupload):
 # 1 = only memory already in VRAM that the game rewrote (no new VRAM), 2 = all of it (~3 GB more
