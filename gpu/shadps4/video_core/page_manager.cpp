@@ -16,18 +16,26 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#ifndef _WIN32
 #include <sys/uio.h>
+#endif
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <string>
 #include <fmt/format.h>
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 #include "core/signals.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include "common/adaptive_mutex.h"
 #else
 #include <windows.h>
@@ -45,7 +53,9 @@
 #include <mutex>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#ifndef _WIN32
 #include <sys/syscall.h>
+#endif
 #else
 #include "common/spin_lock.h"
 #endif
@@ -101,15 +111,14 @@ struct ImageFaultSite {
 std::array<ImageFaultSite, 256> image_fault_sites;
 
 void NoteFaultSite(void* context, VAddr address) {
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
     current_fault_rip = 0;
-    const u64 rip = u64(g[REG_RIP]);
+    const u64 rip = Common::GetFaultRegister(context, Common::FaultRegister::Rip);
     const bool guest_code = rip >= GuestImage && rip < GuestImageEnd;
     u64 caller = 0;
     if (guest_code) {
         // The caller: [rbp + 8] when the guest code keeps frames (its memcpy-like leaves do not).
         u64 saved[2] = {};
-        iovec local{saved, sizeof(saved)}, remote{reinterpret_cast<void*>(g[REG_RBP]), sizeof(saved)};
+        iovec local{saved, sizeof(saved)}, remote{reinterpret_cast<void*>(Common::GetFaultRegister(context, Common::FaultRegister::Rbp)), sizeof(saved)};
         if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(sizeof(saved)) &&
             saved[1] >= GuestImage && saved[1] < GuestImageEnd) {
             caller = saved[1];
@@ -119,7 +128,7 @@ void NoteFaultSite(void* context, VAddr address) {
         // address on the stack is its guest caller.
         std::array<u64, 64> stack{};
         iovec local{stack.data(), sizeof(stack)},
-            remote{reinterpret_cast<void*>(g[REG_RSP]), sizeof(stack)};
+            remote{reinterpret_cast<void*>(Common::GetFaultRegister(context, Common::FaultRegister::Rsp)), sizeof(stack)};
         const ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
         for (ssize_t i = 0; i < got / 8; ++i) {
             if (stack[i] >= GuestImage && stack[i] < GuestImageEnd) {
@@ -296,7 +305,7 @@ struct PageManager::Impl {
             BbStats::Timer timer{BbStats::t_write_faults};
             const bool handled = rasterizer->OnWriteFault(
                 addr, is_gpu_thread,
-                u64(static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]));
+                Common::GetFaultRegister(context, Common::FaultRegister::Rip));
             current_fault_rip = 0;
             return handled;
         } else {

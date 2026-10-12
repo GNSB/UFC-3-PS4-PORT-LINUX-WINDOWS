@@ -10,7 +10,9 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 namespace BbGnmHooks {

@@ -145,6 +145,17 @@ with the desktop apps closed.
   `dist/SacredFire-x86_64.AppImage`, programs `sacredfire` (launcher) and `sacredfire-game`.
   Repository: https://github.com/T3CHNOLOG1C/SacredFire.
 
+## Windows port (2026-10-11, in progress)
+
+A native Windows x86-64 build is cross-compiled from Linux with llvm-mingw 20261006
+(`scripts/build-windows.sh`, `scripts/package-windows.sh`); host services moved behind
+`src/platform/platform.h` with a Linux and a Windows implementation; the GPU library is static on
+Windows and linked into `sacredfire-game.exe`; `SacredFire.exe` (C) replaces run.sh and runs the
+preparation scripts with the bundled Python embeddable package. Design and decisions:
+13-windows-port.md; gates and evidence: 13-windows-port-report.md. The ABI, TLS, memory and file
+probes pass under Wine; nothing has run on real Windows yet (BLOCKED: no Windows machine).
+AvPlayer/FFmpeg left both builds (CTR imports none of it; `-DBB_AVPLAYER=ON` brings them back).
+
 ## Release preparation (2026-10-10)
 
 - Draft release v0.1 on GitHub with `dist/SacredFire-x86_64.AppImage` (841 MB) attached;

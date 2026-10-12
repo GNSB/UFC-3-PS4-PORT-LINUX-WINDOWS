@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_guest_memory.h"
+#ifdef __linux__
 
 #include <array>
 #include <atomic>
@@ -268,3 +269,23 @@ const Chunk* Find(std::uint64_t phys) {
     return phys < c->phys + c->size ? c : nullptr;
 }
 } // namespace BbGuestMemory
+#else
+// Windows: no dma-buf export; guest memory stays in the runtime's section and the GPU side
+// copies (the Steam Deck's default model). BB_GUEST_GPU_MEMORY / BB_PC_MODEL report unavailable.
+#include <cstdio>
+#include <cstdlib>
+namespace BbGuestMemory {
+bool Usable(const Vulkan::Instance&) {
+    static const bool said = [] {
+        if (std::getenv("BB_GUEST_GPU_MEMORY") || std::getenv("BB_PC_MODEL") || std::getenv("BB_GUEST_IN_PLACE"))
+            std::puts("GPU-visible guest memory (dma-buf) is not available on this host; the copying memory model is used");
+        return true;
+    }();
+    (void)said;
+    return false;
+}
+bool PcModelGpu(const Vulkan::Instance&) { return false; }
+void Install(const Vulkan::Instance&) {}
+const Chunk* Find(std::uint64_t) { return nullptr; }
+} // namespace BbGuestMemory
+#endif

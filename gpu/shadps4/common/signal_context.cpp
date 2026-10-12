@@ -47,4 +47,26 @@ bool IsWriteError(void* ctx) {
 #endif
 }
 
+u64 GetFaultRegister(void* ctx, FaultRegister which) {
+#if defined(_WIN32)
+    const CONTEXT* c = ((EXCEPTION_POINTERS*)ctx)->ContextRecord;
+    switch (which) {
+    case FaultRegister::Rax: return c->Rax; case FaultRegister::Rbx: return c->Rbx; case FaultRegister::Rcx: return c->Rcx;
+    case FaultRegister::Rdx: return c->Rdx; case FaultRegister::Rsi: return c->Rsi; case FaultRegister::Rdi: return c->Rdi;
+    case FaultRegister::Rbp: return c->Rbp; case FaultRegister::Rsp: return c->Rsp; case FaultRegister::R8: return c->R8;
+    case FaultRegister::R9: return c->R9; case FaultRegister::R10: return c->R10; case FaultRegister::R11: return c->R11;
+    case FaultRegister::R12: return c->R12; case FaultRegister::R13: return c->R13; case FaultRegister::R14: return c->R14;
+    case FaultRegister::R15: return c->R15; case FaultRegister::Rip: return c->Rip;
+    }
+    return 0;
+#elif defined(__linux__) && defined(ARCH_X86_64)
+    static constexpr int index[] = {REG_RAX, REG_RBX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_RBP, REG_RSP,
+                                    REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15, REG_RIP};
+    return u64(((ucontext_t*)ctx)->uc_mcontext.gregs[index[static_cast<u8>(which)]]);
+#else
+    (void)ctx; (void)which;
+    return 0;
+#endif
+}
+
 } // namespace Common

@@ -16,6 +16,9 @@
 #include <io.h>
 #include <share.h>
 #include <windows.h>
+// sacredfire: mingw-w64 a3d9399 does not declare CreateFileMapping2 (Windows 10 1803, onecore).
+extern "C" WINBASEAPI HANDLE WINAPI CreateFileMapping2(HANDLE File, SECURITY_ATTRIBUTES* SecurityAttributes, ULONG DesiredAccess, ULONG PageProtection,
+                                                       ULONG AllocationAttributes, ULONG64 MaximumSize, PCWSTR Name, MEM_EXTENDED_PARAMETER* ExtendedParameters, ULONG ParameterCount);
 #else
 #include <unistd.h>
 #endif

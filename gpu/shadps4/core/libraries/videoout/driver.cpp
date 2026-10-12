@@ -7,7 +7,9 @@
 #include <chrono>
 #include <cstdio>
 #include <time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include <cstring>
 #include <dirent.h>
 #include <unistd.h>

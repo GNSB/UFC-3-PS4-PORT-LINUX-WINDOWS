@@ -63,15 +63,13 @@ static void from_tick(uint64_t tick, DateTime *t) {
     t->microsecond=(uint32_t)(us%1000000u);
 }
 static uint64_t now_utc(void) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-    return UNIX_EPOCH_TICKS+(uint64_t)ts.tv_sec*1000000u+(uint64_t)ts.tv_nsec/1000u;
+    const uint64_t now=platform_realtime_ns();
+    return UNIX_EPOCH_TICKS+now/1000u;
 }
 /* Offset of local time from UTC at the given UTC tick, in microseconds. */
 static int64_t local_offset(uint64_t utc) {
     time_t seconds=(time_t)((int64_t)(utc-UNIX_EPOCH_TICKS)/1000000);
-    struct tm local;
-    localtime_r(&seconds,&local);
-    return (int64_t)local.tm_gmtoff*1000000;
+    return (int64_t)platform_utc_offset(seconds)*1000000;
 }
 
 static ABI int32_t rtc_current_local(DateTime *t) {

@@ -9,8 +9,12 @@
 #include <unordered_map>
 #include <cstring>
 #include <string>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
+#ifndef _WIN32
 #include <execinfo.h>
+#endif
 #include <unistd.h>
 #include <functional>
 

@@ -1,21 +1,19 @@
 /* Guest threads on host pthreads. Each guest thread owns a FreeBSD-style TCB
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
- * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
- * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
+ * `mov rax, fs:[0]` into `mov rax, gs:[0]`: on Linux GS base = guest TCB while glibc keeps FS
+ * (arch_prctl); on Windows GS stays the TEB and the load's displacement is patched to the TEB
+ * TLS slot that holds the TCB (platform_thread_publish_tcb). Priorities/affinity are recorded,
+ * not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
-#include <unistd.h>
-#include <sys/syscall.h>
-#include <sys/mman.h>
-#include <asm/prctl.h>
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
 #define STACK_MARGIN (256*1024)
@@ -57,14 +55,11 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
 }
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
-static void set_gs(void *base) {
-    if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
-}
-/* Build TCB/static TLS for the calling host thread and point GS at it. */
+/* Build TCB/static TLS for the calling host thread and publish it as the guest TCB. */
 static void attach(GuestThread *t) {
     uint64_t offset=tls_offset();
     size_t total=offset+256;
-    unsigned char *block=aligned_alloc(64,(total+63)&~(size_t)63);
+    unsigned char *block=platform_aligned_alloc(64,(total+63)&~(size_t)63);
     if (!block) { fputs("Cannot allocate guest TLS\n",stderr); exit(1); }
     memset(block,0,total);
     if (tls_filesz) memcpy(block,tls_template,tls_filesz);
@@ -74,7 +69,7 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
-    set_gs(tcb);
+    platform_thread_publish_tcb(tcb);
     current=t;
 }
 static GuestThread *new_thread(void) {
@@ -211,12 +206,7 @@ static ABI int32_t attr_set_guard(ThreadAttr **slot,uint64_t size) {
     a->guard=size; return 0;
 }
 
-/* Linux thread names hold 15 characters; longer ones would be rejected. */
-static void set_host_name(const char *name) {
-    char host[16]={0};
-    memcpy(host,name,strnlen(name,sizeof(host)-1));
-    pthread_setname_np(pthread_self(),host);
-}
+static void set_host_name(const char *name) { platform_thread_set_name(name); }
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
@@ -239,11 +229,10 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     pthread_attr_t host;
     pthread_attr_init(&host);
     uint64_t stack=t->attr.stack<MIN_STACK ? MIN_STACK : t->attr.stack;
-    /* Stacks below 1 TiB as on PS4; guest code may pack stack addresses. */
+    /* Stacks below 1 TiB as on PS4, fully committed (guest code packs stack addresses and has no
+     * stack probes): platform_thread_stack. */
     size_t stack_bytes=(size_t)stack+STACK_MARGIN;
-    void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
-    if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
-    else pthread_attr_setstacksize(&host,stack_bytes);
+    platform_thread_stack(&host,stack_bytes);
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
     *out=t;
@@ -317,14 +306,14 @@ static ABI int32_t thread_getname(GuestThread *t,char *name) {
     if (!name) return ERR(22);
     memcpy(name,t->name,sizeof(t->name)); return 0;
 }
-static ABI int32_t thread_getthreadid(void) { return (int32_t)syscall(SYS_gettid); }
+static ABI int32_t thread_getthreadid(void) { return (int32_t)platform_thread_id(); }
 /* Deferred cancellation: a thread without cancellation points keeps running, as on the console; the
  * request is noted so the caller sees success. No guest thread of this game is expected to reach a
  * cancellation point; a cancel that must take effect would need the point implemented. */
 static _Atomic unsigned cancels;
 static ABI int32_t thread_cancel(GuestThread *t) {
     if (!find_thread(t)) return ERR(3);
-    if (__atomic_fetch_add(&cancels,1,__ATOMIC_RELAXED)<4) printf("Runtime: scePthreadCancel(%s) noted; deferred cancellation never fires here\n",t->name);
+    if (atomic_fetch_add_explicit(&cancels,1,memory_order_relaxed)<4) printf("Runtime: scePthreadCancel(%s) noted; deferred cancellation never fires here\n",t->name);
     return 0;
 }
 /* POSIX scheduling parameters: the policy and priority recorded for the thread (SCHED_OTHER 2,
@@ -380,14 +369,13 @@ uintptr_t runtime_thread_resolve(const char *name) {
         if (runtime_nid_equals(name,table[i].nid)) return (uintptr_t)table[i].fn;
     return 0;
 }
+#ifdef _WIN32
+void runtime_thread_host_init(void) { platform_thread_tcb_displacement(); }
+#else
+void runtime_thread_host_init(void) {}
+#endif
 void runtime_thread_report(void) {
     pthread_mutex_lock(&lock);
     printf("Runtime: guest threads created=%zu, exited=%zu, joined=%zu\n",created,exited,joined_count);
     pthread_mutex_unlock(&lock);
 }
-#else
-uintptr_t runtime_thread_resolve(const char *name) { (void)name; return 0; }
-void runtime_thread_report(void) {}
-void runtime_thread_attach_main(void) {}
-void runtime_set_main_tls(const void *d,uint64_t f,uint64_t m,uint64_t a) { (void)d;(void)f;(void)m;(void)a; }
-#endif

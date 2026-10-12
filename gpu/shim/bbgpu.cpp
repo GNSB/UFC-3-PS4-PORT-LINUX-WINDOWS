@@ -4,7 +4,9 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include "bbport_free_check.h"
 #include "bbport_clobber.h"
 #include "bbport_toggles.h"
@@ -56,7 +58,9 @@ void runtime_memory_set_cpu_write_hook(RuntimeGpuRange hook);
 Frontend::WindowSDL* g_window = nullptr;
 
 namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+#ifndef BB_NO_AVPLAYER
 namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+#endif
 namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
 namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
 
@@ -305,7 +309,9 @@ extern "C" void bbgpu_register_kernel(void) {
     Libraries::Kernel::StartKernelService();
     Core::Loader::SymbolsResolver resolver;
     Libraries::Kernel::RegisterEventQueue(&resolver);
-    Libraries::AvPlayer::RegisterLib(&resolver);
+#ifndef BB_NO_AVPLAYER
+    Libraries::AvPlayer::RegisterLib(&resolver); // Bloodborne's videos; CTR imports none of it (BB_AVPLAYER)
+#endif
 }
 
 extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {

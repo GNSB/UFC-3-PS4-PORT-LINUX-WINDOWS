@@ -4,8 +4,12 @@
 #include <chrono>
 #include <thread>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
+#ifndef _WIN32
 #include <sys/uio.h>
+#endif
 #include <unistd.h>
 #include <array>
 #include <time.h>
@@ -124,9 +128,7 @@ void Liverpool::Process(std::stop_token stoken) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
     gpu_id = std::this_thread::get_id();
-#ifdef __linux__
     gpu_tid = gettid();
-#endif
 
     while (!stoken.stop_requested()) {
         // BB_HONEST_LABELS: fences (and GPU idle) wait for work not submitted yet. Submitted once

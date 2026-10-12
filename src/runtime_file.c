@@ -8,15 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#ifndef _WIN32
-#include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
-#include <unistd.h>
-#include <sys/stat.h>
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define MAX_FILES 1024
 #define MAX_MOUNTS 16
@@ -34,7 +28,7 @@ typedef struct {
 } GuestStat;
 _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
-typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
+typedef PlatformListing Listing;
 /* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
  * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file. */
 typedef struct { int used, host, dirty, save_logged; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
@@ -52,19 +46,20 @@ static int temp_name(const char *name) {
 }
 /* Copies left by a crash (none of them open): removed when their directory is mounted. */
 static void remove_stale_temps(const char *dir,int depth) {
-    DIR *d=opendir(dir);
+    PlatformListing *d=platform_list_directory(dir);
     if (!d) return;
-    for (struct dirent *e; (e=readdir(d));) {
-        if (e->d_name[0]=='.') continue;
+    for (size_t i=0;i<d->count;++i) {
+        const char *name=d->names+d->offsets[i];
+        if (name[0]=='.') continue;
         char path[1024];
-        if ((size_t)snprintf(path,sizeof(path),"%s/%s",dir,e->d_name)>=sizeof(path)) continue;
-        if (temp_name(e->d_name)) {
+        if ((size_t)snprintf(path,sizeof(path),"%s/%s",dir,name)>=sizeof(path)) continue;
+        if (temp_name(name)) {
             int open_now=0;
             for (int i=3;i<MAX_FILES;++i) if (files[i].used && files[i].temp && !strcmp(files[i].temp,path)) open_now=1;
-            if (!open_now && !unlink(path)) printf("Runtime: removed %s (a save interrupted earlier; the file it would have replaced is intact)\n",path);
-        } else if (depth<4 && e->d_type==DT_DIR) remove_stale_temps(path,depth+1);
+            if (!open_now && !platform_unlink(path)) printf("Runtime: removed %s (a save interrupted earlier; the file it would have replaced is intact)\n",path);
+        } else if (depth<4 && d->types[i]==4) remove_stale_temps(path,depth+1);
     }
-    closedir(d);
+    platform_free_listing(d);
 }
 
 int runtime_file_mount(const char *guest,const char *host) {
@@ -96,10 +91,10 @@ void runtime_file_configure(const char *app0,const char *user) {
     runtime_file_mount("/app0",app0);
     runtime_file_mount("/hostapp",app0);
     const char *writable[]={"temp0","download0","data"};
-    mkdir(user,0755);
+    platform_mkdir(user,0755);
     for (int i=0;i<3;++i) {
         snprintf(path,sizeof(path),"%s/%s",user,writable[i]);
-        mkdir(path,0755);
+        platform_mkdir(path,0755);
         char guest[32]; snprintf(guest,sizeof(guest),"/%s",writable[i]);
         runtime_file_mount(guest,path);
     }
@@ -133,25 +128,36 @@ static int translate(const char *guest,char *out,size_t size) {
  * (adhoc/font/dbgfont14h.ccm): files from mods or dumps made elsewhere keep their own case.
  * After a miss, the host path is matched component by component ignoring case; true when it was
  * corrected (same length: only case differs). Only on misses: no cost for found files. */
+static int equal_ignoring_case(const char *a,const char *b) {
+    for (;;++a,++b) {
+        const unsigned char x=(unsigned char)*a, y=(unsigned char)*b;
+        if ((x|0x20)!=(y|0x20) || (x>='A' && x<='Z' ? x+32 : x)!=(y>='A' && y<='Z' ? y+32 : y)) return 0;
+        if (!x) return 1;
+    }
+}
+/* A root ("/" or "C:/") stays as it is; the components after it are matched one by one. */
 static int fix_case(char *path) {
-    if (path[0]!='/') return 0;
-    char out[1024]="", trial[1024], part[256];
     const char *p=path;
+    char out[1024]="", trial[1024], part[256];
+    if (path[0]=='/') ++p;
+    else if (((path[0]>='A' && path[0]<='Z') || (path[0]>='a' && path[0]<='z')) && path[1]==':' && (path[2]=='/' || path[2]=='\\')) { snprintf(out,sizeof(out),"%.2s",path); p=path+3; }
+    else return 0;
     while (*p) {
-        while (*p=='/') ++p;
+        while (*p=='/' || *p=='\\') ++p;
         if (!*p) break;
-        const char *end=strchr(p,'/');
-        size_t len=end ? (size_t)(end-p) : strlen(p);
+        size_t len=strcspn(p,"/\\");
         if (len>=sizeof(part)) return 0;
         memcpy(part,p,len); part[len]=0;
         if ((size_t)snprintf(trial,sizeof(trial),"%s/%s",out,part)>=sizeof(trial)) return 0;
-        if (access(trial,F_OK)) {
-            DIR *d=opendir(out[0] ? out : "/");
+        if (platform_access(trial,0)) {
+            PlatformListing *d=platform_list_directory(out[0] ? out : "/");
             if (!d) return 0;
             int found=0;
-            for (struct dirent *e;(e=readdir(d));)
-                if (!strcasecmp(e->d_name,part)) { snprintf(trial,sizeof(trial),"%s/%s",out,e->d_name); found=1; break; }
-            closedir(d);
+            for (size_t i=0;i<d->count && !found;++i) {
+                const char *name=d->names+d->offsets[i];
+                if (equal_ignoring_case(name,part)) { snprintf(trial,sizeof(trial),"%s/%s",out,name); found=1; }
+            }
+            platform_free_listing(d);
             if (!found) return 0;
         }
         memcpy(out,trial,strlen(trial)+1);
@@ -161,57 +167,27 @@ static int fix_case(char *path) {
     memcpy(path,out,strlen(out)+1);
     return 1;
 }
-static int host_flags(int flags) {
-    int r;
-    switch (flags&3) { case 0: r=O_RDONLY; break; case 1: r=O_WRONLY; break; default: r=O_RDWR; }
-    if (flags&0x4) r|=O_NONBLOCK;
-    if (flags&0x8) r|=O_APPEND;
-    if (flags&0x80) r|=O_SYNC;
-    if (flags&0x200) r|=O_CREAT;
-    if (flags&0x400) r|=O_TRUNC;
-    if (flags&0x800) r|=O_EXCL;
-    if (flags&0x20000) r|=O_DIRECTORY;
-    return r|O_CLOEXEC;
-}
-static void free_listing(Listing *l) { if (l) { free(l->names); free(l->offsets); free(l->types); free(l); } }
+static void free_listing(Listing *l) { platform_free_listing(l); }
+/* The directory's entries without the save copies in progress (name.N.bbtmp). */
 static Listing *list_directory(const char *path) {
-    DIR *d=opendir(path);
-    if (!d) return NULL;
-    Listing *l=calloc(1,sizeof(*l));
-    size_t capacity=0,bytes=0,cap_names=0;
-    struct dirent *e;
-    while (l && (e=readdir(d))) {
-        if (temp_name(e->d_name)) continue;
-        size_t n=strlen(e->d_name)+1;
-        if (l->count==capacity) {
-            capacity=capacity ? capacity*2 : 64;
-            l->offsets=realloc(l->offsets,capacity*sizeof(size_t));
-            l->types=realloc(l->types,capacity);
-        }
-        if (bytes+n>cap_names) { cap_names=(bytes+n)*2; l->names=realloc(l->names,cap_names); }
-        if (!l->offsets || !l->types || !l->names) { fputs("Out of memory listing directory\n",stderr); exit(1); }
-        memcpy(l->names+bytes,e->d_name,n);
-        l->offsets[l->count]=bytes;
-        unsigned char type=e->d_type;
-        if (type==DT_LNK || type==DT_UNKNOWN) {
-            struct stat entry;
-            if (!fstatat(dirfd(d),e->d_name,&entry,0))
-                type=S_ISDIR(entry.st_mode) ? DT_DIR : S_ISREG(entry.st_mode) ? DT_REG : type;
-        }
-        l->types[l->count]=type==DT_DIR ? 4 : type==DT_REG ? 8 : type==DT_LNK ? 10 : 0;
-        ++l->count; bytes+=n;
+    Listing *l=platform_list_directory(path);
+    if (!l) return NULL;
+    size_t kept=0;
+    for (size_t i=0;i<l->count;++i) {
+        if (temp_name(l->names+l->offsets[i])) continue;
+        l->offsets[kept]=l->offsets[i]; l->types[kept]=l->types[i]; ++kept;
     }
-    closedir(d);
+    l->count=kept;
     return l;
 }
-static void convert_stat(const struct stat *s,GuestStat *g) {
+static void convert_stat(const PlatformStat *s,GuestStat *g) {
     memset(g,0,sizeof(*g));
-    g->dev=(uint32_t)s->st_dev; g->ino=(uint32_t)s->st_ino;
-    g->mode=(uint16_t)s->st_mode; g->nlink=(uint16_t)s->st_nlink;
-    g->size=s->st_size; g->blocks=s->st_blocks; g->blksize=(uint32_t)s->st_blksize;
-    g->atime=(GuestTimespec){s->st_atim.tv_sec,s->st_atim.tv_nsec};
-    g->mtime=(GuestTimespec){s->st_mtim.tv_sec,s->st_mtim.tv_nsec};
-    g->ctime=(GuestTimespec){s->st_ctim.tv_sec,s->st_ctim.tv_nsec};
+    g->dev=s->dev; g->ino=s->ino;
+    g->mode=(uint16_t)s->mode; g->nlink=(uint16_t)s->nlink;
+    g->size=s->size; g->blocks=s->blocks; g->blksize=s->blksize;
+    g->atime=(GuestTimespec){s->atim.tv_sec,s->atim.tv_nsec};
+    g->mtime=(GuestTimespec){s->mtim.tv_sec,s->mtim.tv_nsec};
+    g->ctime=(GuestTimespec){s->ctim.tv_sec,s->ctim.tv_nsec};
     g->birthtime=g->ctime;
 }
 static File *get(int fd) {
@@ -234,11 +210,11 @@ static unsigned temp_serial;
 static int copy_contents(int from,int to) {
     char buffer[65536];
     for (;;) {
-        ssize_t n=read(from,buffer,sizeof(buffer));
+        ssize_t n=platform_read(from,buffer,sizeof(buffer));
         if (n<0 && errno==EINTR) continue;
         if (n<=0) return n<0 ? -1 : 0;
         for (ssize_t done=0; done<n;) {
-            ssize_t w=write(to,buffer+done,(size_t)(n-done));
+            ssize_t w=platform_write(to,buffer+done,(size_t)(n-done));
             if (w<0 && errno==EINTR) continue;
             if (w<0) return -1;
             done+=w;
@@ -253,30 +229,30 @@ static void current_copy(char *path,size_t size,int write) {
         if (files[i].used && files[i].commit && !strcmp(files[i].commit,path)) { snprintf(path,size,"%s",files[i].temp); files[i].dirty|=write; break; }
     pthread_mutex_unlock(&lock);
 }
-/* Returns the descriptor of the copy, or -(errno). */
+/* Returns the descriptor of the copy, or -(errno). Guest flag bits: see platform_open. */
+enum { GF_CREAT=0x200, GF_TRUNC=0x400, GF_EXCL=0x800 };
 static int open_for_commit(const char *path,const char *source,int flags,int mode,char **commit,char **temp) {
-    int hf=host_flags(flags);
-    struct stat s;
-    int exists=!stat(source,&s);
-    if (exists && !S_ISREG(s.st_mode)) { int h=open(path,hf,mode ? mode : 0644); return h<0 ? -errno : h; }
-    if (exists && (hf&O_CREAT) && (hf&O_EXCL)) return -EEXIST;
-    if (!exists && !(hf&O_CREAT)) return -ENOENT;
+    PlatformStat s;
+    int exists=!platform_stat(source,&s);
+    if (exists && !s.is_reg) return platform_open(path,flags,mode ? mode : 0644);
+    if (exists && (flags&GF_CREAT) && (flags&GF_EXCL)) return -EEXIST;
+    if (!exists && !(flags&GF_CREAT)) return -ENOENT;
     size_t n=strlen(path)+32;
     char *t=malloc(n), *c=strdup(path);
     if (!t || !c) { free(t); free(c); return -ENOMEM; }
     snprintf(t,n,"%s.%u.bbtmp",path,__atomic_add_fetch(&temp_serial,1,__ATOMIC_RELAXED));
-    int out=open(t,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,exists ? (int)(s.st_mode&07777) : mode ? mode : 0644);
-    int e=out<0 ? errno : 0;
-    if (!e && exists && !(hf&O_TRUNC)) {
-        int in=open(source,O_RDONLY|O_CLOEXEC);
-        if (in<0 || copy_contents(in,out)) e=errno ? errno : EIO;
-        if (in>=0) close(in);
+    int out=platform_open(t,1|GF_CREAT|GF_TRUNC,exists ? (int)(s.mode&07777) : mode ? mode : 0644);
+    int e=out<0 ? -out : 0;
+    if (!e && exists && !(flags&GF_TRUNC)) {
+        int in=platform_open(source,0,0);
+        if (in<0 || copy_contents(in,out)) e=in<0 ? -in : (errno ? errno : EIO);
+        if (in>=0) platform_close(in);
     }
-    if (out>=0) close(out);
-    int host=e ? -1 : open(t,hf&~(O_CREAT|O_EXCL|O_TRUNC));
+    if (out>=0) platform_close(out);
+    int host=e ? -1 : platform_open(t,flags&~(GF_CREAT|GF_EXCL|GF_TRUNC),0);
     if (host<0) {
-        if (!e) e=errno;
-        unlink(t); free(t); free(c);
+        if (!e) e=-host;
+        platform_unlink(t); free(t); free(c);
         return -e;
     }
     *commit=c; *temp=t;
@@ -288,17 +264,17 @@ static void sync_directory(const char *file) {
     char *slash=strrchr(dir,'/');
     if (!slash) return;
     *slash=0;
-    int d=open(dir,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if (d>=0) { fsync(d); close(d); }
+    int d=platform_open(dir,0x20000,0);
+    if (d>=0) { platform_fsync(d); platform_close(d); }
 }
 static int commit_file(const File *f) {
-    if (!f->dirty) { close(f->host); unlink(f->temp); return 0; } /* opened for writing, not written */
-    int e=fsync(f->host) ? errno : 0;
-    close(f->host);
-    if (!e && rename(f->temp,f->commit)) e=errno;
+    if (!f->dirty) { platform_close(f->host); platform_unlink(f->temp); return 0; } /* opened for writing, not written */
+    int e=-platform_fsync(f->host);
+    platform_close(f->host);
+    if (!e) e=-platform_rename(f->temp,f->commit);
     if (e) {
         fprintf(stderr,"Runtime: save file %s not replaced (%s); the old one is kept\n",f->path,strerror(e));
-        unlink(f->temp);
+        platform_unlink(f->temp);
         return -e;
     }
     sync_directory(f->commit);
@@ -316,42 +292,41 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int host;
     if (save_path(guest) && (flags&3)) {
         host=open_for_commit(path,current,flags,mode,&commit,&temp);
-        if (host<0) { errno=-host; host=-1; }
     } else {
-        host=open(current,host_flags(flags),mode ? mode : 0644);
-        if (host<0 && errno==ENOENT && !(flags&0x200) && !save_path(guest) && fix_case(current)) {
-            host=open(current,host_flags(flags),mode ? mode : 0644);
+        host=platform_open(current,flags,mode ? mode : 0644);
+        if (host==-ENOENT && !(flags&0x200) && !save_path(guest) && fix_case(current)) {
+            host=platform_open(current,flags,mode ? mode : 0644);
             snprintf(path,sizeof(path),"%s",current); // the directory listing below uses it
         }
     }
     if (save_trace() && save_path(guest))
         printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
     if (host<0) {
-        e=errno;
+        e=-host;
         if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
         return -e;
     }
-    struct stat s;
+    PlatformStat s;
     Listing *dir=NULL;
-    if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
+    if (!platform_fstat(host,&s) && s.is_dir) dir=list_directory(path);
     pthread_mutex_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
     if (fd<0) {
-        pthread_mutex_unlock(&lock); close(host); free_listing(dir);
-        if (temp) unlink(temp);
+        pthread_mutex_unlock(&lock); platform_close(host); free_listing(dir);
+        if (temp) platform_unlink(temp);
         free(commit); free(temp); return -EMFILE;
     }
     files[fd]=(File){.used=1,.host=host,.dir=dir,.commit=commit,.temp=temp};
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
-    if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
+    if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.size);
     const char *mod_trace=getenv("BB_MOD_TRACE"), *mod_root=getenv("BB_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {
         char actual[PATH_MAX],root[PATH_MAX];
         static unsigned traced;
-        if (realpath(path,actual) && realpath(mod_root,root)) {
+        if (platform_realpath(path,actual) && platform_realpath(mod_root,root)) {
             size_t n=strlen(root);
             if (!strncmp(actual,root,n) && actual[n]=='/' &&
                 __atomic_fetch_add(&traced,1,__ATOMIC_RELAXED)<32)
@@ -372,7 +347,7 @@ static int64_t do_close(int fd) {
     free_listing(closed.dir);
     int result=0;
     if (closed.temp) result=commit_file(&closed);
-    else close(closed.host);
+    else platform_close(closed.host);
     if (save_trace() && save_path(closed.path))
         printf("Save trace: close(fd %d, %s)%s -> %d\n",fd,closed.path,closed.temp ? closed.dirty ? " commit" : " unwritten" : "",result);
     free(closed.commit); free(closed.temp);
@@ -407,7 +382,7 @@ static void touch_for_write(void *buffer,uint64_t size) {
 static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int positional) {
     ssize_t n=-1;
     for (int attempt=0; attempt<8; ++attempt) {
-        n=positional ? pread(h,buffer,size,offset) : read(h,buffer,size);
+        n=positional ? platform_pread(h,buffer,size,offset) : platform_read(h,buffer,size);
         if (n>=0 || errno!=EFAULT) break;
         touch_for_write(buffer,size);
     }
@@ -450,7 +425,7 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
     touch_for_read(buffer,size);
-    ssize_t n=write(h,buffer,size);
+    ssize_t n=platform_write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
@@ -459,7 +434,7 @@ static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset)
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
     touch_for_read(buffer,size);
-    ssize_t n=pwrite(h,buffer,size,offset);
+    ssize_t n=platform_pwrite(h,buffer,size,offset);
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
@@ -472,7 +447,7 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
         if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
         return -EINVAL;
     }
-    off_t r=lseek(f->host,offset,whence);
+    int64_t r=platform_lseek(f->host,offset,whence);
     return r<0 ? -errno : r;
 }
 static int64_t do_fstat(int fd,GuestStat *out) {
@@ -480,19 +455,20 @@ static int64_t do_fstat(int fd,GuestStat *out) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     if (!out) return -EFAULT;
-    struct stat s;
-    if (fstat(h,&s)) return -errno;
+    PlatformStat s;
+    int r=platform_fstat(h,&s);
+    if (r) return r;
     convert_stat(&s,out); return 0;
 }
 static int64_t do_stat(const char *guest,GuestStat *out) {
-    char path[1024]; struct stat s;
+    char path[1024]; PlatformStat s;
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),0);
     if (!out) return -EFAULT;
-    int r=stat(path,&s) ? -errno : 0;
-    if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=stat(path,&s) ? -errno : 0;
-    if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes\n",guest,r,r ? -1LL : (long long)s.st_size);
+    int r=platform_stat(path,&s);
+    if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=platform_stat(path,&s);
+    if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes\n",guest,r,r ? -1LL : (long long)s.size);
     if (r) return r;
     convert_stat(&s,out); return 0;
 }
@@ -530,8 +506,7 @@ static int64_t path_op(const char *guest,int op,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
-    int r= op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
-    r=r ? -errno : 0;
+    int r= op==0 ? platform_mkdir(path,mode ? mode : 0755) : op==1 ? platform_rmdir(path) : platform_unlink(path);
     if (save_trace() && save_path(guest)) printf("Save trace: %s(%s) -> %d\n",op==0 ? "mkdir" : op==1 ? "rmdir" : "unlink",guest,r);
     return r;
 }
@@ -541,14 +516,14 @@ static int64_t do_rename(const char *from,const char *to) {
     int e=translate(from,a,sizeof(a));
     if (!e) e=translate(to,b,sizeof(b));
     if (e) return -e;
-    int r=rename(a,b) ? -errno : 0;
+    int r=platform_rename(a,b);
     if (save_trace() && (save_path(from) || save_path(to))) printf("Save trace: rename(%s, %s) -> %d\n",from,to,r);
     return r;
 }
 static int64_t do_ftruncate(int fd,int64_t length) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
-    return ftruncate(h,length) ? -errno : 0;
+    return platform_ftruncate(h,length);
 }
 static int64_t do_truncate(const char *guest,int64_t length) {
     if (game_path(guest)) return -EROFS;
@@ -557,16 +532,16 @@ static int64_t do_truncate(const char *guest,int64_t length) {
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),1);
     if (save_trace() && save_path(guest)) printf("Save trace: truncate(%s, %lld)\n",guest,(long long)length);
-    return truncate(path,length) ? -errno : 0;
+    return platform_truncate(path,length);
 }
-static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return fsync(h) ? -errno : 0; }
+static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return platform_fsync(h); }
 static int64_t do_access(const char *guest,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),0);
-    int r=access(path,mode&7) ? -errno : 0;
-    if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=access(path,mode&7) ? -errno : 0;
+    int r=platform_access(path,mode&7);
+    if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=platform_access(path,mode&7);
     return r;
 }
 
@@ -640,8 +615,3 @@ void runtime_file_report(void) {
     printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
            opens,reads,(unsigned long long)bytes_read,writes,missing);
 }
-#else
-uintptr_t runtime_file_resolve(const char *name) { (void)name; return 0; }
-void runtime_file_report(void) {}
-void runtime_file_configure(const char *a,const char *u) { (void)a; (void)u; }
-#endif

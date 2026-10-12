@@ -11,12 +11,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
-#ifndef _WIN32
-#include <dirent.h>
 #include <errno.h>
-#include <ftw.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #define ERR_PARAMETER ((int32_t)0x809F0000)
 #define ERR_NOT_INITIALIZED ((int32_t)0x809F0001)
@@ -76,8 +71,9 @@ void runtime_savedata_configure(const char *title) {
 static int make_dirs(const char *path) {
     char buffer[700];
     snprintf(buffer,sizeof(buffer),"%s",path);
-    for (char *p=buffer+1;*p;++p) if (*p=='/') { *p=0; mkdir(buffer,0755); *p='/'; }
-    return mkdir(buffer,0755) && errno!=EEXIST ? -1 : 0;
+    for (char *p=buffer+1;*p;++p) if (*p=='/' || *p=='\\') { char c=*p; *p=0; platform_mkdir(buffer,0755); *p=c; }
+    const int e=platform_mkdir(buffer,0755);
+    return e && e!=-EEXIST ? -1 : 0;
 }
 static void root(int32_t user, const char *title, char *out, size_t size) {
     snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
@@ -93,9 +89,9 @@ static int write_atomic(const char *path, const void *data, size_t size) {
     char temp[760]; snprintf(temp,sizeof(temp),"%s.bbtmp",path);
     FILE *f=fopen(temp,"wb");
     if (!f) return -1;
-    int ok=fwrite(data,1,size,f)==size && !fflush(f) && !fsync(fileno(f));
+    int ok=fwrite(data,1,size,f)==size && !fflush(f) && !platform_fsync(fileno(f));
     ok=!fclose(f) && ok;
-    if (!ok || rename(temp,path)) { unlink(temp); return -1; }
+    if (!ok || platform_rename(temp,path)) { platform_unlink(temp); return -1; }
     return 0;
 }
 static void write_param(const char *meta, const Param *p) {
@@ -109,12 +105,14 @@ static int read_param(const char *meta, Param *p) {
     FILE *f=fopen(path,"rb");
     if (!f) return -1;
     size_t n=fread(p,sizeof(*p),1,f); fclose(f);
-    struct stat st;
-    if (!stat(path,&st)) p->mtime=st.st_mtime;
+    PlatformStat st;
+    if (!platform_stat(path,&st)) p->mtime=st.mtim.tv_sec;
     return n==1 ? 0 : -1;
 }
-static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
-    (void)st; (void)flag; (void)ftw; return remove(path);
+/* Removes a save directory: only inside this title's save root (platform_remove_tree refuses
+ * anything else), so a bad directory name can never reach the user's other files. */
+static void remove_save_tree(const char *base, const char *path) {
+    if (platform_remove_tree(base,path)) fprintf(stderr,"Runtime: save data %s not removed (outside %s or in use)\n",path,base);
 }
 
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
@@ -130,8 +128,8 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     root(user,title,base,sizeof(base));
     snprintf(host,sizeof(host),"%s/%s",base,dir->data);
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,dir->data);
-    struct stat st;
-    int exists=!stat(host,&st) && S_ISDIR(st.st_mode);
+    PlatformStat st;
+    int exists=!platform_stat(host,&st) && st.is_dir;
     if ((mode & MODE_CREATE) && exists) return ERR_EXISTS;
     if (!(mode & (MODE_CREATE|MODE_CREATE2)) && !exists) return ERR_NOT_FOUND;
     pthread_mutex_lock(&lock);
@@ -221,10 +219,10 @@ static ABI int32_t save_delete(const Delete *d) {
     root(d->user,d->title ? d->title->data : NULL,base,sizeof(base));
     snprintf(host,sizeof(host),"%s/%s",base,d->dir->data);
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,d->dir->data);
-    struct stat st;
-    if (stat(host,&st)) return ERR_NOT_FOUND;
-    nftw(host,remove_entry,16,FTW_DEPTH|FTW_PHYS);
-    nftw(meta,remove_entry,16,FTW_DEPTH|FTW_PHYS);
+    PlatformStat st;
+    if (platform_stat(host,&st)) return ERR_NOT_FOUND;
+    remove_save_tree(base,host);
+    remove_save_tree(base,meta);
     printf("Runtime: save data '%s' deleted\n",d->dir->data);
     return 0;
 }
@@ -249,18 +247,19 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
     char base[600];
     root(cond->user,cond->title ? cond->title->data : NULL,base,sizeof(base));
     Entry *entries=NULL; size_t count=0, capacity=0;
-    DIR *d=opendir(base);
-    for (struct dirent *e; d && (e=readdir(d));) {
-        size_t n=strlen(e->d_name);
-        if (e->d_name[0]=='.' || n>=32 || (n>8 && !strcmp(e->d_name+n-8,".sce_sys"))) continue;
-        if (cond->dir && cond->dir->data[0] && !like(e->d_name,cond->dir->data)) continue;
-        if (count==capacity) { capacity=capacity ? capacity*2 : 16; entries=realloc(entries,capacity*sizeof(*entries)); }
-        snprintf(entries[count].name,32,"%s",e->d_name);
-        char meta[680]; snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,e->d_name);
+    PlatformListing *d=platform_list_directory(base);
+    for (size_t i=0; d && i<d->count; ++i) {
+        const char *name=d->names+d->offsets[i];
+        size_t n=strlen(name);
+        if (name[0]=='.' || n>=32 || (n>8 && !strcmp(name+n-8,".sce_sys"))) continue;
+        if (cond->dir && cond->dir->data[0] && !like(name,cond->dir->data)) continue;
+        if (count==capacity) { capacity=capacity ? capacity*2 : 16; entries=realloc(entries,capacity*sizeof(*entries)); if (!entries) exit(1); }
+        snprintf(entries[count].name,32,"%s",name);
+        char meta[680]; snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,name);
         read_param(meta,&entries[count].param);
         ++count;
     }
-    if (d) closedir(d);
+    platform_free_listing(d);
     sort_key=cond->key; sort_order=cond->order;
     if (count) qsort(entries,count,sizeof(*entries),compare);
     result->hits=(uint32_t)count;
@@ -289,7 +288,7 @@ static ABI int32_t memory_setup(int32_t user, uint64_t size, const Param *param)
     int32_t r=ERR_INTERNAL;
     if (f) {
         fseek(f,0,SEEK_END);
-        if ((uint64_t)ftell(f)<size && ftruncate(fileno(f),(off_t)size)) goto done;
+        if ((uint64_t)ftell(f)<size && platform_ftruncate(fileno(f),(int64_t)size)) goto done;
         memory_size=size; r=0;
     done:
         fclose(f);
@@ -328,8 +327,3 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
-#else
-void runtime_savedata_configure(const char *title) { (void)title; }
-uintptr_t runtime_savedata_resolve(const char *name) { (void)name; return 0; }
-void runtime_savedata_report(void) {}
-#endif

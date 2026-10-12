@@ -256,9 +256,7 @@ public:
     }
 
     std::thread::id GetGpuCommandProcessorThread();
-#ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
-#endif
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);

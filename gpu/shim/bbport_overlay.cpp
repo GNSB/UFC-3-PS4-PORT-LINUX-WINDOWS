@@ -20,6 +20,17 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
+#ifdef _WIN32
+// sacredfire: COFF has no .hidden/.previous and names the read-only data section .rdata.
+asm(".section .rdata,\"dr\"\n"
+    ".balign 16\n"
+    ".global bb_font_ttf\n"
+    "bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".global bb_font_ttf_end\n"
+    "bb_font_ttf_end:\n"
+    ".text\n");
+#else
 asm(".section .rodata\n"
     ".balign 16\n"
     ".hidden bb_font_ttf\n"
@@ -30,6 +41,7 @@ asm(".section .rodata\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".previous\n");
+#endif
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 

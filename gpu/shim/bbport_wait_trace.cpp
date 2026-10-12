@@ -10,8 +10,12 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
+#ifndef _WIN32
 #include <execinfo.h>
+#endif
 #include <pthread.h>
 
 namespace BbWaitTrace {

@@ -2,6 +2,7 @@
 #include "bbport_guest_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
+#ifdef __linux__
 
 #include <array>
 #include <atomic>
@@ -207,3 +208,14 @@ void Install(RangeCallback on_gpu_range_allocated) {
     }
 }
 } // namespace BbGuestHooks
+#else
+// Windows: the hooks patch guest code and use SIGTRAP single-stepping (Linux). For CTR none of the
+// Bloodborne sites match anyway; the install reports itself as unavailable when asked for.
+#include <cstdio>
+#include <cstdlib>
+namespace BbGuestHooks {
+void Install(RangeCallback) {
+    if (std::getenv("BB_HEAP_HOOKS") || std::getenv("BB_HEAP_SITES")) std::puts("BB_HEAP_HOOKS/BB_HEAP_SITES are not available on this host (Linux signals)");
+}
+} // namespace BbGuestHooks
+#endif

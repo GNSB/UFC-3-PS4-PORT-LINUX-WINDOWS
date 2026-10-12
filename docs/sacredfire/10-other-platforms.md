@@ -1,5 +1,10 @@
 # Windows and macOS: what a port would need (notes, 2026-10-09)
 
+> 2026-10-11: the Windows port described here is being built; see
+> [13-windows-port.md](13-windows-port.md) (design and decisions) and
+> [13-windows-port-report.md](13-windows-port-report.md) (what was verified). The table below is
+> the starting analysis.
+
 SacredFire inherits bbport's design: the game's x86-64 code runs natively, a small C runtime
 (src/) stands in for the PS4 system libraries, and the GPU library (gpu/) translates the PS4
 command stream to Vulkan. Nothing in that design is Linux-only in principle, but the

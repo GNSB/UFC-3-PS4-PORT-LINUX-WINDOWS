@@ -18,6 +18,7 @@
 #include <vector>
 #include <utility>
 
+#include <cstdlib> // sacredfire: std::abort (libc++ on Windows does not include it transitively)
 #ifndef __cpp_lib_bit_cast
 #include <cstring>
 #endif

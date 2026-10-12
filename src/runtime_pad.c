@@ -104,10 +104,10 @@ static void refresh_ports(uint64_t now) {
     if (now-config_checked<1000000) return;
     config_checked=now;
     const char *path=getenv("BB_CONFIG");
-    struct stat st;
-    if (!path || stat(path,&st)) return;
-    if (st.st_mtim.tv_sec==config_mtime.tv_sec && st.st_mtim.tv_nsec==config_mtime.tv_nsec) return;
-    config_mtime=st.st_mtim;
+    PlatformStat st;
+    if (!path || platform_stat(path,&st)) return;
+    if (st.mtim.tv_sec==config_mtime.tv_sec && st.mtim.tv_nsec==config_mtime.tv_nsec) return;
+    config_mtime=st.mtim;
     load_ports();
 }
 /* 1 when the gamepad id is claimed by a port other than `except` (ports 2..4 with a name). */
@@ -165,7 +165,7 @@ int runtime_pad_user_present(int user) {
 static size_t reads;
 static uint8_t connected_count;
 
-static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
+static uint64_t now_us(void) { return platform_monotonic_ns()/1000u; }
 /* Per-port stick calibration (see the file header). */
 #define PAD_CAL_QUIET 512              /* an axis is quiet when it moved no more than this */
 #define PAD_CAL_QUIET_SAMPLES 8
@@ -290,7 +290,7 @@ static int is_preferred(SDL_JoystickID id, const char *want) {
     char guid[33];
     SDL_GUIDToString(SDL_GetGamepadGUIDForID(id),guid,sizeof guid);
     const char *name=SDL_GetGamepadNameForID(id);
-    return !strcasecmp(guid,want) || (name && strcasestr(name,want));
+    return !SDL_strcasecmp(guid,want) || (name && SDL_strcasestr(name,want));
 }
 /* Any button, trigger or stick input on a gamepad right now. */
 static int gamepad_active(SDL_Gamepad *g) {
@@ -607,10 +607,10 @@ static void read_inject(void) {
     uint64_t now=now_us();
     if (now-last_check<20000) return;
     last_check=now;
-    struct stat st;
-    if (stat(path,&st)!=0) return;
-    if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
-    mtime=st.st_mtim;
+    PlatformStat st;
+    if (platform_stat(path,&st)!=0) return;
+    if (st.mtim.tv_sec==mtime.tv_sec && st.mtim.tv_nsec==mtime.tv_nsec) return;
+    mtime=st.mtim;
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const struct { const char *name; uint32_t ps; } names[]={

@@ -46,7 +46,9 @@ full play-through has not been verified, and the Steam Deck (RADV) is the only t
   the executable image and say what is missing (`BB_SKIP_GAME_CHECK=1` skips the check).
 - To build: GCC, CMake, Ninja, Python 3, glslang, SDL3, Vulkan headers and the libraries in
   `shell.nix` (with [Nix](https://nixos.org), `shell.nix` provides them). On Arch:
-  `tools/deps.sh` fetches the header-only libraries the distribution lacks.
+  `tools/deps.sh` fetches the header-only libraries the distribution lacks. FFmpeg is no
+  longer needed: the AvPlayer video libraries are Bloodborne's and CTR imports none of them
+  (`-DBB_AVPLAYER=ON` builds them again).
 
 ## Build and run
 
@@ -143,7 +145,8 @@ than the Steam Deck has). bbport's temporal upscalers (`BB_UPSCALER`, `BB_OBJECT
 | `scripts/` | Offline preparation of the game image, module linking, game check, patch compiler, mods |
 | `gpu/` | Renderer library: vendored shadPS4 video core (`gpu/VENDOR.txt`) with bbport's and SacredFire's changes, shims, ImGui menu |
 | `patches/` | Community patches for CTR (`CrashTeamRacing.xml`) |
-| `launcher/`, `packaging/` | GTK4 launcher and desktop entry; Nix package and AppImage |
+| `launcher/`, `packaging/` | GTK4 launcher and desktop entry; Nix package and AppImage; `packaging/windows/`: the Windows launcher, manifest, pinned inputs (`deps.lock`) and licence list |
+| `src/platform/`, `cmake/` | Host services (Linux and Windows implementations of one header) and the llvm-mingw cross toolchain file |
 | `tools/` | Developer tools: import-name generation, scripted runs, screenshots, A/B toggles, GPU checks |
 | `tests/` | Loader, runtime, patch, game-check and renderer tests |
 | `docs/sacredfire/` | SacredFire's notes: [status](docs/sacredfire/STATUS.md), setup, imports, Bloodborne gating and removal, fur, controllers, patches, other platforms |
@@ -167,7 +170,11 @@ can find the cause. **No game files** in issues or pull requests. See
 - Races with the 60 FPS patch reach 37–45 FPS on the Steam Deck: the port's GPU command thread
   is the limit at ~1400 draws per frame ([docs/sacredfire/08-patches.md](docs/sacredfire/08-patches.md)).
 - Online features are stubbed; the game runs offline.
-- Windows and macOS are not supported ([docs/sacredfire/10-other-platforms.md](docs/sacredfire/10-other-platforms.md)).
+- Windows: a native x86-64 build is cross-compiled from Linux (`scripts/build-windows.sh`,
+  `scripts/package-windows.sh`, [docs/sacredfire/13-windows-port.md](docs/sacredfire/13-windows-port.md));
+  its state on real Windows is recorded in
+  [docs/sacredfire/13-windows-port-report.md](docs/sacredfire/13-windows-port-report.md). macOS is not
+  supported ([docs/sacredfire/10-other-platforms.md](docs/sacredfire/10-other-platforms.md)).
 
 ## History
 

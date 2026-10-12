@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
+#include "common/signal_context.h"
 
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 #include <x86intrin.h>
 
@@ -105,16 +108,14 @@ void DumpRange(std::uint64_t address, std::uint64_t size) {
 
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     using namespace BbWriteLog;
-    const auto* uc = static_cast<const ucontext_t*>(ucontext);
-    const auto* g = uc->uc_mcontext.gregs;
-    BbFreeCheck::DumpAtFault(std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_R14]));
+    using Common::FaultRegister;
+    const auto reg = [&](FaultRegister r) { return Common::GetFaultRegister(ucontext, r); };
+    BbFreeCheck::DumpAtFault(reg(FaultRegister::Rax), reg(FaultRegister::R14));
     if (Mode() == 0) {
         return;
     }
-    const std::uint64_t regs[] = {std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_RBX]),
-                                  std::uint64_t(g[REG_RCX]), std::uint64_t(g[REG_RDX]),
-                                  std::uint64_t(g[REG_RSI]), std::uint64_t(g[REG_RDI]),
-                                  std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
+    const std::uint64_t regs[] = {reg(FaultRegister::Rax), reg(FaultRegister::Rbx), reg(FaultRegister::Rcx), reg(FaultRegister::Rdx),
+                                  reg(FaultRegister::Rsi), reg(FaultRegister::Rdi), reg(FaultRegister::R14), reg(FaultRegister::R15)};
     const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);

@@ -4,13 +4,14 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#ifndef _WIN32
-#include <setjmp.h>
-/* Recovery point for speculative guest memory reads on this thread (probe.c fault handler). */
-extern __thread sigjmp_buf *runtime_fault_recover;
+#include "platform/platform.h"
+/* Recovery point for speculative guest memory reads on this thread (the fault handler of
+ * platform.h resumes it; sigjmp_buf on Linux, bb_jmp_buf on Windows). */
+extern __thread bb_fault_jmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
-#endif
+/* The guest's functions and callbacks use the System V AMD64 calling convention on every host;
+ * on Windows (Microsoft x64 ABI) the attribute makes clang emit the SysV convention for them. */
 #define ABI __attribute__((sysv_abi))
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
@@ -31,7 +32,7 @@ void runtime_wait_report(double frames);
 void runtime_guest_call_sites(uint64_t out[3]);
 /* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */
 uint64_t runtime_heap_growths(void);
-static inline uint64_t runtime_wait_clock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec; }
+static inline uint64_t runtime_wait_clock(void) { return platform_monotonic_ns(); }
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
 void runtime_rwlock_report(void);
@@ -112,4 +113,8 @@ void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+/* Before anything else allocates: Windows reserves the PS4 user range (no-op on Linux). */
+void runtime_memory_reserve(void);
+/* Before any driver loads: Windows claims the TEB TLS slot of the guest TCB (no-op on Linux). */
+void runtime_thread_host_init(void);
 #endif

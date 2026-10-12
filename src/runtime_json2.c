@@ -7,6 +7,7 @@
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 static ABI void pure_virtual(void) {
@@ -18,7 +19,7 @@ static ABI void base_dtor(void *self) { (void)self; }
 static _Atomic unsigned notified;
 static ABI void notify_error(void *self,int32_t code,uint64_t size,void *user) {
     (void)self; (void)user;
-    if (__atomic_fetch_add(&notified,1,__ATOMIC_RELAXED)<4) printf("Json2: MemAllocator::notifyError(%d, %llu bytes)\n",code,(unsigned long long)size);
+    if (atomic_fetch_add_explicit(&notified,1,memory_order_relaxed)<4) printf("Json2: MemAllocator::notifyError(%d, %llu bytes)\n",code,(unsigned long long)size);
 }
 /* Vtable: offset-to-top, typeinfo, then the virtual functions in declaration order:
  * ~MemAllocator (complete and deleting), allocate, deallocate, notifyError. */

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_clobber.h"
+#include "common/signal_context.h"
 
 #include <algorithm>
 #include <array>
@@ -9,8 +10,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
+#ifndef _WIN32
 #include <ucontext.h>
+#endif
 #include <unistd.h>
 
 namespace BbClobber {
@@ -199,7 +204,11 @@ void* AllocCopy(std::size_t bytes) {
     if (!ProtectCopies()) {
         return std::malloc(bytes);
     }
+#ifdef _WIN32
+    return bb_win_aligned_alloc(Page, RoundUp(bytes));
+#else
     return std::aligned_alloc(Page, RoundUp(bytes));
+#endif
 }
 
 void FreeCopy(void* storage, std::size_t bytes) {
@@ -211,6 +220,9 @@ void FreeCopy(void* storage, std::size_t bytes) {
             }
         }
     }
+#ifdef _WIN32
+    if (ProtectCopies()) { bb_win_aligned_free(storage); return; }
+#endif
     std::free(storage);
 }
 
@@ -243,7 +255,7 @@ bool OnFault(void* ucontext, std::uint64_t address) {
         const std::uint64_t base = p.base.load(std::memory_order_relaxed);
         const std::uint64_t bytes = p.bytes.load(std::memory_order_relaxed);
         if (base != 0 && address >= base && address < base + bytes) {
-            const auto* uc = static_cast<const ucontext_t*>(ucontext);
+            const std::uint64_t rip = Common::GetFaultRegister(ucontext, Common::FaultRegister::Rip);
             char thread[32] = "?";
             pthread_getname_np(pthread_self(), thread, sizeof(thread));
             char line[256];
@@ -254,7 +266,7 @@ bool OnFault(void* ucontext, std::uint64_t address) {
                 (unsigned long long)p.seq.load(std::memory_order_relaxed),
                 (unsigned long long)(address - base), (unsigned long long)address,
                 (unsigned long long)bytes, (unsigned long long)base,
-                (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], thread);
+                (unsigned long long)rip, thread);
             if (n > 0) {
                 const ssize_t written = write(2, line, std::min<std::size_t>(n, sizeof(line) - 1));
                 (void)written;

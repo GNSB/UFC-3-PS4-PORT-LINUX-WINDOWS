@@ -3,16 +3,18 @@
 #pragma once
 #include <array>
 #include <atomic>
-#include <csetjmp>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+// sacredfire: the recovery buffer type and setjmp of the host (sigjmp_buf on Linux, bb_jmp_buf
+// with bb_setjmp on Windows) come from the runtime's platform layer.
+#include "../../src/platform/platform.h"
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
 /// Temporary experiment bits: the second number in BB_TOGGLE_FILE (runtime_memory.c).
 extern "C" std::uint64_t runtime_experiment_bits;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
-extern "C" __thread sigjmp_buf* runtime_fault_recover;
+extern "C" __thread bb_fault_jmp_buf* runtime_fault_recover;
 
 namespace BbToggle {
 enum : std::uint64_t {

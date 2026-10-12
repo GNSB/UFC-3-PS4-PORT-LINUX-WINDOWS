@@ -10,10 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <time.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h> /* htons, inet_pton, inet_ntop (ws2_32; no WSAStartup needed for these) */
+#else
 #include <arpa/inet.h>
+#endif
 
 #define USER_ID 1
 #define ORBIS_OK 0
@@ -95,7 +99,7 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 1: *value=language(); break;           /* language (1 = English US, 8 = Russian) */
     case 2: *value=1; break;                    /* date format DD/MM/YYYY */
     case 3: *value=1; break;                    /* 24-hour clock */
-    case 4: { time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(t.tm_gmtoff/60); break; }
+    case 4: *value=(int32_t)(platform_utc_offset(time(NULL))/60); break;
     case 5: *value=0; break;                    /* summer time */
     case 7: *value=0; break;                    /* parental level off */
     case 1000: *value=1; break;                 /* enter button = cross */
@@ -158,7 +162,7 @@ static ABI int32_t http_epoll(int32_t ctx,void **handle) {
 }
 static ABI int32_t http_wait(void *handle,void *events,int32_t max,int64_t timeout) {
     (void)handle; (void)events; (void)max;
-    if (timeout>0) { struct timespec t={timeout/1000000,(timeout%1000000)*1000}; nanosleep(&t,NULL); }
+    if (timeout>0) platform_sleep_ns((uint64_t)timeout*1000);
     return 0; /* no events: nothing is in flight */
 }
 
@@ -640,6 +644,3 @@ static const RuntimeExport exports[]={
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
 };
 uintptr_t runtime_services_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-#else
-uintptr_t runtime_services_resolve(const char *name) { (void)name; return 0; }
-#endif

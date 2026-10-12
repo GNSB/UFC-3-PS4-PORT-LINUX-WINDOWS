@@ -10,6 +10,11 @@ if (NOT CMAKE_BUILD_TYPE)
 endif()
 # Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
 add_compile_options(-fno-omit-frame-pointer)
+# sacredfire: libSceAvPlayer/libSceVideodec (FFmpeg) are Bloodborne's video path; CTR imports none
+# of their functions (out/import_names.txt), so they are out of the build unless asked for.
+option(BB_AVPLAYER "Build the AvPlayer/Videodec libraries (needs FFmpeg)" OFF)
+# sacredfire: the Windows build (cmake/windows-x86_64-llvm-mingw.cmake) links the GPU library
+# statically into the game executable and builds the executables here (docs/sacredfire/13-windows-port.md).
 
 # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
 # (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
@@ -41,6 +46,12 @@ elseif (BB_PGO STREQUAL "use")
 endif()
 
 find_package(Vulkan REQUIRED)
+if (WIN32)
+    enable_language(RC)
+    # No build-host paths in the binaries (__FILE__ in assertions and logs, debug info): the
+    # archive must not name the machine it was built on, and two builds of one revision agree.
+    add_compile_options("-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/..=." "-ffile-prefix-map=${WINDOWS_TARGET_ROOT}=sysroot" "-ffile-prefix-map=${LLVM_MINGW_ROOT}=toolchain")
+endif()
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
 find_package(magic_enum REQUIRED)
@@ -49,7 +60,9 @@ find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash)
 pkg_check_modules(SDL3 REQUIRED IMPORTED_TARGET sdl3)
-pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+if (NOT WIN32)
+    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+endif()
 find_package(miniz REQUIRED)
 find_package(Zydis REQUIRED)
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
@@ -61,6 +74,17 @@ add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+if (WIN32)
+    # sacredfire: the FidelityFX sources use MSVC's _countof and swprintf_s without including the
+    # headers mingw-w64 declares them in (stdlib.h, wchar.h); every FSR target gets them first.
+    get_property(ffx_targets DIRECTORY third_party/fsr-vulkan PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(ffx_target IN LISTS ffx_targets)
+        get_target_property(ffx_type ${ffx_target} TYPE)
+        if (ffx_type MATCHES "LIBRARY|EXECUTABLE" AND NOT ffx_type STREQUAL "INTERFACE_LIBRARY")
+            target_compile_options(${ffx_target} PRIVATE "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_ffx_prelude.h")
+        endif()
+    endforeach()
+endif()
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
@@ -116,14 +140,27 @@ set(COMMON
     shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
-file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+set(AVPLAYER "")
+if (BB_AVPLAYER)
+    file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
+    list(APPEND AVPLAYER shadps4/core/libraries/videodec/video_utils.cpp)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
-add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
+# Windows: a DLL cannot leave the runtime_* symbols for the executable to resolve, so the
+# library is static there and linked into sacredfire-game.exe below.
+if (WIN32)
+    set(BBGPU_KIND STATIC)
+else()
+    set(BBGPU_KIND SHARED)
+endif()
+add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
-    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
-    shadps4/core/libraries/videodec/video_utils.cpp)
+    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER})
+if (NOT BB_AVPLAYER)
+    target_compile_definitions(bbgpu PRIVATE BB_NO_AVPLAYER)
+endif()
 add_dependencies(bbgpu host_shaders)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
@@ -146,14 +183,97 @@ set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
-# Loaded with bb-probe at startup (DT_NEEDED, never dlopen): thread_local access without a
-# TLS descriptor call (_dl_tlsdesc_return was ~2% of the draw recording thread).
-target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
-# Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+if (NOT WIN32)
+    # Loaded with bb-probe at startup (DT_NEEDED, never dlopen): thread_local access without a
+    # TLS descriptor call (_dl_tlsdesc_return was ~2% of the draw recording thread).
+    target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
+    # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
+    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 miniz::miniz Zydis::Zydis sirit)
+if (BB_AVPLAYER)
+    target_link_libraries(bbgpu PUBLIC PkgConfig::FFMPEG)
+endif()
+if (WIN32)
+    # The POSIX names the bbport diagnostics use (shim/bb_win_compat.h) in every translation
+    # unit; <windows.h> (through the Vulkan Win32 surface header) without min/max macros.
+    target_compile_definitions(bbgpu PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000005)
+    target_compile_options(bbgpu PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/bb_win_compat.h)
+    target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm onecore)
+else()
+    target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
+endif()
+
+# sacredfire (Windows): the game executable, the GPU check and the launcher, built here where
+# CMake knows the static GPU library's dependencies (scripts/build-windows.sh). Linux builds them
+# with build.sh as before.
+if (WIN32)
+    set(BB_SRC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    file(GLOB BB_RUNTIME CONFIGURE_DEPENDS ${BB_SRC}/src/runtime*.c)
+    file(GLOB BB_ATRAC9 CONFIGURE_DEPENDS ${BB_SRC}/third_party/LibAtrac9/C/src/*.c)
+    add_library(atrac9 STATIC ${BB_ATRAC9})
+    target_compile_options(atrac9 PRIVATE -w)
+    set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
+    set(BB_C_WARNINGS -Wall -Wextra -Werror -Wno-unused-but-set-global)
+    set(BB_WIN_DEFS _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000005 WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_executable(sacredfire-game ${BB_SRC}/src/probe.c ${BB_RUNTIME} ${BB_SRC}/src/platform/platform_win.c
+        ${BB_SRC}/src/vulkan_smoke.c ${BB_SRC}/packaging/windows/sacredfire-game.rc)
+    set_target_properties(sacredfire-game PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    target_compile_options(sacredfire-game PRIVATE $<$<COMPILE_LANGUAGE:C>:${BB_C_WARNINGS}>)
+    target_compile_definitions(sacredfire-game PRIVATE ${BB_WIN_DEFS})
+    target_include_directories(sacredfire-game PRIVATE ${BB_SRC} ${BB_SRC}/src)
+    target_link_libraries(sacredfire-game PRIVATE bbgpu atrac9 Zydis::Zydis onecore bcrypt ws2_32 -pthread)
+    # The PS4 range (64 GiB - 1 TiB) must stay free of host allocations: no high-entropy ASLR
+    # (image ASLR and the other mitigations stay on; docs/sacredfire/13-windows-port.md). The
+    # guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
+    # Console subsystem (the log is stdout; SDL3's pkg-config flags would make it a GUI program).
+    target_link_options(sacredfire-game PRIVATE -Wl,--disable-high-entropy-va -Wl,--subsystem,console "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    add_executable(bb-gpu-capabilities ${BB_SRC}/tools/gpu_capabilities.c ${BB_SRC}/packaging/windows/sacredfire-game.rc)
+    target_compile_options(bb-gpu-capabilities PRIVATE ${BB_C_WARNINGS})
+    target_compile_definitions(bb-gpu-capabilities PRIVATE ${BB_WIN_DEFS})
+    target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan PkgConfig::SDL3)
+    target_link_options(bb-gpu-capabilities PRIVATE -Wl,--subsystem,console)
+    # SacredFire.exe: what run.sh does (game check, preparation, patches, start), in C.
+    add_executable(sacredfire ${BB_SRC}/packaging/windows/sacredfire_launcher.c ${BB_SRC}/packaging/windows/sacredfire-game.rc)
+    set_target_properties(sacredfire PROPERTIES C_STANDARD 11 OUTPUT_NAME SacredFire)
+    target_compile_options(sacredfire PRIVATE ${BB_C_WARNINGS} -municode) # wmain: UTF-16 arguments
+    target_link_options(sacredfire PRIVATE -municode)
+    target_compile_definitions(sacredfire PRIVATE ${BB_WIN_DEFS})
+    target_link_libraries(sacredfire PRIVATE shlwapi ole32 shell32)
+    # Windows versions of the runtime tests and the ABI/TLS/memory probes (tests/windows): built
+    # with `ninja windows-tests`, run on real Windows (Wine as a diagnostic).
+    add_custom_target(windows-tests)
+    foreach(probe abi_probe tls_probe memory_probe file_probe)
+        add_executable(${probe} EXCLUDE_FROM_ALL ${BB_SRC}/tests/windows/${probe}.c ${BB_SRC}/src/platform/platform_win.c)
+        set_target_properties(${probe} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+        target_compile_options(${probe} PRIVATE ${BB_C_WARNINGS} -UNDEBUG)
+        target_compile_definitions(${probe} PRIVATE ${BB_WIN_DEFS})
+        target_include_directories(${probe} PRIVATE ${BB_SRC} ${BB_SRC}/src)
+        target_link_libraries(${probe} PRIVATE Zydis::Zydis onecore bcrypt -pthread)
+        target_link_options(${probe} PRIVATE -Wl,--disable-high-entropy-va)
+        add_dependencies(windows-tests ${probe})
+    endforeach()
+    foreach(test runtime sema eventflag)
+        add_executable(${test}-test EXCLUDE_FROM_ALL ${BB_SRC}/tests/test_${test}.c ${BB_RUNTIME} ${BB_SRC}/src/platform/platform_win.c)
+        set_target_properties(${test}-test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+        target_compile_options(${test}-test PRIVATE ${BB_C_WARNINGS} -UNDEBUG) # the tests are assert()s
+        target_compile_definitions(${test}-test PRIVATE ${BB_WIN_DEFS})
+        target_include_directories(${test}-test PRIVATE ${BB_SRC} ${BB_SRC}/src)
+        target_link_libraries(${test}-test PRIVATE bbgpu atrac9 Zydis::Zydis onecore bcrypt ws2_32 -pthread)
+        target_link_options(${test}-test PRIVATE -Wl,--disable-high-entropy-va)
+        add_dependencies(windows-tests ${test}-test)
+    endforeach()
+    # AppContent alone, as build.sh links it on Linux.
+    add_executable(content-test EXCLUDE_FROM_ALL ${BB_SRC}/tests/test_content.c ${BB_SRC}/src/runtime_content.c ${BB_SRC}/src/platform/platform_win.c)
+    set_target_properties(content-test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    target_compile_options(content-test PRIVATE ${BB_C_WARNINGS} -UNDEBUG)
+    target_compile_definitions(content-test PRIVATE ${BB_WIN_DEFS})
+    target_include_directories(content-test PRIVATE ${BB_SRC} ${BB_SRC}/src)
+    target_link_libraries(content-test PRIVATE Zydis::Zydis onecore bcrypt -pthread)
+    add_dependencies(windows-tests content-test)
+endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)

@@ -1,5 +1,7 @@
 /* Exercise actual guest file operations on a linked overlay and writable saves. */
 #include "../src/runtime_file.c"
+#include <unistd.h> /* unlink, rmdir of the test fixture */
+#include <sys/stat.h> /* mkdir */
 #include <assert.h>
 static int32_t guest_errno;
 int32_t *runtime_errno(void) { return &guest_errno; }

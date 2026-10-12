@@ -1,5 +1,4 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
-#define _CRT_RAND_S
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
@@ -71,17 +70,7 @@ static ABI void *guest_tls_get_addr(const uint64_t *index) {
 void runtime_start(uint64_t flags) {
     capabilities = flags;
     if (!(flags & 1)) return;
-#ifdef _WIN32
-    unsigned int halves[2];
-    if (rand_s(&halves[0]) || rand_s(&halves[1])) { fputs("Cannot initialize stack canary\n", stderr); exit(1); }
-    memcpy(&stack_canary, halves, sizeof(stack_canary));
-#else
-    FILE *random = fopen("/dev/urandom", "rb");
-    if (!random || fread(&stack_canary, sizeof(stack_canary), 1, random) != 1) {
-        fputs("Cannot initialize stack canary\n", stderr); exit(1);
-    }
-    fclose(random);
-#endif
+    if (platform_random(&stack_canary, sizeof(stack_canary))) { fputs("Cannot initialize stack canary\n", stderr); exit(1); }
     stack_canary &= ~UINT64_C(255);
 }
 void runtime_report(void) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_free_check.h"
+#ifdef __linux__
 
 #include <algorithm>
 #include <array>
@@ -1088,3 +1089,31 @@ bool OnStaleTrapFault(u64 address) {
     return true;
 }
 } // namespace BbFreeCheck
+#else
+// Windows: BB_FREE_CHECK and BB_LABEL_TRAP need Linux signals and single-stepping; the public
+// functions answer "off" so the callers (liverpool.cpp, the caches, the fault handler) need no
+// conditionals. Said once when the variables are set.
+#include <cstdio>
+#include <cstdlib>
+namespace BbFreeCheck {
+namespace {
+bool Unavailable() {
+    static const bool said = [] {
+        if (std::getenv("BB_FREE_CHECK") || std::getenv("BB_LABEL_TRAP")) std::puts("BB_FREE_CHECK/BB_LABEL_TRAP are not available on this host (Linux signals)");
+        return true;
+    }();
+    return said;
+}
+} // namespace
+bool Enabled() { Unavailable(); return false; }
+void Check(std::uint64_t, std::uint64_t, const void*, Source, std::uint64_t) {}
+std::uint64_t NextFenceSeq() { return 0; }
+void NoteFenceDecoded(std::uint64_t, std::uint64_t, const void*, const void*, std::uint64_t) {}
+void NoteFenceWriting(std::uint64_t) {}
+void NoteFenceWritten(std::uint64_t, std::uint64_t) {}
+bool OnTrapFault(void*, std::uint64_t) { return false; }
+bool OnStaleTrapFault(std::uint64_t) { return false; }
+void NoteSubmit(std::uint64_t, const void*, std::uint64_t) {}
+void DumpAtFault(std::uint64_t, std::uint64_t) {}
+} // namespace BbFreeCheck
+#endif

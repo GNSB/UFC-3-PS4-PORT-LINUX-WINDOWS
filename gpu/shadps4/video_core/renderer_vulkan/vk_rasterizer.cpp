@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <map>
 #include <unordered_set>
 #include <xxhash.h>
@@ -911,10 +913,19 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
+#ifdef __GLIBCXX__
     for (size_t block = dirty.blocks._Find_first(); block < dirty.blocks.size();
          block = dirty.blocks._Find_next(block)) {
         blocks[num_blocks++] = static_cast<u16>(block);
     }
+#else
+    // sacredfire: libc++ has no _Find_first/_Find_next; the set bits by a plain scan.
+    for (size_t block = 0; block < dirty.blocks.size(); ++block) {
+        if (dirty.blocks.test(block)) {
+            blocks[num_blocks++] = static_cast<u16>(block);
+        }
+    }
+#endif
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
     // Constants: copied here into the ring, the recording thread only binds them.
@@ -1195,8 +1206,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
             std::memcpy(flat.data(), snapshot.user_data,
                         std::min(snapshot.user_data_size, snapshot.flat_size) * sizeof(u32));
             // Pointers in the tables may be stale by now: a fault only skips the check.
-            sigjmp_buf recover;
-            if (sigsetjmp(recover, 0)) {
+            bb_fault_jmp_buf recover; // sacredfire: the host's recovery buffer (platform.h)
+            if (bb_fault_setjmp(recover)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }
@@ -4261,11 +4272,9 @@ std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
     return liverpool->GetGpuCommandProcessorThread();
 }
 
-#ifdef __linux__
 u32 Rasterizer::GetGpuCommandProcessorThreadId() {
     return liverpool->GetGpuCommandProcessorThreadId();
 }
-#endif
 
 } // namespace Vulkan
 
