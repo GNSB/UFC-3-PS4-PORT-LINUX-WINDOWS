@@ -66,6 +66,17 @@ gpu/shim/bb_ffx_prelude.h); libc++ has no `std::atomic_ref<const T>` (texture_ca
 `__atomic_load_n`); a positioned read on a write-only descriptor is correctly refused (the first
 version of the file probe opened the file write-only).
 
+## Observations from the user's Wine session (2026-10-12)
+
+- The in-game menu's check boxes unchecked themselves at once: the settings writer replaced
+  bbport.ini with the C `rename`, which refuses an existing destination on Windows, so the menu
+  re-read the unchanged file. Fixed (std::filesystem::rename, which replaces on every host);
+  the menu's quit button and the controller port assignments worked, the game ran and races
+  loaded.
+- "Rescan controllers" found no controller plugged in after the start. Under Wine, SDL3's
+  Windows gamepad backend depends on Wine delivering device-change notifications and its HID
+  bus; this is to be re-checked on real Windows before any code change (noted, not fixed).
+
 ## Native Windows: how to test (for the user or any tester)
 
 1. Unpack `dist/SacredFire-windows-x86_64.zip` on Windows 10 1903+ with a Vulkan 1.3 driver.

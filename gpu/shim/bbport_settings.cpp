@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -304,8 +306,15 @@ void Save() {
     FILE* file = std::fopen(temporary.c_str(), "w");
     bool ok = file && std::fwrite(out.data(), 1, out.size(), file) == out.size();
     ok = file && std::fclose(file) == 0 && ok;
-    if (!ok || std::rename(temporary.c_str(), Path()) != 0) {
-        std::printf("Settings: cannot write %s\n", Path());
+    // sacredfire: std::filesystem::rename replaces an existing file on every host; the C
+    // rename does on POSIX only (on Windows the menu's changes never reached the file).
+    std::error_code error;
+    if (ok) {
+        std::filesystem::rename(temporary, Path(), error);
+    }
+    if (!ok || error) {
+        std::printf("Settings: cannot write %s%s%s\n", Path(), error ? ": " : "", error ? error.message().c_str() : "");
+        std::remove(temporary.c_str());
     }
 }
 
