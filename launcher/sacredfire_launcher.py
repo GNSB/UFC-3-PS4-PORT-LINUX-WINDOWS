@@ -257,6 +257,11 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.launch_button = Gtk.Button()
         self.launch_button.connect("clicked", self.on_launch)
         header.pack_end(self.launch_button)
+        steam_button = Gtk.Button(label=tr("Add to Steam"))
+        steam_button.set_tooltip_text(tr("A non-Steam shortcut that starts the game with these settings "
+                                         "(Steam Deck game mode). Close Steam before adding."))
+        steam_button.connect("clicked", self.on_add_to_steam)
+        header.pack_start(steam_button)
         toolbar.add_top_bar(header)
         self.toasts = Adw.ToastOverlay()
         self.toasts.set_child(self.stack)

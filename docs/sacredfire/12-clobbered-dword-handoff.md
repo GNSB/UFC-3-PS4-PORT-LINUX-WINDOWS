@@ -223,3 +223,56 @@ right before the clobber in run 4); the evening runs did 250 to 300 compiles at 
 port's cache is cleared each time (`user/cache/CUSA13795` is written and removed as expected), so
 the difference is RADV's own on-disk cache (`~/.cache/mesa_shader_cache`), cold in the morning,
 warm now. Run 4 points `MESA_SHADER_CACHE_DIR` at an empty directory to bring the long stalls back.
+
+## 2026-10-12: a reproduction on native Windows, and the late-label guard
+
+The Windows build (branch windows-port, v0.2.1-7-g4455a29, AMD Custom GPU 0932 with the AMD
+proprietary driver 2.0.302, Vulkan 1.3.280) hit the bug three times in three play sessions
+(race 2, race 2, race 4), each with the diagnostics on. The race-4 log is the first reproduction
+with the instrumentation (kept outside the repository: it holds the user's paths), and it reads
+as case 1 of the list above:
+
+- `Command buffer check: submission 34303's dcb already holds a non-packet dword when the game
+  submits it: 00000001 at +0x9228 (guest 00000010F6909220; dcb at 00000010F68FFFF8, 0x1e198
+  bytes; submitting thread 6976)`.
+- Under it, the ring names the writer: `port write into it: EOS fence of 4 bytes, value 0x1, to
+  0x10f6909220, 1525.60 ms ago, while decoding submission 34299 (thread 12580)`, then the same
+  EOS fence to the same address 7.7 to 8.1 s earlier, once every four submissions (33963, 33967,
+  ... 33987: every other frame at 30 FPS, the buffer at 0x10f6900000 alternating with the other
+  one). The slot is a NOP payload in those frames (a label allocated from the command buffer)
+  and a `SET_SH_REG` header in submission 34303 (`c0001000 6875000d [00000001] 00000050
+  f4a99910 ...`).
+- The decoder then met the header 29.66 ms after the submit, skipped two dwords, and died on
+  `Unknown PM4 type 3 opcode 0x99 with count 13482` (exit 23).
+
+So the writer is the port's own EOS label write for submission 34299, and it landed after the
+game had rebuilt the buffer for submission 34303: the game wrote the `SET_SH_REG` header, the
+port wrote 1 over it 1.5 s before the game submitted the buffer (a load stall: race 4 was
+starting). Which ordering let the game rebuild the buffer before that label was written is still
+not read off the log: in the default mode the next submission waits for the GPU-idle signal that
+follows the drain of the draw recording thread, which runs the EOS tasks; the `--tls-loads`,
+`BB_SUBMIT_AHEAD` and flip paths were checked and do not bypass it on paper. The log does not
+record when the game called the submit that was then held for 1.5 s.
+
+**The guard (gpu/shim/bbport_clobber.cpp `GuardLabel`, always on).** Every fence label store
+(EOP, EOS, RELEASE_MEM; `SignalEop`, `WriteEosLabel`, the RELEASE_MEM cases in liverpool.cpp)
+first checks whether its slot lies inside a submitted command buffer (the ring of 256 ranges)
+and now holds a plausible PM4 type-3 header (type 3, opcode 0x10 to 0xaf, reserved bits clear).
+A fence slot holds 0, 1, a counter or a clock, never that; the game resets a label it still waits
+on before it submits the buffer, so a header in the slot means the game has rebuilt the buffer
+and is done with the label. Such a write is dropped and reported once (the first 16, then every
+100th) with the writer's call chain:
+
+    Late label guarded: EOS fence of 4 bytes, value 0x1, to 0x10f6909220 from submission 34299
+    lands at +0x9228 of submission 34303's command buffer, which now holds the packet header
+    c0047600 there (the game rebuilt the buffer; submitted ... ms ago; decoding submission ...;
+    thread ...; guarded 1): the write is dropped
+        #0 sacredfire-game.exe+0x...
+        ...
+
+followed by the `SacredFire issue #2` notice, so the log still gets reported. The fence tasks now
+carry the graphics submission's seq (`EopTask`, `EosTask`) for that line. The guard turns the
+crash into a logged event; the call chain in the next report names the path (GPU thread, draw
+recording thread, Vulkan recording thread; honest, async or recorder fences), which is what the
+nine clean runs could not. The ring timestamps show it would have fired here: the slot held
+`c0047600` when the EOS fence arrived.

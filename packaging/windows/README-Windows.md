@@ -38,8 +38,10 @@ Nothing has to be installed: no Python, no runtime package, no compiler.
    The first start compiles shaders as it goes (slower); later starts preload them. *Stop* ends
    the game; closing the launcher asks first while the game runs.
 
-Without the window (a Steam shortcut, a script): `SacredFire.exe --play` uses the saved
-settings; `--game "D:\Games\CUSA13795"` names the folder. Further arguments go to the game
+*Add to Steam* writes a non-Steam shortcut ("SacredFire", `SacredFire.exe --play`) for every
+Steam user of this machine; close Steam first (it overwrites its shortcuts when it exits), then
+start Steam to see it. Without the window (that shortcut, a script): `SacredFire.exe --play`
+uses the saved settings; `--game "D:\Games\CUSA13795"` names the folder. Further arguments go to the game
 (`--timeout 120` for a watchdog, `--list-imports`). Environment variables of the Linux
 `run.sh` apply on top of the window's switches: `BB_NEO=1` (PS4 Pro mode), `BB_FPS=60`,
 `BB_VK_VALIDATION=1`, `BB_CLEAR_SHADER_CACHE=1`, `BB_DATA_DIR`, `BB_USER_DIR`,
@@ -74,7 +76,9 @@ Every run writes its whole output to `%LOCALAPPDATA%\SacredFire\logs\<date>_<tim
 shows the same lines, and the last line gives the game's exit code. For a report, attach
 that log and name your GPU and driver version. A line starting with `STOP:` or `Guest fault`/`Host fault` names the failure; the
 lines after it are the call chain. `SacredFire issue #2` in the log is a known problem (see
-the main README).
+the main README): a fence label of the port landing in a command buffer the game has rebuilt.
+Since the 2026-10-12 build such a write is caught (`Late label guarded: ...` with the writer's
+call chain) and the game goes on; please still send that log, it names the path to fix.
 
 Known differences from the Linux build: the dma-buf memory model (`BB_PC_MODEL`), userfaultfd
 tracking (`BB_UFFD`), the single-step heap diagnostics (`BB_FREE_CHECK`, `BB_LABEL_TRAP`,

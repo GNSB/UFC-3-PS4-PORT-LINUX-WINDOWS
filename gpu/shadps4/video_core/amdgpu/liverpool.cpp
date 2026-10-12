@@ -437,9 +437,11 @@ LabelDelayTest& EosDelayTest() {
     return test;
 }
 
-void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq) {
+// `seq`: the fence's place in the stream (BB_FREE_CHECK); `packet_seq`: the graphics submission
+// that holds the packet (the late-label guard, SacredFire issue #2).
+void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq, u64 packet_seq) {
     eop.SignalFence(
-        [seq](void* address, u64 data, u32 num_bytes) {
+        [seq, packet_seq](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
             EopDelayTest().Apply();
             BbFreeCheck::Check(reinterpret_cast<u64>(address), num_bytes, &data, BbFreeCheck::Eop,
@@ -447,6 +449,11 @@ void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq) {
             BbFreeCheck::NoteFenceWriting(reinterpret_cast<u64>(address));
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
             BbClobber::NoteWrite(reinterpret_cast<u64>(address), data, num_bytes, BbClobber::Eop);
+            if (BbClobber::GuardLabel(reinterpret_cast<u64>(address), data, num_bytes,
+                                      BbClobber::Eop, packet_seq)) {
+                BbFreeCheck::NoteFenceWritten(reinterpret_cast<u64>(address), 0);
+                return;
+            }
             const auto write_start = std::chrono::steady_clock::now();
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 StoreLabel(address, data, num_bytes);
@@ -467,8 +474,20 @@ void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq) {
 
 // bbport: end-of-pipe/-shader events run in order with the draws (Rasterizer::RunInOrder: on
 // the draw recording thread when the draw pipeline is in use).
+// The ordered tasks for fences carry the graphics submission's seq (the late-label guard).
+struct EopTask {
+    PM4CmdEventWriteEop eop;
+    u64 packet_seq;
+};
+struct EosTask {
+    PM4CmdEventWriteEos eos;
+    u64 packet_seq;
+};
+
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
-    const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
+    const EopTask task = *reinterpret_cast<const EopTask*>(data);
+    const auto& eop = task.eop;
+    const u64 packet_seq = task.packet_seq;
     if (eop.data_sel.Value() != DataSelect::None) {
         BbStats::eop_decoded.fetch_add(1, std::memory_order_relaxed);
     }
@@ -481,7 +500,7 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const bool writes = eop.data_sel.Value() != DataSelect::None;
         const u64 value = eop.data_sel.Value() == DataSelect::Data32Low ? eop.DataDWord()
                                                                         : eop.DataQWord();
-        rasterizer.SignalAfterGpu([eop, seq] { SignalEop(eop, seq); },
+        rasterizer.SignalAfterGpu([eop, seq, packet_seq] { SignalEop(eop, seq, packet_seq); },
                                   writes ? reinterpret_cast<VAddr>(eop.Address<u8>()) : 0, value);
         return;
     }
@@ -494,16 +513,16 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return env && env[0] == '1';
     }();
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
-        BbCopy::AfterCopies([eop, seq] { SignalEop(eop, seq); });
+        BbCopy::AfterCopies([eop, seq, packet_seq] { SignalEop(eop, seq, packet_seq); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
-        rasterizer.SignalAfterHostCopies([eop, seq] { SignalEop(eop, seq); });
+        rasterizer.SignalAfterHostCopies([eop, seq, packet_seq] { SignalEop(eop, seq, packet_seq); });
     } else {
         // Labels are written in order: not before the ones deferred to the recording thread.
         rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
-        SignalEop(eop, seq);
+        SignalEop(eop, seq, packet_seq);
     }
 }
 
@@ -588,13 +607,18 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                                 (header->type3.count.Value() - 2) * sizeof(u32), true);
 }
 
-void WriteEosLabel(void* address, u64 value, u32 num_bytes) {
+void WriteEosLabel(void* address, u64 value, u32 num_bytes, u64 packet_seq) {
     auto* memory = Core::Memory::Instance();
     EosDelayTest().Apply(); // BB_EOS_DELAY_TEST (experiment, see LabelDelayTest)
     BbFreeCheck::Check(reinterpret_cast<u64>(address), num_bytes, &value, BbFreeCheck::Eos);
     BbFreeCheck::NoteFenceWriting(reinterpret_cast<u64>(address));
     BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
     BbClobber::NoteWrite(reinterpret_cast<u64>(address), value, num_bytes, BbClobber::Eos);
+    if (BbClobber::GuardLabel(reinterpret_cast<u64>(address), value, num_bytes, BbClobber::Eos,
+                              packet_seq)) {
+        BbFreeCheck::NoteFenceWritten(reinterpret_cast<u64>(address));
+        return;
+    }
     if (!memory->TryWriteBacking(address, &value, num_bytes)) {
         StoreLabel(address, value, num_bytes);
     }
@@ -606,13 +630,18 @@ void WriteEosLabel(void* address, u64 value, u32 num_bytes) {
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
-    const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
+    const EosTask& task = *reinterpret_cast<const EosTask*>(data);
+    const auto& event_eos = task.eos;
+    const u64 packet_seq = task.packet_seq;
+    const auto write_label = [packet_seq](void* address, u64 value, u32 num_bytes) {
+        WriteEosLabel(address, value, num_bytes, packet_seq);
+    };
     // BB_HONEST_LABELS: end of shader work, so written once the GPU has finished it.
     if (Vulkan::Rasterizer::HonestLabels() &&
         event_eos.command == PM4CmdEventWriteEos::Command::SignalFence) {
         rasterizer.ProcessDownloadImages();
         const PM4CmdEventWriteEos eos = event_eos;
-        rasterizer.SignalAfterGpu([eos] { eos.SignalFence(&WriteEosLabel); },
+        rasterizer.SignalAfterGpu([eos, write_label] { eos.SignalFence(write_label); },
                                   reinterpret_cast<VAddr>(eos.Address()), eos.DataDWord());
         return;
     }
@@ -620,7 +649,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
     rasterizer.ProcessDownloadImages();
-    event_eos.SignalFence(&WriteEosLabel);
+    event_eos.SignalFence(write_label);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
         rasterizer.Finish();
@@ -1568,8 +1597,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     BbFreeCheck::NoteFenceDecoded(reinterpret_cast<u64>(event_eos->Address()),
                                                   event_eos->DataDWord(), header, dcb.data(), seq);
                 }
+                const EosTask eos_task{*event_eos, seq};
                 if (rasterizer &&
-                    rasterizer->RunInOrder(&RunEventWriteEos, event_eos, sizeof(*event_eos),
+                    rasterizer->RunInOrder(&RunEventWriteEos, &eos_task, sizeof(eos_task),
                                            BbToggle::PipelinedTasks, false)) {
                     NotePendingFences(*event_eos);
                 }
@@ -1584,13 +1614,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                                              : event_eop->DataQWord(),
                         header, dcb.data(), seq);
                 }
+                const EopTask eop_task{*event_eop, seq};
                 if (rasterizer) {
-                    if (rasterizer->RunInOrder(&RunEventWriteEop, event_eop, sizeof(*event_eop),
+                    if (rasterizer->RunInOrder(&RunEventWriteEop, &eop_task, sizeof(eop_task),
                                                BbToggle::PipelinedTasks, false)) {
                         NotePendingFences(*event_eop);
                     }
                 } else {
-                    SignalEop(*event_eop, 0);
+                    SignalEop(*event_eop, 0, seq);
                 }
                 break;
             }
@@ -2103,6 +2134,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             BbClobber::NoteWrite(release.Address<u64>(), release.DataQWord(),
                                                  sel == DataSelect::Data32Low ? 4 : 8,
                                                  BbClobber::ReleaseMem);
+                            if (BbClobber::GuardLabel(release.Address<u64>(), release.DataQWord(),
+                                                      sel == DataSelect::Data32Low ? 4 : 8,
+                                                      BbClobber::ReleaseMem, 0)) {
+                                Platform::IrqC::Instance()->Signal(
+                                    static_cast<Platform::InterruptId>(pipe_id));
+                                return;
+                            }
                         }
                         release.SignalFence(
                             [pipe_id] {
@@ -2129,6 +2167,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                    BbFreeCheck::ReleaseMem);
                 BbClobber::NoteWrite(release_mem->Address<u64>(), value,
                                      sel == DataSelect::Data32Low ? 4 : 8, BbClobber::ReleaseMem);
+                if (BbClobber::GuardLabel(release_mem->Address<u64>(), value,
+                                          sel == DataSelect::Data32Low ? 4 : 8,
+                                          BbClobber::ReleaseMem, 0)) {
+                    Platform::IrqC::Instance()->Signal(
+                        static_cast<Platform::InterruptId>(queue.pipe_id));
+                    break;
+                }
             }
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();

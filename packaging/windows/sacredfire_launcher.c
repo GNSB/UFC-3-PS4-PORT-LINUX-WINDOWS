@@ -26,11 +26,14 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <tlhelp32.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #define PATHW (MAX_PATH * 4)
 static wchar_t root[PATHW];   /* the folder this program runs from */
@@ -392,9 +395,173 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     return code;
 }
 
+
+/* ---- Steam: a non-Steam shortcut (userdata\<user>\config\shortcuts.vdf) ----
+ * The same entry the Linux launcher writes (launcher/steam_shortcuts.py): Steam keeps its
+ * non-Steam games in a binary VDF (a map of numbered entries; strings 0x01, 32-bit integers
+ * 0x02, nested maps 0x00 ended by 0x08) that it rewrites when it exits, so Steam has to be
+ * closed while the entry is added. The app id is the CRC32 of the quoted executable and the
+ * name with the top bit set, as Steam computes it. The shortcut starts SacredFire.exe --play. */
+static uint32_t crc32_of(const char *text) {
+    uint32_t crc = 0xffffffffu;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        crc ^= *p;
+        for (int i = 0; i < 8; ++i) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+static int steam_running(void) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W entry = {.dwSize = sizeof(entry)};
+    int found = 0;
+    for (BOOL ok = Process32FirstW(snapshot, &entry); ok && !found; ok = Process32NextW(snapshot, &entry))
+        if (!_wcsicmp(entry.szExeFile, L"steam.exe")) found = 1;
+    CloseHandle(snapshot);
+    return found;
+}
+static int steam_root(wchar_t *out_path) {
+    DWORD size = PATHW * sizeof(wchar_t);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, NULL, out_path, &size) != ERROR_SUCCESS) return 0;
+    for (wchar_t *p = out_path; *p; ++p) if (*p == L'/') *p = L'\\';
+    return exists(out_path);
+}
+/* A map's contents from `at` (just after its key) to its closing 0x08; -1 on a malformed file. */
+static long vdf_skip_map(const unsigned char *d, long n, long at) {
+    while (at < n) {
+        unsigned char kind = d[at++];
+        if (kind == 0x08) return at;
+        while (at < n && d[at]) ++at; /* the key */
+        if (at++ >= n) return -1;
+        if (kind == 0x00) { at = vdf_skip_map(d, n, at); if (at < 0) return -1; }
+        else if (kind == 0x01) { while (at < n && d[at]) ++at; if (at++ >= n) return -1; }
+        else if (kind == 0x02) at += 4;
+        else return -1;
+    }
+    return -1;
+}
+static void vdf_put(unsigned char **out, const void *bytes, size_t n) { memcpy(*out, bytes, n); *out += n; }
+static void vdf_string(unsigned char **out, const char *key, const char *value) { unsigned char k = 1; vdf_put(out, &k, 1); vdf_put(out, key, strlen(key) + 1); vdf_put(out, value, strlen(value) + 1); }
+static void vdf_int(unsigned char **out, const char *key, int32_t value) { unsigned char k = 2; vdf_put(out, &k, 1); vdf_put(out, key, strlen(key) + 1); vdf_put(out, &value, 4); }
+/* Adds the entry to one shortcuts.vdf (created if missing; an entry with the same executable
+ * and name is replaced). Returns 1 added, 2 replaced, 0 on failure (message in the log). */
+static int steam_add_shortcut(const wchar_t *path, const char *exe_quoted, const char *start_dir_quoted) {
+    static unsigned char data[1 << 20], fresh[4096];
+    long n = 0;
+    FILE *f = _wfopen(path, L"rb");
+    if (f) { n = (long)fread(data, 1, sizeof(data), f); fclose(f); if (n >= (long)sizeof(data)) { logw(L"%ls: too large\n", path); return 0; } }
+    /* The new entry. */
+    char appid_text[1200]; snprintf(appid_text, sizeof(appid_text), "%sSacredFire", exe_quoted);
+    const int32_t appid = (int32_t)(crc32_of(appid_text) | 0x80000000u);
+    unsigned char entry[4096], *e = entry;
+    unsigned char kind_map = 0, end = 8;
+    char index_key[16] = "0";
+    /* Walk the existing file: the "shortcuts" map's entries. */
+    long body_start = -1, body_end = -1, replace_start = -1, replace_end = -1; int next_index = 0;
+    if (n > 0) {
+        long at = 0;
+        if (data[at] != 0x00 || strcmp((const char *)data + 1, "shortcuts") != 0) { logw(L"%ls: not a shortcuts file\n", path); return 0; }
+        at = 1 + (long)strlen("shortcuts") + 1;
+        body_start = at;
+        while (at < n && data[at] != 0x08) {
+            if (data[at] != 0x00) { logw(L"%ls: unexpected field in the shortcuts map\n", path); return 0; }
+            const long entry_start = at;
+            const char *key = (const char *)data + at + 1;
+            long inner = at + 1 + (long)strlen(key) + 1;
+            const long entry_end = vdf_skip_map(data, n, inner);
+            if (entry_end < 0) { logw(L"%ls: malformed\n", path); return 0; }
+            const int index = atoi(key); if (index + 1 > next_index) next_index = index + 1;
+            /* Its Exe and AppName. */
+            const char *exe = NULL, *name = NULL;
+            for (long k = inner; k < entry_end - 1;) {
+                unsigned char kind = data[k++]; const char *field = (const char *)data + k; k += (long)strlen(field) + 1;
+                if (kind == 0x01) { const char *value = (const char *)data + k; k += (long)strlen(value) + 1; if (!strcmp(field, "Exe")) exe = value; else if (!strcmp(field, "AppName")) name = value; }
+                else if (kind == 0x02) k += 4;
+                else if (kind == 0x00) { k = vdf_skip_map(data, n, k); if (k < 0) break; }
+                else break;
+            }
+            if (exe && name && !strcmp(exe, exe_quoted) && !strcmp(name, "SacredFire") && replace_start < 0) { replace_start = entry_start; replace_end = entry_end; snprintf(index_key, sizeof(index_key), "%s", key); }
+            at = entry_end;
+        }
+        if (at >= n) { logw(L"%ls: malformed (no end)\n", path); return 0; }
+        body_end = at;
+    }
+    if (replace_start < 0) snprintf(index_key, sizeof(index_key), "%d", next_index);
+    vdf_put(&e, &kind_map, 1); vdf_put(&e, index_key, strlen(index_key) + 1);
+    vdf_int(&e, "appid", appid);
+    vdf_string(&e, "AppName", "SacredFire");
+    vdf_string(&e, "Exe", exe_quoted);
+    vdf_string(&e, "StartDir", start_dir_quoted);
+    vdf_string(&e, "icon", "");
+    vdf_string(&e, "ShortcutPath", "");
+    vdf_string(&e, "LaunchOptions", "--play");
+    vdf_int(&e, "IsHidden", 0); vdf_int(&e, "AllowDesktopConfig", 1); vdf_int(&e, "AllowOverlay", 1);
+    vdf_int(&e, "OpenVR", 0); vdf_int(&e, "Devkit", 0);
+    vdf_string(&e, "DevkitGameID", "");
+    vdf_int(&e, "DevkitOverrideAppID", 0); vdf_int(&e, "LastPlayTime", 0);
+    vdf_string(&e, "FlatpakAppID", "");
+    vdf_put(&e, &kind_map, 1); vdf_put(&e, "tags", 5); vdf_put(&e, &end, 1);
+    vdf_put(&e, &end, 1);
+    const size_t entry_bytes = (size_t)(e - entry);
+    /* The new file. */
+    wchar_t temp[PATHW]; _snwprintf(temp, PATHW, L"%ls.tmp", path); temp[PATHW - 1] = 0;
+    wchar_t folder[PATHW]; wcsncpy(folder, path, PATHW - 1); folder[PATHW - 1] = 0; { wchar_t *slash = wcsrchr(folder, L'\\'); if (slash) *slash = 0; } ensure_directory(folder);
+    FILE *out = _wfopen(temp, L"wb");
+    if (!out) { logw(L"%ls: cannot write\n", temp); return 0; }
+    int result;
+    if (n == 0) {
+        unsigned char *h = fresh;
+        vdf_put(&h, &kind_map, 1); vdf_put(&h, "shortcuts", 10);
+        fwrite(fresh, 1, (size_t)(h - fresh), out); fwrite(entry, 1, entry_bytes, out); fputc(8, out); fputc(8, out);
+        result = 1;
+    } else if (replace_start >= 0) {
+        fwrite(data, 1, (size_t)replace_start, out); fwrite(entry, 1, entry_bytes, out); fwrite(data + replace_end, 1, (size_t)(n - replace_end), out);
+        result = 2;
+    } else {
+        fwrite(data, 1, (size_t)body_end, out); fwrite(entry, 1, entry_bytes, out); fwrite(data + body_end, 1, (size_t)(n - body_end), out);
+        result = 1;
+    }
+    (void)body_start;
+    fclose(out);
+    if (!MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { logw(L"%ls: cannot replace\n", path); return 0; }
+    return result;
+}
+/* The button: every Steam user of this Steam installation gets the shortcut. */
+static void add_to_steam(void) {
+    if (steam_running()) { fail(L"Close Steam first: it overwrites its shortcuts when it exits. Then press Add to Steam again."); return; }
+    wchar_t steam[PATHW], userdata[PATHW], pattern[PATHW];
+    if (!steam_root(steam)) { fail(L"Steam was not found (no SteamPath in the registry)."); return; }
+    join(userdata, PATHW, steam, L"userdata"); join(pattern, PATHW, userdata, L"*");
+    wchar_t self[PATHW]; GetModuleFileNameW(NULL, self, PATHW);
+    char exe_utf8[PATHW * 3], root_utf8[PATHW * 3], exe_quoted[PATHW * 3 + 4], root_quoted[PATHW * 3 + 4];
+    WideCharToMultiByte(CP_UTF8, 0, self, -1, exe_utf8, sizeof(exe_utf8), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, root, -1, root_utf8, sizeof(root_utf8), NULL, NULL);
+    snprintf(exe_quoted, sizeof(exe_quoted), "\"%s\"", exe_utf8); snprintf(root_quoted, sizeof(root_quoted), "\"%s\"", root_utf8);
+    int added = 0, replaced = 0, failed = 0;
+    WIN32_FIND_DATAW found; HANDLE search = FindFirstFileW(pattern, &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !iswdigit(found.cFileName[0]) || !wcscmp(found.cFileName, L"0")) continue;
+            wchar_t config[PATHW], vdf[PATHW];
+            join(config, PATHW, userdata, found.cFileName); join(config, PATHW, config, L"config");
+            if (!exists(config)) continue;
+            join(vdf, PATHW, config, L"shortcuts.vdf");
+            const int r = steam_add_shortcut(vdf, exe_quoted, root_quoted);
+            if (r == 1) ++added; else if (r == 2) ++replaced; else ++failed;
+            logw(L"Steam: %ls: %ls\n", vdf, r == 1 ? L"shortcut added" : r == 2 ? L"shortcut updated" : L"failed");
+        } while (FindNextFileW(search, &found));
+        FindClose(search);
+    }
+    if (added + replaced == 0) { fail(failed ? L"The Steam shortcut could not be written (see the log)." : L"No Steam user folder was found (Steam\\userdata)."); return; }
+    wchar_t message[256];
+    _snwprintf(message, 256, L"Added to Steam as \"SacredFire\" (%d added, %d updated). Start Steam to see it; it starts the game with the saved settings (--play).", added, replaced);
+    logw(L"%ls\n", message);
+    if (!GetEnvironmentVariableW(L"BB_NO_DIALOGS", NULL, 0)) MessageBoxW(main_window, message, L"SacredFire", MB_OK | MB_ICONINFORMATION);
+}
+
 /* ---- the window ---- */
 enum { ID_GAME = 100, ID_BROWSE, ID_GAMEPAD, ID_RESCAN, ID_P60, ID_PBLUR, ID_P1080, ID_NEO, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
-       ID_PLAY, ID_STOP, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
+       ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
 static float scale = 1.0f;
@@ -481,6 +648,7 @@ static void set_running(int on) {
     running = on;
     EnableWindow(control(ID_PLAY), !on); EnableWindow(control(ID_STOP), on);
     for (int id = ID_GAME; id <= ID_TRACE; ++id) EnableWindow(control(id), !on);
+    EnableWindow(control(ID_STEAM), !on);
 }
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
@@ -496,6 +664,9 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             if (t) CloseHandle(t); else { fail(L"CreateThread failed"); set_running(0); }
         } else if (id == ID_STOP && running) {
             if (game_process) { logw(L"Stop: the game process is ended\n"); TerminateProcess(game_process, 1); }
+        } else if (id == ID_STEAM && !running) {
+            read_controls(); /* the shortcut uses the saved settings */
+            add_to_steam();
         } else if (id == ID_LOGS || id == ID_DATA) {
             wchar_t folder[PATHW];
             if (id == ID_LOGS) join(folder, PATHW, data, L"logs"); else { wcsncpy(folder, data, PATHW - 1); folder[PATHW - 1] = 0; }
@@ -592,6 +763,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Menu input trace", BS_AUTOCHECKBOX, 420, y + 20, 200, 20, ID_TRACE); y += 58;
     make(L"BUTTON", L"Play", BS_DEFPUSHBUTTON, 12, y, 120, 30, ID_PLAY);
     make(L"BUTTON", L"Stop", BS_PUSHBUTTON, 140, y, 90, 30, ID_STOP);
+    make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
     log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 640 - y - 12, ID_LOG);

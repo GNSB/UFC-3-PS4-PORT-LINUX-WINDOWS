@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_clobber.h"
 #include "common/signal_context.h"
+#include "../../src/platform/platform.h"
 
 #include <algorithm>
 #include <array>
@@ -152,6 +153,73 @@ void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, 
     if (late) {
         AskForReport();
     }
+}
+
+namespace {
+// A plausible PM4 type-3 header: type 3, a known opcode range, the reserved bits clear (the
+// predicate and shader-type bits may be set). A fence slot holds 0, 1, a counter or a clock:
+// none of these look like one.
+bool LooksLikeType3Header(std::uint32_t word) {
+    const std::uint32_t opcode = (word >> 8) & 0xff;
+    return (word >> 30) == 3 && opcode >= 0x10 && opcode <= 0xaf && (word & 0xfc) == 0;
+}
+} // namespace
+
+bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source,
+                std::uint64_t packet_seq) {
+    if (address == 0 || (bytes != 4 && bytes != 8) || (address & 3) != 0) {
+        return false;
+    }
+    // Inside a submitted command buffer? (The newest submission whose range holds it.)
+    const Range* hit = nullptr;
+    const std::uint64_t head = ranges_head.load(std::memory_order_relaxed);
+    const std::uint64_t count = std::min<std::uint64_t>(head, ranges.size());
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const Range& r = ranges[(head - 1 - i) % ranges.size()];
+        if (r.bytes != 0 && address >= r.base && address + bytes <= r.base + r.bytes &&
+            (!hit || r.seq > hit->seq)) {
+            hit = &r;
+        }
+    }
+    if (!hit) {
+        return false;
+    }
+    std::uint32_t now_words[2] = {0, 0};
+    std::memcpy(now_words, reinterpret_cast<const void*>(address), bytes);
+    const bool header = LooksLikeType3Header(now_words[0]) ||
+                        (bytes == 8 && LooksLikeType3Header(now_words[1]));
+    if (!header) {
+        return false;
+    }
+    static std::atomic<std::uint64_t> guarded{0};
+    const std::uint64_t n = guarded.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || n % 100 == 0) {
+        const std::uint64_t now = NowNs();
+        char thread[32] = "?";
+        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        std::fprintf(stderr,
+                     "Late label guarded: %s of %u bytes, value %#llx, to %#llx from submission %llu "
+                     "lands at +%#llx of submission %llu's command buffer, which now holds the packet "
+                     "header %08x there (the game rebuilt the buffer; submitted %.2f ms ago; decoding "
+                     "submission %llu; thread %s; guarded %llu): the write is dropped\n",
+                     SourceName(source), bytes, (unsigned long long)value,
+                     (unsigned long long)address, (unsigned long long)packet_seq,
+                     (unsigned long long)(address - hit->base), (unsigned long long)hit->seq,
+                     LooksLikeType3Header(now_words[0]) ? now_words[0] : now_words[1],
+                     (now - hit->ns) / 1e6,
+                     (unsigned long long)decoding.load(std::memory_order_relaxed), thread,
+                     (unsigned long long)n);
+        void* frames[24];
+        const int depth = platform_backtrace(frames, 24);
+        for (int i = 1; i < depth; ++i) {
+            char where[256];
+            platform_describe_address(reinterpret_cast<uintptr_t>(frames[i]), where, sizeof(where));
+            std::fprintf(stderr, "    #%d %s\n", i - 1, where);
+        }
+        std::fflush(stderr);
+        AskForReport();
+    }
+    return true;
 }
 
 void DumpWritesInto(std::uint64_t address, std::uint64_t bytes) {

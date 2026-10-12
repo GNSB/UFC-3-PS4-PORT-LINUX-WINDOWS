@@ -106,7 +106,7 @@ lives in `~/.local/share/sacredfire`, launcher settings in `~/.config/sacredfire
 Without a game folder chosen, the launcher shows the Game row as *not chosen* with Play disabled
 until a folder passes the game check.
 
-**Adding the AppImage to Steam**: the launcher's *Settings → Steam → Add to Steam* writes the
+**Adding the AppImage to Steam**: the launcher's *Add to Steam* button (header bar, also under *Settings → Steam*) writes the
 shortcut (with `--play`, for the Steam Deck's game mode) while Steam is closed; by hand, *Add a
 Non-Steam Game* needs no options. The compatibility tool does not matter. Steam's overlay is removed before the port's own programs start. Where
 Steam runs games without FUSE, set the launch options to

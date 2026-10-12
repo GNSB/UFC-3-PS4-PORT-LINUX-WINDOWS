@@ -48,6 +48,16 @@ void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, 
 /// The remembered writes that touched [address, address + bytes), newest first, on stderr.
 void DumpWritesInto(std::uint64_t address, std::uint64_t bytes);
 
+/// The late-label guard, before a fence label (EOP, EOS, RELEASE_MEM) is stored: true when the
+/// write must be dropped, because its slot lies inside a submitted command buffer and now holds
+/// a PM4 packet header: the game rebuilt the buffer over the label (the writer of SacredFire
+/// issue #2), so storing the value would clobber the new packet; the game resets a label it
+/// still waits on before submitting it, so a header there means it is done with the label.
+/// Reports the write, the buffer, and the writer's call chain. `packet_seq`: the graphics
+/// submission whose packet asked for the write (0: a compute queue or unknown).
+bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source,
+                std::uint64_t packet_seq);
+
 /// BB_COPY_PROTECT=1.
 bool ProtectCopies();
 /// Storage for a SubmittedCopy: whole pages, page-aligned, when ProtectCopies(); malloc otherwise.
