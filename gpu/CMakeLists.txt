@@ -235,13 +235,14 @@ if (WIN32)
     target_compile_definitions(bb-gpu-capabilities PRIVATE ${BB_WIN_DEFS})
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan PkgConfig::SDL3)
     target_link_options(bb-gpu-capabilities PRIVATE -Wl,--subsystem,console)
-    # SacredFire.exe: what run.sh does (game check, preparation, patches, start), in C.
-    add_executable(sacredfire ${BB_SRC}/packaging/windows/sacredfire_launcher.c ${BB_SRC}/packaging/windows/sacredfire-game.rc)
+    # SacredFire.exe: the launcher window (native Win32) and what run.sh does (game check,
+    # preparation, patches, start) behind its Play button or --play.
+    add_executable(sacredfire WIN32 ${BB_SRC}/packaging/windows/sacredfire_launcher.c ${BB_SRC}/packaging/windows/sacredfire-launcher.rc)
     set_target_properties(sacredfire PROPERTIES C_STANDARD 11 OUTPUT_NAME SacredFire)
-    target_compile_options(sacredfire PRIVATE ${BB_C_WARNINGS} -municode) # wmain: UTF-16 arguments
-    target_link_options(sacredfire PRIVATE -municode)
+    target_compile_options(sacredfire PRIVATE ${BB_C_WARNINGS} -municode) # wWinMain: UTF-16 arguments
+    target_link_options(sacredfire PRIVATE -municode -mwindows)
     target_compile_definitions(sacredfire PRIVATE ${BB_WIN_DEFS})
-    target_link_libraries(sacredfire PRIVATE shlwapi ole32 shell32 uuid)
+    target_link_libraries(sacredfire PRIVATE comctl32 shlwapi ole32 shell32 uuid user32 gdi32)
     # Windows versions of the runtime tests and the ABI/TLS/memory probes (tests/windows): built
     # with `ninja windows-tests`, run on real Windows (Wine as a diagnostic).
     add_custom_target(windows-tests)

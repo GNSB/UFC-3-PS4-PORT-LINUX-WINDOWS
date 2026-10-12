@@ -29,15 +29,21 @@ Nothing has to be installed: no Python, no runtime package, no compiler.
 
 1. Unpack the archive anywhere (a folder without special permissions is best, e.g.
    `C:\Games\SacredFire`).
-2. Run `SacredFire.exe`. On the first start it asks for the game folder (the one with
-   `eboot.bin`). The folder is remembered in `%LOCALAPPDATA%\SacredFire\sacredfire.ini`.
-3. A console window shows the log while the game runs; the game window opens when the renderer
-   is ready. The first start compiles shaders as it goes (slower); later starts preload them.
+2. Run `SacredFire.exe`: the launcher window. *Browse...* to the game folder (the one with
+   `eboot.bin`), pick the controller for port 1 if you have several, tick the patches and
+   switches you want, *Play*. Everything is remembered in
+   `%LOCALAPPDATA%\SacredFire\sacredfire.ini` (the patches in `bbport.ini`, shared with the
+   in-game menu).
+3. The log of the run scrolls in the window; the game window opens when the renderer is ready.
+   The first start compiles shaders as it goes (slower); later starts preload them. *Stop* ends
+   the game; closing the launcher asks first while the game runs.
 
-From a shell: `SacredFire.exe --game "D:\Games\CUSA13795"`. Further arguments go to the game
+Without the window (a Steam shortcut, a script): `SacredFire.exe --play` uses the saved
+settings; `--game "D:\Games\CUSA13795"` names the folder. Further arguments go to the game
 (`--timeout 120` for a watchdog, `--list-imports`). Environment variables of the Linux
-`run.sh` apply: `BB_NEO=1` (PS4 Pro mode), `BB_FPS=60`, `BB_VK_VALIDATION=1`,
-`BB_CLEAR_SHADER_CACHE=1`, `BB_DATA_DIR`, `BB_USER_DIR`, `BB_SKIP_GAME_CHECK=1`.
+`run.sh` apply on top of the window's switches: `BB_NEO=1` (PS4 Pro mode), `BB_FPS=60`,
+`BB_VK_VALIDATION=1`, `BB_CLEAR_SHADER_CACHE=1`, `BB_DATA_DIR`, `BB_USER_DIR`,
+`BB_SKIP_GAME_CHECK=1`. Started from a console, the output also goes there.
 
 ## Where things are
 
@@ -63,10 +69,10 @@ apply after a restart.
 
 ## Logs and problems
 
-Every start writes its whole output to `%LOCALAPPDATA%\SacredFire\logs\<date>_<time>.log`
-(the first line of the console names the file), the console shows the same lines, and after a
-failed exit the console stays open until Enter. For a report, attach that log and name your
-GPU and driver version. A line starting with `STOP:` or `Guest fault`/`Host fault` names the failure; the
+Every run writes its whole output to `%LOCALAPPDATA%\SacredFire\logs\<date>_<time>.log`
+(the first line in the window names the file; *Open logs folder* shows them), the window
+shows the same lines, and the last line gives the game's exit code. For a report, attach
+that log and name your GPU and driver version. A line starting with `STOP:` or `Guest fault`/`Host fault` names the failure; the
 lines after it are the call chain. `SacredFire issue #2` in the log is a known problem (see
 the main README).
 

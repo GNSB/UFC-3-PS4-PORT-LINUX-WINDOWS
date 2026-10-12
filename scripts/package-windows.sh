@@ -37,7 +37,7 @@ resolve() {
     "$readobj" --coff-imports "$pe" | sed -n 's/^ *Name: \(.*\)$/\1/p' | while read -r dll; do
         local lower=${dll,,}
         case $lower in
-        kernel32.dll|user32.dll|gdi32.dll|advapi32.dll|shell32.dll|ole32.dll|oleaut32.dll|shlwapi.dll|ws2_32.dll|bcrypt.dll|ntdll.dll|\
+        kernel32.dll|user32.dll|gdi32.dll|comctl32.dll|advapi32.dll|shell32.dll|ole32.dll|oleaut32.dll|shlwapi.dll|ws2_32.dll|bcrypt.dll|ntdll.dll|\
         winmm.dll|imm32.dll|version.dll|setupapi.dll|cfgmgr32.dll|dwmapi.dll|uxtheme.dll|crypt32.dll|msvcrt.dll|vulkan-1.dll|\
         api-ms-win-*|ext-ms-*|dbghelp.dll|synchronization.dll|onecore.dll|comdlg32.dll|hid.dll|xinput*.dll|dinput8.dll|\
         d3d11.dll|d3d12.dll|dxgi.dll|opengl32.dll|wininet.dll|urlmon.dll|iphlpapi.dll|dxcore.dll|windows.*.dll|avrt.dll|mmdevapi.dll|ole32.dll)

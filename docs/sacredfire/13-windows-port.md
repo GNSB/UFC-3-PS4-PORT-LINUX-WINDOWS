@@ -64,15 +64,20 @@ guards that compile the runtime files to empty stubs.
 9. **FFmpeg excluded on Windows** (`BB_AVPLAYER=OFF`): CTR imports no libSceAvPlayer or
    libSceVideodec function (out/import_names.txt), so the AvPlayer sources are Bloodborne-only.
    Linux keeps building them (default ON) so nothing changes there.
-10. **Player entrypoint: a native C launcher plus the Python embeddable package.** The preparation
-    steps are the existing Python scripts (SELF parsing, module linking, patches); rewriting them
-    in C was judged out of scope. `python-3.13.16-embed-amd64.zip` (stdlib only, no Tk, no pip)
-    runs them; `sacredfire.exe` (C, built by the cross toolchain) does what run.sh does and starts
-    the game. No PyInstaller: it is not a cross-compiler.
+10. **Player entrypoint: a native Win32 launcher plus the Python embeddable package.** The
+    preparation steps are the existing Python scripts (SELF parsing, module linking, patches);
+    rewriting them in C was judged out of scope. `python-3.13.16-embed-amd64.zip` (stdlib only,
+    no Tk, no pip) runs them; `SacredFire.exe` (C, Win32 API only, built by the cross toolchain)
+    is the counterpart of the GTK launcher: a window with the game folder, the controller for
+    port 1, the game patches, PS4 Pro mode, fullscreen, the developer switches, Play/Stop and
+    the log, and behind Play what run.sh does. `--play` starts the game without the window
+    (Steam shortcuts). No PyInstaller: it is not a cross-compiler; no GTK: PyGObject cannot be
+    produced for the embeddable Python from Linux.
 11. **Not ported** (reported, not faked): userfaultfd write tracking (BB_UFFD), the dma-buf memory
     model (BB_PC_MODEL), the SIGTRAP single-step diagnostics (BB_LABEL_TRAP, BB_FREE_CHECK trap
-    mode, guest heap hooks), PGO, MangoHud, the GTK launcher, mods overlays (symlinks), the in-game
-    restart through run.sh (becomes a relaunch of the launcher command line).
+    mode, guest heap hooks), PGO, MangoHud, mods overlays (symlinks), the in-game restart through
+    run.sh (becomes a relaunch of the launcher command line), the GTK launcher's Steam shortcut
+    writer and issue-report helpers.
 
 ## Architecture: platform services
 
@@ -106,7 +111,7 @@ read, page protection, fault-context accessors): the shim diagnostics include it
 | src/runtime_sema.c / eventflag.c monotonic condvars | WAIT_CLOCK = CLOCK_REALTIME | platform wait clock | none | sema/eventflag tests pass on both |
 | gpu/shim/window.cpp X11/Wayland | `WindowSystemType::Windows`, HWND | add the Windows branch | none | window smoke test |
 | gpu/CMakeLists.txt shared lib, X11, FFmpeg | static lib on WIN32, bb-probe target in CMake | options BB_AVPLAYER, WIN32 branches, the executable targets | default values keep Linux as is | Linux build + Windows build |
-| scripts/run.sh | run.py | sacredfire.exe launcher in C + embedded Python; aerolib.inl bundled (no download at run time) | none | launcher test on Wine, then Windows |
+| scripts/run.sh, launcher/ (GTK4) | run.py, bbport_launcher_win.py (Tkinter) | SacredFire.exe: Win32 launcher window in C (same pages as the GTK one) + embedded Python for the preparation; aerolib.inl bundled (no download at run time) | none | launcher test on Wine (window, Play, Stop, settings), then Windows |
 | packaging/appimage.sh | packaging/windows/package.sh | scripts/package-windows.sh: closure check with llvm-readobj, zip, manifest, sha256 | none | archive inspection |
 | excluded | launcher/bbport_launcher_win.py (Tkinter, PyInstaller), bbnet/shadNet, DLSS bridge, run.py co-op overrides | not taken | - | - |
 

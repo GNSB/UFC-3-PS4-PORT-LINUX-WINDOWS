@@ -35,6 +35,7 @@ the archive is a candidate, not a release.
 | 3 Runtime tests as Windows programs (runtime, sema, eventflag, content) | PASS under Wine; NOT RUN on Windows | `scripts/build-windows.sh --tests`, run with the toolchain DLLs beside them: all four print their PASS line (the runtime test exercises the section-backed direct memory, guard ABI, mutexes, callbacks) |
 | 4 Window, native PRX initialization, title screen, input, audio | Wine diagnostic reached the running game; BLOCKED on Windows | The packaged tree under Wine 11 (Bottles flatpak) with the user's game folder: SacredFire.exe ran the bundled Python through game_check, prepare, link_libc, link_modules (fs->gs patched=3747), gen_import_names (bundled aerolib.inl), content_profile, patches; sacredfire-game.exe found the display and the GPU (RADV, Vulkan 1.4), created the window and presenter, patched 3747 TCB loads ("matches the preparation step"), ran the three module initializers (all 0), entered the eboot, loaded the system modules, opened two audio ports; the GPU thread decoded thousands of submissions and the user heard the game's audio. Window: with Wine's X11 driver under Xwayland, KWin kept a 1920x1080 windowed surface at 1 pixel high off-screen (xdotool could not help); BB_FULLSCREEN=1 gives a viewable 1920x1080 window. Wine's own Wayland driver (flatpak Wine 11) cannot create the Vulkan SDL window ("File not found"). Fullscreen run on 2026-10-12: the user played it ("it worked fine"), the engine log shows a race being loaded (eight drivers), and closing the window ended the process with exit code 0. None of this is Windows acceptance evidence: it is the Windows build on Wine's Win32 implementation over the Deck's Linux drivers. |
 | 5 Race, menus, save, restart, reload, repeated sessions | BLOCKED on Windows; under Wine the user reached a race and quit cleanly (one session) | needs real Windows; saves, restart, reload and repeated sessions were not exercised |
+| 4 Launcher window (SacredFire.exe): folder, controller list, patches to bbport.ini, switches, Play, log, Stop, settings kept | PASS under Wine; NOT RUN on Windows | 2026-10-12, Wine 11 (Proton) with the X11 driver: the window lays out at 96 and 144 DPI (system message font, scaled positions), lists the one SDL gamepad, a Play press ran the preparation and the game with the log streaming into the window, the controls were locked during the run and freed when the watchdog ended it (exit 142 with BB_TIMEOUT=90), closing the window wrote sacredfire.ini. The folder picker (IFileOpenDialog) and "Open logs folder" were not exercised under Wine |
 | 6 Release archive built on Linux, closure inspected | see below | `scripts/package-windows.sh` (needs a clean, tagged checkout or BB_ALLOW_DIRTY=1 for a candidate) |
 | 6 Clean-Windows test of the archive, AMD/NVIDIA coverage | BLOCKED | needs real Windows |
 
@@ -73,6 +74,12 @@ version of the file probe opened the file write-only).
   re-read the unchanged file. Fixed (std::filesystem::rename, which replaces on every host);
   the menu's quit button and the controller port assignments worked, the game ran and races
   loaded.
+- The launcher window first came up 65535x65535 pixels under Wine: the Proton-made prefix
+  carries `CaptionHeight=6352142` in WindowMetrics (Proton never shows ordinary windows), so
+  every frame metric was garbage. Setting the three heights to Wine's defaults fixed the
+  diagnostic; the launcher does not use AdjustWindowRect any more but measures the frame of
+  the created window, and refuses a frame larger than 200 pixels. A Windows machine has sane
+  metrics and is not affected.
 - "Rescan controllers" found no controller plugged in after the start. Under Wine, SDL3's
   Windows gamepad backend depends on Wine delivering device-change notifications and its HID
   bus; this is to be re-checked on real Windows before any code change (noted, not fixed).
@@ -84,17 +91,19 @@ version of the file probe opened the file write-only).
    4096-byte readback PASS`.
 3. The probes: `abi_probe.exe`, `tls_probe.exe`, `memory_probe.exe`, `file_probe.exe` (from
    `scripts/build-windows.sh --tests`, out/windows/tests) each print a `PASS` line.
-4. `SacredFire.exe --game <folder>` with `BB_TIMEOUT=180`: the log must reach `Entering original
+4. `SacredFire.exe`: the window; choose the folder, Play. Or from cmd, `SacredFire.exe --play
+   --game <folder>` with `BB_TIMEOUT=180`: the log must reach `Entering original
    x86-64 code`, `Guest TCB loads redirected ... (matches the preparation step)`, the window, the
    licence screens, the title screen. Then a race, return to the menus, a save
    (`%LOCALAPPDATA%\SacredFire\user\savedata`), exit, start again, continue from the save.
-5. Send the console log (start from cmd with `> log.txt 2>&1`), GPU and driver version.
+5. Send the run's log from `%LOCALAPPDATA%\SacredFire\logs` ("Open logs folder"), GPU and
+   driver version.
 
 ## Limitations recorded
 
 - Not ported (reported as unavailable in the log): BB_UFFD, BB_PC_MODEL/dma-buf chunks,
   BB_FREE_CHECK/BB_LABEL_TRAP/BB_HEAP_HOOKS/BB_HEAP_SITES (single-step traps), BB_SAMPLE_THREAD,
-  BB_DUMP_GOT, MangoHud, PGO, the GTK launcher, mod folder overlays.
+  BB_DUMP_GOT, MangoHud, PGO, mod folder overlays, the GTK launcher's Steam shortcut writer.
 - Paths longer than 260 characters need Windows' long-path policy; the manifest declares the
   capability.
 - The archive's byte-for-byte reproducibility was not tested (two independent builds compared);
