@@ -10,7 +10,7 @@ the archive is a candidate, not a release.
 
 | item | value |
 |---|---|
-| SacredFire source | main at f1f7935 (v0.2.1-1) plus the uncommitted changes of this work (see `git status`); the report is updated when they are committed |
+| SacredFire source | branch windows-port, commit faa002a on top of main f1f7935 (v0.2.1-1); the Windows candidate archive and the Wine runs described below were made from this tree before the commit (same content) |
 | donor | Supermedo/bloodborne_pc ec8340a9f9d809436cf07fa1f07b08affa9c13e3 (read, not merged) |
 | toolchain | llvm-mingw 20261006 ucrt ubuntu-22.04 x86_64 (clang 23.1.3, mingw-w64 a3d9399, UCRT, libc++, winpthreads), sha256 5f9c6ed9...8ab4 |
 | inputs | packaging/windows/deps.lock (14 entries, every one pinned by commit or sha256) |
