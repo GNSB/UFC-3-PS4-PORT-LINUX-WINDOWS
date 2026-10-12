@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include "common/assert.h"
+#include "bbport_timeline.h"
 #include "bbport_toggles.h"
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
@@ -370,6 +371,7 @@ static void PrintMemory() {
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    BbTimeline::Note(BbTimeline::FlipDone, req.eop ? 1 : 0, u64(req.index));
     // Update HDR status before presenting, then present the frame (bbport: on the swap thread).
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);

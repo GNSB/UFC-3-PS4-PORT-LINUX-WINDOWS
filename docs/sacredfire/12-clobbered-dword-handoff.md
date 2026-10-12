@@ -340,3 +340,19 @@ pair that textures already bind as null descriptors since 381cb24. `SurfaceForma
 the format of the same layout with another number format (10_11_11 Float, `B10G11R11UfloatPack32`)
 and prints the substitution once, instead of asserting; `TrySurfaceFormat` stays strict for the
 null-descriptor and draw-preparation paths.
+
+### What the guard prints now (for the ordering question)
+
+`BbTimeline` (gpu/shim/bbport_timeline.h) keeps an always-on ring of the last 8192 events
+beside the opt-in file timeline: the guest's graphics submissions (`guest submit gfx seq`, with
+the seq the clobber diagnostics use, and the dcb address), `sceGnmSubmitDone` and whether it
+set the GPU-idle lock, the stubbed `sceGnmRequestFlipAndSubmitDone`, waits for the lock and
+their length, flips (`sceVideoOutSubmitFlip`, EOP flips registered and reached, frames
+presented), and the GPU thread's decode begin/end, submission-end drains with their length,
+and idle signals. The first four trips of the late-label guard print, after the call chain,
+every event from 50 ms before the label's buffer was submitted up to the write, with times
+relative to that point and thread ids. Read it for: which call ended the frame after that
+submission (`sceGnmSubmitDone` with the lock, or the stub, or only a flip), whether the next
+submissions waited for GPU idle and how long, when the drain of that frame began and ended on
+the GPU thread, and where in that sequence the game must have rebuilt the buffer (before the
+write, after the last event that told it the frame was done).

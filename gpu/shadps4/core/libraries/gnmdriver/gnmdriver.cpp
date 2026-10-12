@@ -202,13 +202,15 @@ static void WaitGpuIdle() {
     if (submission_lock == 0) {
         return;
     }
+    BbTimeline::Note(BbTimeline::GuestIdleWaitBegin);
     const auto start = std::chrono::steady_clock::now();
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+    BbTimeline::Note(BbTimeline::GuestIdleWaitEnd, 0, u64(waited));
     BbStats::gnm_frame_waits.fetch_add(1, std::memory_order_relaxed);
-    BbStats::gnm_frame_wait_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
-            .count(),
-        std::memory_order_relaxed);
+    BbStats::gnm_frame_wait_ns.fetch_add(waited, std::memory_order_relaxed);
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -1447,11 +1449,13 @@ s32 PS4_SYSV_ABI sceGnmRegisterResource(void* res_handle, void* owner_handle, co
 
 int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDone() {
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+    BbTimeline::Note(BbTimeline::GuestSubmitDoneStub, 0);
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload() {
     LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+    BbTimeline::Note(BbTimeline::GuestSubmitDoneStub, 1);
     return ORBIS_OK;
 }
 
@@ -2539,6 +2543,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
         if (!liverpool->IsGpuIdle()) {
             submission_lock = true;
         }
+        BbTimeline::Note(BbTimeline::GuestLockSet, submission_lock ? 1 : 0, u64(frames_submitted) + 1);
         ++frames_submitted;
         liverpool->SubmitDone();
     }

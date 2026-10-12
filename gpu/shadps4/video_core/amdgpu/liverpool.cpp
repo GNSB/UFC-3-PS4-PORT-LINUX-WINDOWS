@@ -272,8 +272,14 @@ void Liverpool::Process(std::stop_token stoken) {
         // BB_PIPE_SIGNALS: the recording thread does both in order (a task below) instead.
         const bool pipe_signals = rasterizer && rasterizer->PipeSignals();
         if (rasterizer && !pipe_signals) {
+            BbTimeline::Note(BbTimeline::DrainBegin, Vulkan::DrawPipe::ReasonSubmissionEnd);
+            const auto drain_start = std::chrono::steady_clock::now();
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
+            BbTimeline::Note(BbTimeline::DrainEnd, 0,
+                             u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - drain_start)
+                                     .count()));
         }
         // GPU idle only if nothing was submitted meanwhile: the drain and the deferred fences take
         // milliseconds (Steam Deck), and a submission plus sceGnmSubmitDone in that time set the
@@ -328,6 +334,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 work_retired = true;
             }
         }
+        BbTimeline::Note(BbTimeline::GpuIdleSignal, idle ? 1 : 0);
         if (idle) {
             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
         }
@@ -2323,6 +2330,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         }
         BbFreeCheck::NoteSubmit(seq, copy ? copy->guest_dcb : dcb.data(), dcb.size_bytes());
         BbClobber::NoteSubmit(seq, copy ? copy->guest_dcb : dcb.data(), dcb.size_bytes());
+        BbTimeline::Note(BbTimeline::GuestSubmitGfx, seq,
+                         reinterpret_cast<u64>(copy ? copy->guest_dcb : dcb.data()));
         if (copy) {
             if (copy->bad_at_submit >= 0) {
                 const u32* guest = copy->guest_dcb + copy->bad_at_submit;
@@ -2399,6 +2408,7 @@ void Liverpool::SignalGpuIdle(u64 generation) {
             work_retired = true;
         }
     }
+    BbTimeline::Note(BbTimeline::GpuIdleSignal, idle ? 1 : 0, generation);
     if (idle) {
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }

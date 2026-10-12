@@ -2,6 +2,7 @@
 #include "bbport_clobber.h"
 #include "common/signal_context.h"
 #include "../../src/platform/platform.h"
+#include "bbport_timeline.h"
 
 #include <algorithm>
 #include <array>
@@ -257,6 +258,15 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
             char where[256];
             platform_describe_address(reinterpret_cast<uintptr_t>(frames[i]), where, sizeof(where));
             std::fprintf(stderr, "    #%d %s\n", i - 1, where);
+        }
+        if (n <= 4) {
+            // What the guest and the GPU thread did from 50 ms before the buffer's submission:
+            // its submissions and frame ends, flips, idle waits and the lock, the decoder's
+            // progress, drains and idle signals, up to this write (times from that point).
+            BbTimeline::Note(BbTimeline::GuardTrip, packet_seq, address);
+            std::fprintf(stderr, "  events from 50 ms before submission %llu was submitted (tid %u "
+                         "writes now):\n", (unsigned long long)hit->seq, platform_thread_id());
+            BbTimeline::DumpRecent(std::int64_t(hit->ns) - 50'000'000, stderr);
         }
         std::fflush(stderr);
         AskForReport();
