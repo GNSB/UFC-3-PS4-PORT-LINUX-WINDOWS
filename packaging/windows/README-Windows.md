@@ -78,7 +78,8 @@ that log and name your GPU and driver version. A line starting with `STOP:` or `
 lines after it are the call chain. `SacredFire issue #2` in the log is a known problem (see
 the main README): a fence label of the port landing in a command buffer the game has rebuilt.
 Since the 2026-10-12 build such a write is caught (`Late label guarded: ...` with the writer's
-call chain) and the game goes on; please still send that log, it names the path to fix.
+call chain) and the game goes on (seen twice in a seven-race session without a crash); please
+still send that log, it narrows the fix.
 
 Known differences from the Linux build: the dma-buf memory model (`BB_PC_MODEL`), userfaultfd
 tracking (`BB_UFFD`), the single-step heap diagnostics (`BB_FREE_CHECK`, `BB_LABEL_TRAP`,

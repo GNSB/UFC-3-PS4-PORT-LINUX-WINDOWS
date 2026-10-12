@@ -63,6 +63,16 @@ std::array<Write, 16384> writes;
 std::atomic<std::uint64_t> writes_head{0};
 std::atomic<std::uint64_t> hits{0};
 
+// The port's last write per label address (direct-mapped by address): a slot that holds what
+// the port last wrote there was not rebuilt by the game (GuardLabel).
+struct LastWrite {
+    std::atomic<std::uint64_t> address{0}, value{0}, ns{0};
+};
+std::array<LastWrite, 4096> last_writes;
+LastWrite& LastWriteSlot(std::uint64_t address) {
+    return last_writes[(address >> 2) % last_writes.size()];
+}
+
 // BB_COPY_PROTECT: the read-only copies.
 struct Protected {
     std::atomic<std::uint64_t> base{0}, bytes{0}, seq{0};
@@ -117,6 +127,12 @@ void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, 
     const std::uint64_t decoding_now = decoding.load(std::memory_order_relaxed);
     writes[writes_head.fetch_add(1, std::memory_order_relaxed) % writes.size()] =
         Write{address, value, now, decoding_now, bytes, source, tid, 0};
+    {
+        LastWrite& last = LastWriteSlot(address);
+        last.address.store(address, std::memory_order_relaxed);
+        last.value.store(value, std::memory_order_relaxed);
+        last.ns.store(now, std::memory_order_release);
+    }
     // The newest submitted buffer the write lands in.
     const Range* hit = nullptr;
     const std::uint64_t head = ranges_head.load(std::memory_order_relaxed);
@@ -141,7 +157,7 @@ void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, 
                             : "an older buffer, not resubmitted since";
     const bool late = hit->seq > decoding_now;
     char thread[32] = "?";
-    pthread_getname_np(pthread_self(), thread, sizeof(thread));
+    platform_thread_get_name(thread, sizeof(thread));
     std::fprintf(stderr,
                  "Guest write check: %s of %u bytes, value %#llx, to %#llx lands inside submission "
                  "%llu's command buffer at +%#llx (%s; decoding submission %llu; submitted %.2f ms "
@@ -166,7 +182,7 @@ bool LooksLikeType3Header(std::uint32_t word) {
 } // namespace
 
 bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source,
-                std::uint64_t packet_seq) {
+                std::uint64_t packet_seq, const std::uint32_t* at_submit) {
     if (address == 0 || (bytes != 4 && bytes != 8) || (address & 3) != 0) {
         return false;
     }
@@ -186,9 +202,36 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
     }
     std::uint32_t now_words[2] = {0, 0};
     std::memcpy(now_words, reinterpret_cast<const void*>(address), bytes);
-    const bool header = LooksLikeType3Header(now_words[0]) ||
-                        (bytes == 8 && LooksLikeType3Header(now_words[1]));
-    if (!header) {
+    const std::uint32_t dwords = bytes / 4;
+    bool rebuilt = false;
+    char why[160];
+    if (at_submit) {
+        // Changed since the submission, by someone other than the port?
+        if (std::memcmp(now_words, at_submit, bytes) != 0) {
+            const LastWrite& last = LastWriteSlot(address);
+            std::uint64_t ours = 0;
+            const bool port_wrote =
+                last.ns.load(std::memory_order_acquire) >= hit->ns &&
+                last.address.load(std::memory_order_relaxed) == address &&
+                (ours = last.value.load(std::memory_order_relaxed), true) &&
+                std::memcmp(now_words, &ours, bytes) == 0;
+            if (!port_wrote) {
+                rebuilt = true;
+                std::snprintf(why, sizeof(why), "the slot held %08x%s at submit and holds %08x%s now",
+                              at_submit[0], dwords == 2 ? " .." : "", now_words[0],
+                              dwords == 2 ? " .." : "");
+            }
+        }
+    } else {
+        const bool header = LooksLikeType3Header(now_words[0]) ||
+                            (dwords == 2 && LooksLikeType3Header(now_words[1]));
+        if (header) {
+            rebuilt = true;
+            std::snprintf(why, sizeof(why), "the slot now holds the packet header %08x",
+                          LooksLikeType3Header(now_words[0]) ? now_words[0] : now_words[1]);
+        }
+    }
+    if (!rebuilt) {
         return false;
     }
     static std::atomic<std::uint64_t> guarded{0};
@@ -196,16 +239,15 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
     if (n <= 16 || n % 100 == 0) {
         const std::uint64_t now = NowNs();
         char thread[32] = "?";
-        pthread_getname_np(pthread_self(), thread, sizeof(thread));
+        platform_thread_get_name(thread, sizeof(thread));
         std::fprintf(stderr,
                      "Late label guarded: %s of %u bytes, value %#llx, to %#llx from submission %llu "
-                     "lands at +%#llx of submission %llu's command buffer, which now holds the packet "
-                     "header %08x there (the game rebuilt the buffer; submitted %.2f ms ago; decoding "
-                     "submission %llu; thread %s; guarded %llu): the write is dropped\n",
+                     "lands at +%#llx of submission %llu's command buffer, which the game has rebuilt "
+                     "(%s; submitted %.2f ms ago; decoding submission %llu; thread %s; guarded "
+                     "%llu): the write is dropped\n",
                      SourceName(source), bytes, (unsigned long long)value,
                      (unsigned long long)address, (unsigned long long)packet_seq,
-                     (unsigned long long)(address - hit->base), (unsigned long long)hit->seq,
-                     LooksLikeType3Header(now_words[0]) ? now_words[0] : now_words[1],
+                     (unsigned long long)(address - hit->base), (unsigned long long)hit->seq, why,
                      (now - hit->ns) / 1e6,
                      (unsigned long long)decoding.load(std::memory_order_relaxed), thread,
                      (unsigned long long)n);

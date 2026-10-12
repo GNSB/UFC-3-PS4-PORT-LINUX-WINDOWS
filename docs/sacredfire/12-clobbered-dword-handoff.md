@@ -276,3 +276,67 @@ crash into a logged event; the call chain in the next report names the path (GPU
 recording thread, Vulkan recording thread; honest, async or recorder fences), which is what the
 nine clean runs could not. The ring timestamps show it would have fired here: the slot held
 `c0047600` when the EOS fence arrived.
+
+### The second Windows log (2026-10-12, seven races): the writer's call chain, and the rule
+
+The next session on Windows (v0.2.1-8-g5edc381, five tracks, about seven races) hit the guard
+twice and played on; the game ended later in an unrelated colour-buffer format assertion (below).
+Both guard reports read the same, here the first:
+
+    Late label guarded: EOS fence of 4 bytes, value 0x1, to 0x10f690d6f8 from submission 28822
+    lands at +0xd700 of submission 28822's command buffer, which now holds the packet header
+    c0016900 there (the game rebuilt the buffer; submitted 3232.98 ms ago; decoding submission
+    28824; thread ; guarded 1): the write is dropped
+        #0 sacredfire-game.exe+0xab4d0   GuardLabel        (gpu/shim/bbport_clobber.cpp)
+        #1 sacredfire-game.exe+0x1ce570  WriteEosLabel     (liverpool.cpp)
+        #2 sacredfire-game.exe+0x1cbd47  RunEventWriteEos  (liverpool.cpp)
+        #4 sacredfire-game.exe+0x69f8d   DrawPipe::Run     (vk_draw_pipe.h:242)
+        #7 ucrtbase.dll+0x2cd30          (thread start)
+
+(symbolized with `llvm-symbolizer --obj=out/windows/bin/sacredfire-game.exe --relative-address`
+against the unstripped build of the same commit). So:
+
+- The writer is the **draw recording thread** (stage B, `DrawPipe::Run`) executing the EOS task
+  of submission 28822 in the default path (no honest labels): `RunEventWriteEos` ->
+  `WriteEosLabel`. Nothing exotic: the ordinary in-order task, run late.
+- It ran **3.2 s after the submission**, while the GPU command thread (stage A) was already
+  decoding submission 28824, two submissions (one frame) later. The game had rebuilt the buffer
+  of 28822 for the frame after that (the label's own buffer; the slot held a `SET_CONTEXT_REG`
+  header, `c0016900`). The second event is the same picture: 59267 written while 59269 was being
+  decoded, 2.6 s late, the slot holding a NOP header. Both happened at a race load ("push load
+  octane/t154_oxide_station" follows the second).
+- Therefore the game's submissions and its rebuild of a command buffer ran ahead of stage B by
+  a whole frame during a load stall. The GPU-idle gating of sceGnmSubmitDone drains stage B
+  before it signals idle, so either the game does not go through sceGnmSubmitDone between
+  these frames (it imports sceGnmSubmitDone, sceGnmRequestFlipAndSubmitDone - a stub that
+  returns at once - and sceVideoOutSubmitFlip; which one it uses per frame is the next thing to
+  log), or it gates its own reuse of the buffer on something the port signals before stage B is
+  done (a flip, a label written on stage A). Either way the memory write of the label must not
+  trust that the buffer is still the one it was decoded from.
+
+**The rule the guard applies now.** The fence tasks (`EosTask`, `EopTask`) carry the label
+slot's dwords *as the buffer was submitted*, read from the submission's copy when the packet is
+decoded (`label_at_submit` in `ProcessGraphics`; only for labels inside the buffer being
+decoded, which is where CTR keeps them). Before the store, `GuardLabel` compares the guest slot
+with that value: equal means untouched since submission, so the write proceeds; different means
+someone wrote the slot after the submission, which is either the port itself (the last port
+write per address is remembered, and a slot holding it is fine: a label written twice in one
+stream) or the game rebuilding the buffer, in which case the write is dropped and reported with
+the two values. The game resets a label it waits on before it submits the buffer and leaves it
+alone until the port writes it, so this rule does not drop a fence the game is waiting for; the
+header check stays as the fallback for labels without a submitted value (another buffer, the
+compute queues). A dropped write that lands on a packet *payload* (a register value, a shader
+address) is now caught as well, which the header check alone did not do.
+
+The stall itself (seconds of stage B work at a race load: pipeline compiles on first use of a
+track's shaders) is what makes the window; a warm pipeline cache shrinks it, which is why the
+Linux runs with a warm RADV cache stayed clean.
+
+### The format assertion (the same log's end)
+
+After the seven races the game stopped with `SurfaceFormat: Assertion Failed! Unknown
+data_format=6 and num_format=0` (exit 23): a colour or vertex buffer with 10_11_11 Unorm, the
+pair that textures already bind as null descriptors since 381cb24. `SurfaceFormat` now takes
+the format of the same layout with another number format (10_11_11 Float, `B10G11R11UfloatPack32`)
+and prints the substitution once, instead of asserting; `TrySurfaceFormat` stays strict for the
+null-descriptor and draw-preparation paths.

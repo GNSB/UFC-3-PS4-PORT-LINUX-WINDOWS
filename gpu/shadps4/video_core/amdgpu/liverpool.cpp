@@ -437,11 +437,23 @@ LabelDelayTest& EosDelayTest() {
     return test;
 }
 
+// The slot of a fence label as it was when its buffer was submitted (SacredFire issue #2, the
+// late-label guard): read from the submission's copy when the packet is decoded, if the label
+// lies inside the buffer being decoded.
+struct LabelAtSubmit {
+    u32 words[2] = {0, 0};
+    bool known = false;
+    const u32* Words() const {
+        return known ? words : nullptr;
+    }
+};
+
 // `seq`: the fence's place in the stream (BB_FREE_CHECK); `packet_seq`: the graphics submission
 // that holds the packet (the late-label guard, SacredFire issue #2).
-void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq, u64 packet_seq) {
+void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq, u64 packet_seq,
+               LabelAtSubmit at_submit = {}) {
     eop.SignalFence(
-        [seq, packet_seq](void* address, u64 data, u32 num_bytes) {
+        [seq, packet_seq, at_submit](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
             EopDelayTest().Apply();
             BbFreeCheck::Check(reinterpret_cast<u64>(address), num_bytes, &data, BbFreeCheck::Eop,
@@ -450,7 +462,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq, u64 packet_seq) {
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
             BbClobber::NoteWrite(reinterpret_cast<u64>(address), data, num_bytes, BbClobber::Eop);
             if (BbClobber::GuardLabel(reinterpret_cast<u64>(address), data, num_bytes,
-                                      BbClobber::Eop, packet_seq)) {
+                                      BbClobber::Eop, packet_seq, at_submit.Words())) {
                 BbFreeCheck::NoteFenceWritten(reinterpret_cast<u64>(address), 0);
                 return;
             }
@@ -478,16 +490,19 @@ void SignalEop(const PM4CmdEventWriteEop& eop, u64 seq, u64 packet_seq) {
 struct EopTask {
     PM4CmdEventWriteEop eop;
     u64 packet_seq;
+    LabelAtSubmit at_submit;
 };
 struct EosTask {
     PM4CmdEventWriteEos eos;
     u64 packet_seq;
+    LabelAtSubmit at_submit;
 };
 
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const EopTask task = *reinterpret_cast<const EopTask*>(data);
     const auto& eop = task.eop;
     const u64 packet_seq = task.packet_seq;
+    const LabelAtSubmit at_submit = task.at_submit;
     if (eop.data_sel.Value() != DataSelect::None) {
         BbStats::eop_decoded.fetch_add(1, std::memory_order_relaxed);
     }
@@ -500,8 +515,9 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const bool writes = eop.data_sel.Value() != DataSelect::None;
         const u64 value = eop.data_sel.Value() == DataSelect::Data32Low ? eop.DataDWord()
                                                                         : eop.DataQWord();
-        rasterizer.SignalAfterGpu([eop, seq, packet_seq] { SignalEop(eop, seq, packet_seq); },
-                                  writes ? reinterpret_cast<VAddr>(eop.Address<u8>()) : 0, value);
+        rasterizer.SignalAfterGpu(
+            [eop, seq, packet_seq, at_submit] { SignalEop(eop, seq, packet_seq, at_submit); },
+            writes ? reinterpret_cast<VAddr>(eop.Address<u8>()) : 0, value);
         return;
     }
     // Guest memory copies on the copy threads precede the fence the guest sees.
@@ -513,16 +529,18 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return env && env[0] == '1';
     }();
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
-        BbCopy::AfterCopies([eop, seq, packet_seq] { SignalEop(eop, seq, packet_seq); });
+        BbCopy::AfterCopies(
+            [eop, seq, packet_seq, at_submit] { SignalEop(eop, seq, packet_seq, at_submit); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
-        rasterizer.SignalAfterHostCopies([eop, seq, packet_seq] { SignalEop(eop, seq, packet_seq); });
+        rasterizer.SignalAfterHostCopies(
+            [eop, seq, packet_seq, at_submit] { SignalEop(eop, seq, packet_seq, at_submit); });
     } else {
         // Labels are written in order: not before the ones deferred to the recording thread.
         rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
-        SignalEop(eop, seq, packet_seq);
+        SignalEop(eop, seq, packet_seq, at_submit);
     }
 }
 
@@ -607,7 +625,8 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                                 (header->type3.count.Value() - 2) * sizeof(u32), true);
 }
 
-void WriteEosLabel(void* address, u64 value, u32 num_bytes, u64 packet_seq) {
+void WriteEosLabel(void* address, u64 value, u32 num_bytes, u64 packet_seq,
+                   const LabelAtSubmit& at_submit) {
     auto* memory = Core::Memory::Instance();
     EosDelayTest().Apply(); // BB_EOS_DELAY_TEST (experiment, see LabelDelayTest)
     BbFreeCheck::Check(reinterpret_cast<u64>(address), num_bytes, &value, BbFreeCheck::Eos);
@@ -615,7 +634,7 @@ void WriteEosLabel(void* address, u64 value, u32 num_bytes, u64 packet_seq) {
     BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
     BbClobber::NoteWrite(reinterpret_cast<u64>(address), value, num_bytes, BbClobber::Eos);
     if (BbClobber::GuardLabel(reinterpret_cast<u64>(address), value, num_bytes, BbClobber::Eos,
-                              packet_seq)) {
+                              packet_seq, at_submit.Words())) {
         BbFreeCheck::NoteFenceWritten(reinterpret_cast<u64>(address));
         return;
     }
@@ -633,8 +652,9 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const EosTask& task = *reinterpret_cast<const EosTask*>(data);
     const auto& event_eos = task.eos;
     const u64 packet_seq = task.packet_seq;
-    const auto write_label = [packet_seq](void* address, u64 value, u32 num_bytes) {
-        WriteEosLabel(address, value, num_bytes, packet_seq);
+    const LabelAtSubmit at_submit = task.at_submit;
+    const auto write_label = [packet_seq, at_submit](void* address, u64 value, u32 num_bytes) {
+        WriteEosLabel(address, value, num_bytes, packet_seq, at_submit);
     };
     // BB_HONEST_LABELS: end of shader work, so written once the GPU has finished it.
     if (Vulkan::Rasterizer::HonestLabels() &&
@@ -1131,6 +1151,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (dcb_stats) {
         ScanDcb(dcb, dcb_depth);
     }
+    // SacredFire issue #2 (the late-label guard): a fence label inside this buffer, as the
+    // buffer was submitted. `dcb` is the submission's copy (or the guest buffer itself) and
+    // `label_guest_base` where it lives in guest memory.
+    const u8* label_span = reinterpret_cast<const u8*>(dcb.data());
+    const u64 label_span_bytes = dcb.size_bytes();
+    const VAddr label_guest_base =
+        reinterpret_cast<VAddr>(copy ? copy->guest_dcb : dcb.data());
+    const auto label_at_submit = [&](VAddr label, u32 bytes) {
+        LabelAtSubmit result;
+        if (label >= label_guest_base && label - label_guest_base + bytes <= label_span_bytes &&
+            (bytes == 4 || bytes == 8)) {
+            std::memcpy(result.words, label_span + (label - label_guest_base), bytes);
+            result.known = true;
+        }
+        return result;
+    };
     // SacredFire issue #2: the copy's headers walked again when its decoding starts (SubmitGfx
     // walked them right after the memcpy).
     if (copy && dcb_depth == 0) {
@@ -1597,7 +1633,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     BbFreeCheck::NoteFenceDecoded(reinterpret_cast<u64>(event_eos->Address()),
                                                   event_eos->DataDWord(), header, dcb.data(), seq);
                 }
-                const EosTask eos_task{*event_eos, seq};
+                const EosTask eos_task{
+                    *event_eos, seq,
+                    event_eos->command == PM4CmdEventWriteEos::Command::SignalFence
+                        ? label_at_submit(reinterpret_cast<VAddr>(event_eos->Address()), 4)
+                        : LabelAtSubmit{}};
                 if (rasterizer &&
                     rasterizer->RunInOrder(&RunEventWriteEos, &eos_task, sizeof(eos_task),
                                            BbToggle::PipelinedTasks, false)) {
@@ -1614,14 +1654,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                                              : event_eop->DataQWord(),
                         header, dcb.data(), seq);
                 }
-                const EopTask eop_task{*event_eop, seq};
+                const auto eop_sel = event_eop->data_sel.Value();
+                const EopTask eop_task{
+                    *event_eop, seq,
+                    eop_sel == DataSelect::None || eop_sel == DataSelect::GdsMemStore
+                        ? LabelAtSubmit{}
+                        : label_at_submit(reinterpret_cast<VAddr>(event_eop->Address<u8>()),
+                                          eop_sel == DataSelect::Data32Low ? 4 : 8)};
                 if (rasterizer) {
                     if (rasterizer->RunInOrder(&RunEventWriteEop, &eop_task, sizeof(eop_task),
                                                BbToggle::PipelinedTasks, false)) {
                         NotePendingFences(*event_eop);
                     }
                 } else {
-                    SignalEop(*event_eop, 0, seq);
+                    SignalEop(*event_eop, 0, seq, eop_task.at_submit);
                 }
                 break;
             }
@@ -2136,7 +2182,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                                  BbClobber::ReleaseMem);
                             if (BbClobber::GuardLabel(release.Address<u64>(), release.DataQWord(),
                                                       sel == DataSelect::Data32Low ? 4 : 8,
-                                                      BbClobber::ReleaseMem, 0)) {
+                                                      BbClobber::ReleaseMem, 0, nullptr)) {
                                 Platform::IrqC::Instance()->Signal(
                                     static_cast<Platform::InterruptId>(pipe_id));
                                 return;
@@ -2169,7 +2215,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                                      sel == DataSelect::Data32Low ? 4 : 8, BbClobber::ReleaseMem);
                 if (BbClobber::GuardLabel(release_mem->Address<u64>(), value,
                                           sel == DataSelect::Data32Low ? 4 : 8,
-                                          BbClobber::ReleaseMem, 0)) {
+                                          BbClobber::ReleaseMem, 0, nullptr)) {
                     Platform::IrqC::Instance()->Signal(
                         static_cast<Platform::InterruptId>(queue.pipe_id));
                     break;

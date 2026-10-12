@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
 #include "common/assert.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
@@ -786,6 +788,29 @@ vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat
 
 vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
     vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+    if (result == vk::Format::eUndefined && data_format != AmdGpu::DataFormat::FormatInvalid) {
+        // SacredFire: CTR binds colour and vertex buffers with data_format 6 and num_format 0
+        // (10_11_11 Unorm, which no hardware format spells; textures with it bind as null
+        // descriptors, vk_rasterizer.cpp IsBindableFormat). A pair with no Vulkan format takes
+        // the format of the same layout with another number format, by preference, instead of
+        // stopping the game (exit 23, "Unknown data_format=6 and num_format=0" after seven
+        // races on 2026-10-12).
+        static constexpr u32 preference[] = {7, 0, 4, 1, 5, 9, 2, 3, 6, 10, 11, 12, 13, 14, 15};
+        for (const u32 candidate : preference) {
+            const auto nearest = surface_format_table[GetSurfaceFormatTableIndex(
+                data_format, static_cast<AmdGpu::NumberFormat>(candidate))];
+            if (nearest != vk::Format::eUndefined) {
+                static std::atomic<u32> printed{0};
+                if (printed.fetch_add(1) < 8) {
+                    std::printf("GPU: no Vulkan format for data_format %u with num_format %u: "
+                                "using %s (num_format %u)\n",
+                                static_cast<u32>(data_format), static_cast<u32>(num_format),
+                                vk::to_string(nearest).c_str(), candidate);
+                }
+                return nearest;
+            }
+        }
+    }
     bool found =
         result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
     ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
