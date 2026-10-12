@@ -241,7 +241,7 @@ if (WIN32)
     target_compile_options(sacredfire PRIVATE ${BB_C_WARNINGS} -municode) # wmain: UTF-16 arguments
     target_link_options(sacredfire PRIVATE -municode)
     target_compile_definitions(sacredfire PRIVATE ${BB_WIN_DEFS})
-    target_link_libraries(sacredfire PRIVATE shlwapi ole32 shell32)
+    target_link_libraries(sacredfire PRIVATE shlwapi ole32 shell32 uuid)
     # Windows versions of the runtime tests and the ABI/TLS/memory probes (tests/windows): built
     # with `ninja windows-tests`, run on real Windows (Wine as a diagnostic).
     add_custom_target(windows-tests)

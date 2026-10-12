@@ -151,9 +151,16 @@ void Store(std::atomic<T>& target, T value, bool changed) {
     }
 }
 
+// BB_MENU_TRACE=1: every key event the menu feeds ImGui and every check box change (diagnostics).
+bool MenuTrace() {
+    static const bool on = [] { const char* e = std::getenv("BB_MENU_TRACE"); return e && e[0] == '1'; }();
+    return on;
+}
 void Checkbox(const char* label, std::atomic<bool>& value) {
     bool v = value;
-    Store(value, v, ImGui::Checkbox(label, &v));
+    const bool changed = ImGui::Checkbox(label, &v);
+    if (changed && MenuTrace()) std::printf("Menu trace: checkbox '%s' -> %d (frame %d)\n", label, v, ImGui::GetFrameCount());
+    Store(value, v, changed);
 }
 
 void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
@@ -761,6 +768,7 @@ bool HandleEvent(const SDL_Event& event) {
         io.AddKeyEvent(ImGuiMod_Shift, (event.key.mod & SDL_KMOD_SHIFT) != 0);
         io.AddKeyEvent(ImGuiMod_Alt, (event.key.mod & SDL_KMOD_ALT) != 0);
         if (const ImGuiKey key = KeyFromSdl(event.key.key); key != ImGuiKey_None) {
+            if (MenuTrace()) std::printf("Menu trace: key %d %s repeat=%d (frame %d)\n", int(key), down ? "down" : "up", int(event.key.repeat), ImGui::GetFrameCount());
             io.AddKeyEvent(key, down);
         }
         return true;
@@ -782,6 +790,7 @@ bool HandleEvent(const SDL_Event& event) {
             return false;
         }
         if (const ImGuiKey key = KeyFromGamepad(button); key != ImGuiKey_None) {
+            if (MenuTrace()) std::printf("Menu trace: gamepad %u button %u %s (frame %d)\n", unsigned(event.gbutton.which), unsigned(button), down ? "down" : "up", ImGui::GetFrameCount());
             io.AddKeyEvent(key, down);
         }
         return true;

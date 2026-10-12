@@ -58,29 +58,49 @@ static void append_argument(wchar_t *line, size_t n, const wchar_t *argument) {
 }
 /* Runs a command line, waits, returns its exit code (or 127 when it cannot start). stdout/stderr
  * are inherited: the log is this console. */
+/* The log file of this run (<data>\logs\<time>.log): everything the game and the scripts print,
+ * next to the console, so a crash leaves its report even when the console closes with it. */
+static FILE *log_file;
+static void log_write(const char *text, size_t n) {
+    DWORD written;
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text, (DWORD)n, &written, NULL);
+    if (log_file) { fwrite(text, 1, n, log_file); fflush(log_file); }
+}
 static DWORD run(wchar_t *line, int capture_fd, char *captured, size_t capture_size) {
     STARTUPINFOW startup = {.cb = sizeof(startup), .dwFlags = STARTF_USESTDHANDLES,
                             .hStdInput = GetStdHandle(STD_INPUT_HANDLE), .hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE),
                             .hStdError = GetStdHandle(STD_ERROR_HANDLE)};
     HANDLE read_end = NULL, write_end = NULL;
-    if (capture_fd) {
+    const int piped = capture_fd || log_file != NULL;
+    if (piped) {
         SECURITY_ATTRIBUTES inheritable = {.nLength = sizeof(inheritable), .bInheritHandle = TRUE};
         if (!CreatePipe(&read_end, &write_end, &inheritable, 0)) fail(L"CreatePipe failed");
         SetHandleInformation(read_end, HANDLE_FLAG_INHERIT, 0);
         startup.hStdOutput = write_end;
+        if (!capture_fd) startup.hStdError = write_end; /* the log gets both streams, in order */
     }
     PROCESS_INFORMATION process;
-    wprintf(L"> %ls\n", line); fflush(stdout);
+    { char head[32768]; int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, head + 2, sizeof(head) - 4, NULL, NULL);
+      if (n > 0) { head[0] = '>'; head[1] = ' '; head[n + 1] = '\n'; log_write(head, (size_t)n + 2); } }
     if (!CreateProcessW(NULL, line, NULL, NULL, TRUE, 0, NULL, root, &startup, &process)) {
         fwprintf(stderr, L"cannot start (error %lu)\n", GetLastError());
         return 127;
     }
     CloseHandle(process.hThread);
-    if (capture_fd) {
+    if (piped) {
         CloseHandle(write_end);
         size_t total = 0; DWORD got;
-        while (total + 1 < capture_size && ReadFile(read_end, captured + total, (DWORD)(capture_size - 1 - total), &got, NULL) && got) total += got;
-        captured[total] = 0;
+        char chunk[16384];
+        for (;;) {
+            if (capture_fd) {
+                if (total + 1 >= capture_size || !ReadFile(read_end, captured + total, (DWORD)(capture_size - 1 - total), &got, NULL) || !got) break;
+                total += got;
+            } else {
+                if (!ReadFile(read_end, chunk, sizeof(chunk), &got, NULL) || !got) break;
+                log_write(chunk, got);
+            }
+        }
+        if (capture_fd) captured[total] = 0;
         CloseHandle(read_end);
     }
     WaitForSingleObject(process.hProcess, INFINITE);
@@ -207,6 +227,14 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t user_dir[MAX_PATH * 4], config[MAX_PATH * 4], game_exe[MAX_PATH * 4], caps_exe[MAX_PATH * 4];
     join(user_dir, MAX_PATH * 4, data, L"user"); ensure_directory(user_dir);
     join(config, MAX_PATH * 4, data, L"bbport.ini");
+    wchar_t logs[MAX_PATH * 4], log_path[MAX_PATH * 4];
+    join(logs, MAX_PATH * 4, data, L"logs"); ensure_directory(logs);
+    {
+        SYSTEMTIME now; GetLocalTime(&now);
+        _snwprintf(log_path, MAX_PATH * 4, L"%ls\\%04u%02u%02u_%02u%02u%02u.log", logs, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+        log_file = _wfopen(log_path, L"wb");
+        wprintf(L"Log: %ls\n", log_file ? log_path : L"(not writable)");
+    }
     join(python, MAX_PATH * 4, root, L"python\\python.exe");
     join(game_exe, MAX_PATH * 4, root, L"bin\\sacredfire-game.exe");
     join(caps_exe, MAX_PATH * 4, root, L"bin\\bb-gpu-capabilities.exe");
@@ -316,6 +344,18 @@ int wmain(int argc, wchar_t **argv) {
     char version[64] = "unknown version";
     { wchar_t v[MAX_PATH * 4]; join(v, MAX_PATH * 4, root, L"VERSION"); FILE *f = _wfopen(v, L"rb"); if (f) { if (fgets(version, sizeof(version), f)) trim(version); fclose(f); } }
     wprintf(L"SacredFire %hs\n", version);
+    { char head[128]; int n = snprintf(head, sizeof(head), "SacredFire %s (Windows)\n", version); if (log_file && n > 0) fwrite(head, 1, (size_t)n, log_file); }
     (void)caps_exe;
-    return (int)run(line, 0, NULL, 0);
+    const DWORD code = run(line, 0, NULL, 0);
+    char tail[160];
+    int n = snprintf(tail, sizeof(tail), "sacredfire-game.exe exited with code %lu%s\n", code,
+                     code == 0 ? "" : code == 3 ? " (a fault; the report is above)" : code == 142 ? " (watchdog)" : code == 23 ? " (GPU library assertion)" : "");
+    if (n > 0) log_write(tail, (size_t)n);
+    if (log_file) fclose(log_file);
+    DWORD owners[2];
+    if (code != 0 && GetConsoleProcessList(owners, 2) <= 1) { /* our own console window: it would close with us */
+        wprintf(L"The log is %ls. Press Enter to close.\n", log_path);
+        fflush(stdout); getwchar();
+    }
+    return (int)code;
 }

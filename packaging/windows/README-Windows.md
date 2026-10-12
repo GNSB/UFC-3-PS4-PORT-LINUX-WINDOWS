@@ -63,9 +63,10 @@ apply after a restart.
 
 ## Logs and problems
 
-The console window is the log. To keep it: start from `cmd.exe` with
-`SacredFire.exe > log.txt 2>&1`. For a report, attach that log and name your GPU and driver
-version. A line starting with `STOP:` or `Guest fault`/`Host fault` names the failure; the
+Every start writes its whole output to `%LOCALAPPDATA%\SacredFire\logs\<date>_<time>.log`
+(the first line of the console names the file), the console shows the same lines, and after a
+failed exit the console stays open until Enter. For a report, attach that log and name your
+GPU and driver version. A line starting with `STOP:` or `Guest fault`/`Host fault` names the failure; the
 lines after it are the call chain. `SacredFire issue #2` in the log is a known problem (see
 the main README).
 
