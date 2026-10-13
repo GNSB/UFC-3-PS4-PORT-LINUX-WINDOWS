@@ -44,7 +44,7 @@ static wchar_t python[PATHW], game_exe[PATHW], caps_exe[PATHW];
 typedef struct {
     wchar_t game[PATHW], gamepad[128];
     int neo, fullscreen, clear_cache, validation, frame_stats, menu_trace;
-    int patch_60fps, patch_no_motion_blur, patch_pro_1080p; /* mirrors of bbport.ini */
+    int patch_60fps, patch_no_motion_blur, patch_pro_1080p, fps_unlocked; /* mirrors of bbport.ini */
 } Settings;
 static Settings settings;
 
@@ -147,6 +147,7 @@ static void patches_load(void) {
     settings.patch_60fps = ini_flag("patch_60fps");
     settings.patch_no_motion_blur = ini_flag("patch_no_motion_blur");
     settings.patch_pro_1080p = ini_flag("patch_pro_1080p");
+    settings.fps_unlocked = ini_flag("fps_unlocked");
 }
 
 /* ---- the log: window, file, console ---- */
@@ -360,8 +361,9 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
         /* The 60 FPS patch removes the game's cap altogether; above 60 FPS its physics misbehave
          * (slopes bleed speed, karts stick on ledges), so the present thread caps at 60 unless
          * BB_FPS=uncap or BB_FPS_LIMIT (0: none) says otherwise. */
-        if (sixty && !env_or(L"BB_FPS_LIMIT", NULL)) SetEnvironmentVariableW(L"BB_FPS_LIMIT", !wcscmp(fps, L"uncap") ? L"0" : L"60");
-        if (sixty) logw(L"60 FPS patch on: frame limit %ls FPS (BB_FPS=uncap or BB_FPS_LIMIT=0 for none)\n", env_or(L"BB_FPS_LIMIT", L"60"));
+        if (sixty && !env_or(L"BB_FPS_LIMIT", NULL))
+            SetEnvironmentVariableW(L"BB_FPS_LIMIT", (!wcscmp(fps, L"uncap") || ini_flag("fps_unlocked")) ? L"0" : L"60");
+        if (sixty) logw(L"60 FPS patch on: frame limit %ls FPS (0: none; the launcher's or the menu's Unlocked frame rate)\n", env_or(L"BB_FPS_LIMIT", L"60"));
     }
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
         wchar_t cache[PATHW]; join(cache, PATHW, env_or(L"BB_USER_DIR", user_dir), L"cache\\CUSA13795");
@@ -567,7 +569,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_GAMEPAD, ID_RESCAN, ID_P60, ID_PBLUR, ID_P1080, ID_NEO, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_GAMEPAD, ID_RESCAN, ID_P60, ID_PBLUR, ID_P1080, ID_UNLOCKED, ID_NEO, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -603,11 +605,12 @@ static void read_controls(void) {
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
     settings.neo = checked(ID_NEO); settings.fullscreen = checked(ID_FULLSCREEN); settings.clear_cache = checked(ID_CLEAR);
     settings.validation = checked(ID_VALIDATION); settings.frame_stats = checked(ID_STATS); settings.menu_trace = checked(ID_TRACE);
-    const int p60 = checked(ID_P60), pblur = checked(ID_PBLUR), p1080 = checked(ID_P1080);
+    const int p60 = checked(ID_P60), pblur = checked(ID_PBLUR), p1080 = checked(ID_P1080), unlocked = checked(ID_UNLOCKED);
     if (p60 != settings.patch_60fps) ini_set("patch_60fps", p60 ? "1" : "0");
     if (pblur != settings.patch_no_motion_blur) ini_set("patch_no_motion_blur", pblur ? "1" : "0");
     if (p1080 != settings.patch_pro_1080p) ini_set("patch_pro_1080p", p1080 ? "1" : "0");
-    settings.patch_60fps = p60; settings.patch_no_motion_blur = pblur; settings.patch_pro_1080p = p1080;
+    if (unlocked != settings.fps_unlocked) ini_set("fps_unlocked", unlocked ? "1" : "0");
+    settings.patch_60fps = p60; settings.patch_no_motion_blur = pblur; settings.patch_pro_1080p = p1080; settings.fps_unlocked = unlocked;
     settings_save();
 }
 static int pick_folder(wchar_t *out_path) {
@@ -734,7 +737,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
     /* The client area is 760x640 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(640);
+    const int client_w = sx(760), client_h = sx(664);
     main_window = CreateWindowExW(0, wc.lpszClassName, L"SacredFire", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
@@ -756,14 +759,15 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"STATIC", L"Controller for port 1 (ports 2-4 for split screen: in-game menu, L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 640, 200, ID_GAMEPAD);
     make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 660, y, 88, 24, ID_RESCAN); y += 34;
-    make(L"BUTTON", L"Game patches (by illusion and TroyWarez; applied at start)", BS_GROUPBOX, 12, y, 360, 96, 0);
-    make(L"BUTTON", L"60 FPS unlock", BS_AUTOCHECKBOX, 24, y + 20, 330, 20, ID_P60);
-    make(L"BUTTON", L"Disable motion blur", BS_AUTOCHECKBOX, 24, y + 44, 330, 20, ID_PBLUR);
-    make(L"BUTTON", L"1080p in PS4 Pro mode", BS_AUTOCHECKBOX, 24, y + 68, 330, 20, ID_P1080);
-    make(L"BUTTON", L"Display and console", BS_GROUPBOX, 388, y, 360, 96, 0);
+    make(L"BUTTON", L"Game patches (by illusion and TroyWarez; applied at start)", BS_GROUPBOX, 12, y, 360, 120, 0);
+    make(L"BUTTON", L"60 FPS unlock (capped at 60)", BS_AUTOCHECKBOX, 24, y + 20, 330, 20, ID_P60);
+    make(L"BUTTON", L"Unlocked frame rate (physics bugs above 60)", BS_AUTOCHECKBOX, 24, y + 44, 330, 20, ID_UNLOCKED);
+    make(L"BUTTON", L"Disable motion blur", BS_AUTOCHECKBOX, 24, y + 68, 330, 20, ID_PBLUR);
+    make(L"BUTTON", L"1080p in PS4 Pro mode", BS_AUTOCHECKBOX, 24, y + 92, 330, 20, ID_P1080);
+    make(L"BUTTON", L"Display and console", BS_GROUPBOX, 388, y, 360, 120, 0);
     make(L"BUTTON", L"PS4 Pro mode (7 CPUs, 5568 MiB; needed for 1080p)", BS_AUTOCHECKBOX, 400, y + 20, 340, 20, ID_NEO);
     make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 400, y + 44, 330, 20, ID_FULLSCREEN);
-    make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 68, 330, 20, ID_CLEAR); y += 106;
+    make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 68, 330, 20, ID_CLEAR); y += 130;
     make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
     make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
@@ -773,9 +777,10 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 640 - y - 12, ID_LOG);
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 664 - y - 12, ID_LOG);
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
     set_checked(ID_P60, settings.patch_60fps); set_checked(ID_PBLUR, settings.patch_no_motion_blur); set_checked(ID_P1080, settings.patch_pro_1080p);
+    set_checked(ID_UNLOCKED, settings.fps_unlocked);
     set_checked(ID_NEO, settings.neo); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads();

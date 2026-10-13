@@ -87,6 +87,10 @@ struct Values {
     /// Applied at start (patches.py); the menu shows when a restart is needed.
     std::atomic<bool> effects[EffectCount]{};
     std::atomic<bool> game_patches[GamePatchCount]{}; ///< SacredFire: see GamePatches
+    /// SacredFire: with the 60 FPS patch, no frame limit (bbport.ini fps_unlocked; run.sh and
+    /// the Windows launcher set BB_FPS_LIMIT=0 from it; a restart applies it). Above 60 FPS
+    /// the game's physics misbehave (slopes bleed speed, karts stick on ledges).
+    std::atomic<bool> fps_unlocked{false};
     std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
     /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
@@ -102,6 +106,7 @@ struct Values {
     bool startup_object_motion = true;
     bool startup_effects[EffectCount]{};
     bool startup_game_patches[GamePatchCount]{};
+    bool startup_fps_unlocked{};
     int startup_model_lod = 0;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;

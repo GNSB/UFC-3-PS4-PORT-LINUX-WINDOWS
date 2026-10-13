@@ -64,7 +64,8 @@ PRESENT_MODES = [("Mailbox", "Mailbox"), ("FIFO (VSync)", "Fifo"),
 # TroyWarez from https://github.com/illusionyy/PS-Game-Patch): bbport.ini key,
 # label, note. The in-game menu edits the same keys.
 PATCHES = [
-    ("patch_60fps", "60 FPS unlock", "By illusion. Capped at 60 (above it the game's physics misbehave; BB_FPS=uncap removes the cap). 40-45 in races on a Steam Deck"),
+    ("patch_60fps", "60 FPS unlock", "By illusion; capped at 60. 40-45 in races on a Steam Deck"),
+    ("fps_unlocked", "Unlocked frame rate", "With the 60 FPS unlock: no cap; above 60 FPS the game's physics misbehave (slopes, ledges)"),
     ("patch_no_motion_blur", "Disable motion blur", "By illusion"),
     ("patch_pro_1080p", "1080p in PS4 Pro mode", "By TroyWarez; only with PS4 Pro mode below"),
 ]

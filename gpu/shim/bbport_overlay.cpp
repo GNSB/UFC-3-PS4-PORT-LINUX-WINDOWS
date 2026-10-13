@@ -503,6 +503,11 @@ void Menu() {
     }
     Hint(BbSettings::MenuText("From patches/CrashTeamRacing.xml (illusionyy/PS-Game-Patch), applied to the executable at start.",
                               "Из patches/CrashTeamRacing.xml (illusionyy/PS-Game-Patch), применяются к исполняемому файлу при запуске."));
+    // SacredFire: the 60 FPS patch removes the game's cap altogether; the port limits it to 60
+    // unless this is on.
+    Checkbox(BbSettings::MenuText("Unlocked frame rate (with 60 FPS unlock)", "Без ограничения кадров (с 60 FPS)"), s.fps_unlocked);
+    Hint(BbSettings::MenuText("Off: 60 FPS. On: as fast as it renders; above 60 FPS the game's physics misbehave (slopes, ledges).",
+                              "Выкл: 60 FPS. Вкл: без ограничения; выше 60 FPS физика игры ведёт себя неверно (склоны, уступы)."));
 
     bool restart =
         s.object_motion != s.startup_object_motion || s.model_lod != s.startup_model_lod ||
@@ -513,6 +518,7 @@ void Menu() {
     for (int g = 0; g < BbSettings::GamePatchCount; ++g) {
         restart |= s.game_patches[g] != s.startup_game_patches[g];
     }
+    restart |= s.fps_unlocked != s.startup_fps_unlocked;
     if (restart) {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s",
                            BbSettings::MenuText("Changes apply after restarting the game",
