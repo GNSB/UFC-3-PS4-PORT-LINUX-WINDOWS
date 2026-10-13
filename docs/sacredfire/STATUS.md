@@ -183,6 +183,15 @@ AvPlayer/FFmpeg left both builds (CTR imports none of it; `-DBB_AVPLAYER=ON` bri
   nix-shell build (429 MB, nixpkgs 26.11pre1087755.e7439b6b14ad), booted to the start screen with
   `--appimage-extract-and-run --play`, released on GitHub with the .sha256.
 
+## v0.3.1 (2026-10-13)
+
+- Tag v0.3.1 at 25cc051: v0.3.0 (never published; its draft is withdrawn) plus both builds of
+  the 1.21 update (scripts/game_check.py variants, signature-located patch lines in
+  patches/CrashTeamRacing.xml, BB_GAME_VARIANT gating of the address-keyed diagnostics;
+  08-patches.md). `dist/SacredFire-windows-x86_64.zip` from the tag; the AppImage bundled from
+  the same nix-shell build (nixpkgs e7439b6b14ad). Release notes: `dist/RELEASE_NOTES_v0.3.1.md`
+  (they carry the v0.3.0 notes too).
+
 ## v0.3.0 (2026-10-13)
 
 - Tag v0.3.0 at 0e66635 (windows-port fast-forwarded into main): the Windows x86-64 port with
