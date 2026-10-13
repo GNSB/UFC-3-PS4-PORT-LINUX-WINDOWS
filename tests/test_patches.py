@@ -75,6 +75,43 @@ class ExternalPatchTests(unittest.TestCase):
             self.assertEqual(blob[24:], struct.pack('<QQ', 0x10, 1) + b'\x90')
 
 
+def tiny_elf(code, vaddr=0x1000, offset=0x100):
+    """An ELF64 header with one load segment holding code at vaddr (file offset offset)."""
+    elf = bytearray(offset) + code
+    struct.pack_into('<Q', elf, 0x20, 64)
+    struct.pack_into('<HH', elf, 0x36, 56, 1)
+    struct.pack_into('<IIQQQQQQ', elf, 64, 1, 5, offset, vaddr, vaddr, len(code), len(code), 0x10)
+    return bytes(elf)
+
+
+class SignatureTests(unittest.TestCase):
+    """Lines with a Signature: written at Address when the code is there, else where it is found."""
+    SIGNED = """<?xml version="1.0"?><Patch><TitleID><ID>CUSA13795</ID></TitleID>
+      <Metadata Title="CTR" Name="S" Author="x" AppVer="01.21" AppElf="eboot.bin" isEnabled="true">
+        <PatchList><Line Type="bytes" Address="{address}" Value="9090" Signature="aa bb ?? dd" SignatureOffset="0x2"/></PatchList>
+      </Metadata></Patch>"""
+
+    def writes(self, elf, address):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'p.xml').write_text(self.SIGNED.format(address=hex(address)))
+            found = external_patches(Path(tmp))
+            return compile_external(external_selection(found, None), eboot_segments(elf), elf)
+
+    def test_signature_at_the_address(self):
+        elf = tiny_elf(b'\0' * 16 + b'\xaa\xbb\x01\xdd' + b'\0' * 12)
+        self.assertEqual(self.writes(elf, EBOOT_BASE + 0x1012), [(0x1012, b'\x90\x90')])
+
+    def test_signature_moved(self):
+        # The 6.72+ build: the same code at another address.
+        elf = tiny_elf(b'\0' * 4 + b'\xaa\xbb\x07\xdd' + b'\0' * 24)
+        self.assertEqual(self.writes(elf, EBOOT_BASE + 0x1012), [(0x1006, b'\x90\x90')])
+
+    def test_signature_missing_or_ambiguous_skips_the_patch(self):
+        self.assertEqual(self.writes(tiny_elf(b'\0' * 32), EBOOT_BASE + 0x1012), [])
+        twice = tiny_elf(b'\xaa\xbb\x00\xdd' * 2 + b'\0' * 24)
+        self.assertEqual(self.writes(twice, EBOOT_BASE + 0x1012), [])
+
+
 class GamePatchTests(unittest.TestCase):
     """The bundled CTR patches, chosen through bbport.ini patch_* keys (the in-game menu)."""
 
@@ -91,9 +128,27 @@ class GamePatchTests(unittest.TestCase):
         self.assertEqual(external_selection(found, None, {}), [])
         selected = external_selection(found, None, {'patch_60fps': '1', 'patch_no_motion_blur': '0'})
         self.assertEqual([key for key, _, _ in selected], ['CrashTeamRacing.xml/60 FPS Unlock'])
-        writes = compile_external(selected, SEGMENTS)
-        self.assertEqual(len(writes), 1)
-        self.assertEqual(writes[0][0], 0x017a9d90 - EBOOT_BASE)
+        signature = selected[0][2].find('.//Line').get('Signature')
+        code = bytes(0 if b == '??' else int(b, 16) for b in signature.split())
+        start = 0x017a9d8b - EBOOT_BASE  # the 5.05 build's address for the signature
+        for at in (start, start + 0x40):  # 5.05 build; code moved (6.72+ build)
+            elf = tiny_elf(b'\0' * (at - 0x13a9d00) + code + b'\0' * 32, vaddr=0x13a9d00)
+            writes = compile_external(selected, eboot_segments(elf), elf)
+            self.assertEqual(writes, [(at + 5, bytes.fromhex('41899688040000'))])
+
+    def test_every_bundled_patch_is_signed_and_found_at_its_address(self):
+        # The signatures must match at their published addresses in the firmware 5.05 build
+        # (out/eboot.elf when a prepared game of that build is present; skipped otherwise).
+        elf_path = ROOT / 'out' / 'eboot.elf'
+        if not elf_path.is_file():
+            self.skipTest('no prepared game in out/')
+        elf = elf_path.read_bytes()
+        found = external_patches(ROOT / 'patches')
+        for key, _, meta in found:
+            for line in meta.iter('Line'):
+                self.assertTrue(line.get('Signature'), key)
+                offset = int(line.get('Address'), 0) - EBOOT_BASE
+                self.assertEqual(patches.locate(line, offset, elf), offset, key)
 
     def test_read_settings(self):
         with tempfile.TemporaryDirectory() as tmp:

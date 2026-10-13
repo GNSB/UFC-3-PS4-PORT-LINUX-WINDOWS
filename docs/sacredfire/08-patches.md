@@ -50,3 +50,24 @@ buffer's slice register (64-row macro-tile alignment). Heights that are not a mu
 hit this, and 1080 is the first one CTR uses. The resolver's padding-only rule (formerly for a
 differing pow2 flag only) now also covers identical metadata with a different padded size and
 reuses the cached image. Pro mode + 1080p patch then runs at 30 FPS (logs/run39-play.log).
+
+## The 1.21 update's two builds (2026-10-13)
+
+Two builds of the 1.21 update exist: the one rebuilt for firmware 5.05 (param.sfo
+`sdk_ver=05050000`; the image hash in scripts/game_check.py SUPPORTED) and the original one for
+firmware 6.72+ (KNOWN_672). Same game, different executable: its code sits at other
+addresses, so fixed patch addresses miss. Since v0.3.1:
+
+- `game_check.py` accepts a 1.21 executable that is not a known old image (the base game's 1.00,
+  OLD_IMAGES) as `variant='6.72+'`; KNOWN_672 holds that build's image hash. `--variant` prints the build
+  for run.sh and the Windows launcher (BB_GAME_VARIANT), and prepare.py names it in the log.
+- Every line of patches/CrashTeamRacing.xml carries a `Signature` (the code around the write,
+  relative jumps and RIP offsets masked as `??`) and a `SignatureOffset`. `patches.py` writes at
+  `Address` when the signature matches there, else at the one place in the executable where it
+  matches, and skips the patch with a log line when it matches nowhere or more than once. On the
+  5.05 build all three match at their published addresses (tests/test_patches.py checks this
+  when out/eboot.elf is that build).
+- The diagnostics that hook the game by address (BB_HEAP_HOOKS, BB_HEAP_SITES, BB_FREE_CHECK)
+  know the 5.05 build only; with any other BB_GAME_VARIANT they print a line and stay off.
+
+A log from either build says which it is and whether the three sites were found.

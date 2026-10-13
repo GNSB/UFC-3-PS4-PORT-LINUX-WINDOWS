@@ -47,7 +47,20 @@ class GameCheckTests(unittest.TestCase):
         self.assertIn('01.21', game_check.explain(*game_check.problem(game)))
 
     def test_update_metadata_with_an_old_executable(self):
-        self.assertEqual(game_check.problem(self.game('CUSA13795', '01.21'))[0], 'wrong_eboot')
+        game = self.game('CUSA13795', '01.21')
+        with mock.patch.dict(game_check.OLD_IMAGES, {game_check.image_sha256(game): '01.00'}):
+            self.assertEqual(game_check.problem(game)[0], 'wrong_eboot')
+            self.assertIsNone(game_check.profile(game))
+
+    def test_other_121_build_is_accepted_as_672(self):
+        # The 1.21 update for firmware 6.72+: another executable, same game.
+        game = self.game('CUSA13795', '01.21')
+        self.assertIsNone(game_check.problem(game))
+        self.assertEqual(game_check.profile(game)['name'], 'ctr')
+        self.assertEqual(game_check.profile(game)['variant'], '6.72+')
+        self.assertFalse(game_check.profile(game)['known'])
+        with mock.patch.object(game_check, 'KNOWN_672', {game_check.image_sha256(game)}):
+            self.assertTrue(game_check.profile(game)['known'])
 
     def test_other_title(self):
         # Bloodborne (bbport's game) is no longer a profile.
@@ -63,6 +76,7 @@ class GameCheckTests(unittest.TestCase):
         with mock.patch.object(game_check, 'SUPPORTED', table):
             self.assertIsNone(game_check.problem(game))
             self.assertEqual(game_check.profile(game)['name'], 'ctr')
+            self.assertEqual(game_check.profile(game)['variant'], '5.05')
             self.assertIn('libSceNpToolkit2.prx', game_check.profile(game)['modules'])
 
     def test_profile_guess_with_the_check_skipped(self):

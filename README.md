@@ -7,7 +7,9 @@ small runtime replaces the PS4 system libraries, and a renderer derived from
 [shadPS4](https://github.com/shadps4-emu/shadPS4) translates the PS4 GPU work to Vulkan.
 Developed and tested on a Steam Deck.
 
-> **No game files are included.** You need your own dump of the game and its 1.21 update.
+> **No game files are included.** You need your own dump of the game and its 1.21 update. Both
+> builds of the 1.21 update are accepted: the one for firmware 5.05 and the one for 6.72+ (the
+> game patches find their sites by signature, so they apply on either).
 > This project is not affiliated with or endorsed by Sony Interactive Entertainment, Activision
 > or Beenox. *Crash Team Racing*, *Nitro-Fueled* and *PlayStation* are trademarks of their
 > owners, named here only to identify the game this software runs.

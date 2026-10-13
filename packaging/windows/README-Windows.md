@@ -4,7 +4,8 @@ SacredFire runs *Crash Team Racing: Nitro-Fueled* (PlayStation 4, CUSA13795, upd
 native Windows x86-64 program. This archive was built on Linux from the SacredFire source at the
 commit in `VERSION`; it contains no game files. You need your own dump of the game with the
 1.21 update merged in (copy the dumped update over the base game, replacing files, eboot.bin
-and sce_sys too).
+and sce_sys too). Both builds of the 1.21 update are accepted, the one for firmware 5.05 and
+the one for 6.72+; the log names which you have.
 
 **Status:** this Windows build has been produced and inspected on Linux. The Windows acceptance
 tests (title screen, a race, saving, restart) are recorded in the project's verification

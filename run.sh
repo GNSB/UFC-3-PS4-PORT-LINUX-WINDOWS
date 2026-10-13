@@ -52,6 +52,8 @@ if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR
 # The game check (scripts/game_check.py) compares the executable image with the supported one
 # (Crash Team Racing Nitro-Fueled CUSA13795 1.21) and names the profile the runtime reads.
 profile=$("$PYTHON" scripts/game_check.py "$game") || { echo "$profile" >&2; exit 2; }
+# The update's build (5.05, 6.72+ or ?): the address-keyed diagnostics know the 5.05 build only.
+export BB_GAME_VARIANT=$("$PYTHON" scripts/game_check.py "$game" --variant 2>/dev/null || echo '?')
 export BB_GAME_PROFILE=${profile:-ctr}
 echo "Game profile: $BB_GAME_PROFILE"
 original_game=$game

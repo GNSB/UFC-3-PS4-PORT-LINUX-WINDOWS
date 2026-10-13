@@ -5,6 +5,7 @@
 // its code on the stack). Report() prints the sites whose live bytes grew since the last report:
 // what leaks when the guest heap runs out.
 #include "bbport_heap_sites.h"
+#include "bbport_toggles.h"
 
 #include <algorithm>
 #include <atomic>
@@ -221,6 +222,9 @@ void InstallWrappers(bool counters) {
         return env && env[0] == '1';
     }();
     static bool done = false;
+    if ((wanted || counters) && !BbToggle::ReferenceBuild("BB_HEAP_SITES")) {
+        return;
+    }
     if ((!wanted && !counters) || done) {
         return;
     }

@@ -308,6 +308,15 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
         trim(profile);
     }
     if (!profile[0]) snprintf(profile, sizeof(profile), "ctr");
+    /* The update's build (5.05, 6.72+ or ?): the address-keyed diagnostics know the 5.05 build only. */
+    {
+        char variant[64] = "?";
+        const wchar_t *args[] = {game, L"--variant"};
+        if (script(L"scripts", L"game_check.py", args, 2, variant, sizeof(variant)) == 0) trim(variant);
+        if (!variant[0]) snprintf(variant, sizeof(variant), "?");
+        wchar_t variant_w[64]; MultiByteToWideChar(CP_UTF8, 0, variant, -1, variant_w, 64); variant_w[63] = 0;
+        SetEnvironmentVariableW(L"BB_GAME_VARIANT", variant_w);
+    }
     wchar_t profile_w[64]; MultiByteToWideChar(CP_UTF8, 0, profile, -1, profile_w, 64); profile_w[63] = 0;
     SetEnvironmentVariableW(L"BB_GAME_PROFILE", profile_w);
     logw(L"Game profile: %ls\n", profile_w);

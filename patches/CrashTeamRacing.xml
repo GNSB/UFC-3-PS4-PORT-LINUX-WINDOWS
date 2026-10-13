@@ -6,7 +6,10 @@
      SacredFire change: the Resolution Patch address is 0x017a9db4, not the published 0x017a9db3.
      The instruction there is a two-byte jne (0F 85) on the "is PS4 Pro" flag; 0x84 belongs on
      its second byte (jne to je). Written on the first byte it becomes "test al, [rbp+0x88f]"
-     and the game faults at boot (docs/sacredfire/08-patches.md). -->
+     and the game faults at boot (docs/sacredfire/08-patches.md).
+     Each line carries a Signature of the code around it (relative jumps and RIP offsets masked),
+     so patches.py also finds it in the 1.21 build for firmware 6.72+, whose code sits at other
+     addresses; the addresses are the firmware 5.05 build's. -->
 <Patch>
     <TitleID>
         <ID>CUSA13795</ID>
@@ -19,7 +22,8 @@
               AppVer="01.21"
               AppElf="eboot.bin">
         <PatchList>
-            <Line Type="bytes" Address="0x017a9d90" Value="41899688040000"/>
+            <Line Type="bytes" Address="0x017a9d90" Value="41899688040000"
+                  Signature="41 8b 44 24 18 41 89 86 88 04 00 00 8a 05 ?? ?? ?? ?? 84 c0 0f 84 ?? ?? ?? ?? 41 8b 8e 40 05 00 00 80 3d ?? ?? ?? ?? 00 0f 85 ?? ?? ?? ?? 45 8b 86 44 05 00 00" SignatureOffset="0x5"/>
         </PatchList>
     </Metadata>
     <Metadata Title="Crash Team Racing Nitro-Fueled"
@@ -29,7 +33,8 @@
               AppVer="01.21"
               AppElf="eboot.bin">
         <PatchList>
-            <Line Type="bytes" Address="0x00ef0f52" Value="9090909090"/>
+            <Line Type="bytes" Address="0x00ef0f52" Value="9090909090"
+                  Signature="41 80 bc 24 50 01 00 00 00 75 10 49 8b b4 24 68 01 00 00 4c 89 e7 e8 ?? ?? ?? ?? c4 c1 7a 10 86 c0 03 00 00" SignatureOffset="0x16"/>
         </PatchList>
     </Metadata>
     <Metadata Title="Crash Team Racing Nitro-Fueled"
@@ -39,7 +44,8 @@
               AppVer="01.21"
               AppElf="eboot.bin">
         <PatchList>
-            <Line Type="bytes" Address="0x017a9db4" Value="84"/>
+            <Line Type="bytes" Address="0x017a9db4" Value="84"
+                  Signature="41 8b 44 24 18 41 89 86 88 04 00 00 8a 05 ?? ?? ?? ?? 84 c0 0f 84 ?? ?? ?? ?? 41 8b 8e 40 05 00 00 80 3d ?? ?? ?? ?? 00 0f 85 ?? ?? ?? ?? 45 8b 86 44 05 00 00" SignatureOffset="0x29"/>
         </PatchList>
     </Metadata>
 </Patch>

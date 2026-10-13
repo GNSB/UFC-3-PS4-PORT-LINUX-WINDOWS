@@ -173,6 +173,9 @@ void Install(RangeCallback on_gpu_range_allocated) {
     if (installed.exchange(true)) {
         return;
     }
+    if (!BbToggle::ReferenceBuild("BB_HEAP_HOOKS")) {
+        return;
+    }
     struct sigaction action {};
     action.sa_sigaction = OnTrap;
     action.sa_flags = SA_SIGINFO | SA_NODEFER;

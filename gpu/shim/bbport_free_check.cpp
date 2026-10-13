@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_free_check.h"
+#include "bbport_toggles.h"
 #ifdef __linux__
 
 #include <algorithm>
@@ -489,7 +490,7 @@ void CheckPage(u64 page, u64 begin, u64 end, u64 value, u64 size, Source source,
 bool Enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_FREE_CHECK");
-        return env && env[0] == '1';
+        return env && env[0] == '1' && BbToggle::ReferenceBuild("BB_FREE_CHECK");
     }();
     return enabled;
 }

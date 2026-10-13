@@ -1,6 +1,8 @@
 // bbport: optimizations that can be switched off while the game runs (BB_TOGGLE_FILE,
 // see runtime_memory.c), to find which one changes rendering without restarting.
 #pragma once
+#include <cstring>
+#include <cstdio>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -98,6 +100,25 @@ inline bool Disabled(std::uint64_t bit) {
 /// A temporary experiment switched on by bit `bit` of the second number in BB_TOGGLE_FILE.
 inline bool Experiment(std::uint64_t bit) {
     return (__atomic_load_n(&runtime_experiment_bits, __ATOMIC_RELAXED) & bit) != 0;
+}
+
+/// SacredFire: the 1.21 update's build the game check found (BB_GAME_VARIANT: "5.05", the
+/// reference image, "6.72+", or "?"). The diagnostics that hook the game by address
+/// (BB_HEAP_HOOKS, BB_HEAP_SITES, BB_FREE_CHECK) know the 5.05 build only and stay off on
+/// any other; `what` names the switch in the line printed once.
+inline bool ReferenceBuild(const char* what) {
+    static const bool reference = [] {
+        const char* env = std::getenv("BB_GAME_VARIANT");
+        return !env || !env[0] || std::strcmp(env, "5.05") == 0;
+    }();
+    if (!reference) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            std::printf("%s: the hooks know the 1.21 build for firmware 5.05 only (this is the %s "
+                        "build): off\n", what, std::getenv("BB_GAME_VARIANT"));
+        }
+    }
+    return reference;
 }
 } // namespace BbToggle
 

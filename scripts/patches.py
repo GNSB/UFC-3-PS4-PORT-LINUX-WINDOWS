@@ -4,6 +4,12 @@ Patch addresses are PS4 virtual addresses (eboot base 0x400000); the loader's im
 vaddr 0 at image offset 0. Only literal writes are supported (bytes, bytes16/32/64, float32/64,
 utf8, utf16); pattern ("mask") patches are rejected and the patch is skipped whole.
 
+A line may carry Signature="41 8b ?? ..." (hex bytes, ?? for any byte) and SignatureOffset (where
+the write goes, from the signature's start). The write goes to Address when the signature matches
+there (the 1.21 build for firmware 5.05); otherwise to the one place in the executable where it
+matches (the 6.72+ build, whose code sits at other addresses). No match, or more than one: the
+patch is skipped whole, with a log line.
+
 Patch files: patches/*.xml in the checkout (patches/CrashTeamRacing.xml, from
 illusionyy/PS-Game-Patch) and any folder named with --patches-dir. A patch is applied when the
 in-game menu or the launcher turned its bbport.ini key on (GAME_PATCH_KEYS), when patches.json
@@ -11,6 +17,7 @@ lists it under "enabled", or when its file marks it isEnabled and patches.json d
 """
 import argparse
 import json
+import re
 import struct
 import sys
 import xml.etree.ElementTree as ET
@@ -46,6 +53,42 @@ def eboot_segments(elf):
         kind,_,_,vaddr,_,_,memsz,_=struct.unpack_from('<IIQQQQQQ',elf,phoff+i*phentsize)
         if kind==1: segments.append((vaddr,vaddr+memsz))
     return segments
+
+
+def load_segments(elf):
+    """[(vaddr, file offset, file size)] of eboot.elf's load segments (signature search)."""
+    phoff,=struct.unpack_from('<Q',elf,0x20)
+    phentsize,phnum=struct.unpack_from('<HH',elf,0x36)
+    found=[]
+    for i in range(phnum):
+        kind,_,offset,vaddr,_,filesz,_,_=struct.unpack_from('<IIQQQQQQ',elf,phoff+i*phentsize)
+        if kind==1: found.append((vaddr,offset,filesz))
+    return found
+
+
+def signature_regex(text):
+    tokens=text.split()
+    if not tokens: raise ValueError('empty signature')
+    return re.compile(b''.join(b'.' if t=='??' else re.escape(bytes([int(t,16)])) for t in tokens),re.S)
+
+
+def locate(line, offset, elf):
+    """The image offset a signed line writes to (see the module docstring)."""
+    rx=signature_regex(line.get('Signature'))
+    shift=int(line.get('SignatureOffset','0'),0)
+    loads=load_segments(elf)
+    def at(vaddr):
+        for start,pos,size in loads:
+            if start<=vaddr and vaddr-start<size: return pos+vaddr-start
+    pos=at(offset-shift)
+    if pos is not None and rx.match(elf,pos): return offset
+    hits=[]
+    for start,pos,size in loads:
+        hits+=[start+m.start()-pos for m in rx.finditer(elf,pos,pos+size)]
+        if len(hits)>1: break
+    if len(hits)!=1:
+        raise ValueError(f'patch site for {line.get("Address")} not found ({len(hits)} signature matches)')
+    return hits[0]+shift
 
 
 def encode(line):
@@ -93,8 +136,9 @@ def external_selection(found, config, ini=None):
             if key in enabled or (key not in disabled and meta.get('isEnabled','false').lower()=='true')]
 
 
-def compile_external(selected, segments):
-    """Writes of the selected patches; a patch with unsupported lines is skipped whole."""
+def compile_external(selected, segments, elf=None):
+    """Writes of the selected patches; a patch with unsupported lines is skipped whole. elf (the
+    eboot.elf bytes) is needed for lines with a Signature."""
     writes=[]
     for key,_,meta in selected:
         try:
@@ -102,6 +146,11 @@ def compile_external(selected, segments):
             for line in meta.iter('Line'):
                 offset=int(line.get('Address') or '',0)-EBOOT_BASE
                 data=encode(line)
+                if line.get('Signature'):
+                    if elf is None: raise ValueError('signature without the executable')
+                    moved=locate(line,offset,elf)
+                    if moved!=offset: print(f'Patches: {key}: {line.get("Address")} found at {moved+EBOOT_BASE:#010x}')
+                    offset=moved
                 if not any(start<=offset and offset+len(data)<=end for start,end in segments):
                     raise ValueError(f'address {line.get("Address")} is outside the eboot')
                 ours.append((offset,data))
@@ -132,9 +181,10 @@ def main():
     p.add_argument('--settings',type=Path,default=root/'bbport.ini')
     p.add_argument('--external-only',action='store_true',help='accepted for older callers (the only mode)')
     a=p.parse_args()
-    segments=eboot_segments((a.out/'eboot.elf').read_bytes())
+    elf=(a.out/'eboot.elf').read_bytes()
+    segments=eboot_segments(elf)
     found=external_patches(a.patches_dir,a.app_version,a.title_id)
-    writes=compile_external(external_selection(found,a.patches_config,read_settings(a.settings)),segments)
+    writes=compile_external(external_selection(found,a.patches_config,read_settings(a.settings)),segments,elf)
     write_blob(a.out,writes)
     print(f'Patches: {len(writes)} writes from {len(found)} available patches')
 
