@@ -183,6 +183,17 @@ AvPlayer/FFmpeg left both builds (CTR imports none of it; `-DBB_AVPLAYER=ON` bri
   nix-shell build (429 MB, nixpkgs 26.11pre1087755.e7439b6b14ad), booted to the start screen with
   `--appimage-extract-and-run --play`, released on GitHub with the .sha256.
 
+## v0.3.0 (2026-10-13)
+
+- Tag v0.3.0 at 0e66635 (windows-port fast-forwarded into main): the Windows x86-64 port with
+  its Win32 launcher and Add to Steam, the issue #2 late-label guard with the event dump, the
+  nearest-surface-format fallback, the 60 FPS cap with the separate Unlocked frame rate switch.
+  `dist/SacredFire-windows-x86_64.zip` (20 MB) from `scripts/package-windows.sh` at the tag;
+  `dist/SacredFire-x86_64.AppImage` (429 MB) rebuilt with the nix-shell build, nixpkgs pinned to
+  the v0.2.1 revision (e7439b6b14ad, as a tarball: the container's Nix store had been emptied and
+  now lives on the SD card), booted with `--appimage-extract-and-run --play` to the running game
+  on the bundled RADV. Release notes: `dist/RELEASE_NOTES_v0.3.0.md`.
+
 ## Launcher and controllers (2026-10-11, branch backport-0.51)
 
 - Launcher, log page: *Copy* (clipboard) and *Export log…* (a file dialog; `sacredfire-<date>.log`),
