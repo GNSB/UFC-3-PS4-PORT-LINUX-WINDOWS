@@ -1,3 +1,5 @@
+#include <tuple>
+#include <set>
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -2919,7 +2921,11 @@ struct DepthAsR16 {
     vk::UniqueDescriptorSetLayout set_layout;
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline;
-    std::unordered_map<const void*, Copy> copies; // keyed by the guest image's VkImage
+    // Keyed by the guest image's VkImage and the layer read: UFC 3's spot-light shadow map is a
+    // 6-layer Z16 array that cs 34617c9f reads layer by layer (one per light) into the floor's
+    // R32G32_UINT min/max map; only layer 0 converted gave garbage for lights 1-5 (the octagon
+    // floor's grain and gray blocks).
+    std::map<std::pair<const void*, u32>, Copy> copies;
 };
 
 DepthAsR16& DepthAsR16State(const Instance& instance) {
@@ -2956,9 +2962,10 @@ DepthAsR16& DepthAsR16State(const Instance& instance) {
     return state;
 }
 
-const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, const void* key, u32 width,
-                                       u32 height) {
+const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, const void* image, u32 layer,
+                                       u32 width, u32 height) {
     auto& state = DepthAsR16State(instance);
+    const auto key = std::make_pair(image, layer);
     auto& copy = state.copies[key];
     if (copy.image && (copy.width != width || copy.height != height)) {
         instance.GetDevice().destroyImageView(copy.view);
@@ -2993,8 +3000,8 @@ const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, const void* key
         }));
         copy.width = width;
         copy.height = height;
-        std::printf("Depth as R16_UINT: %ux%u copy for a depth image read as raw Z16 bits\n",
-                    width, height);
+        std::printf("Depth as R16_UINT: %ux%u copy of layer %u for a depth image read as raw Z16 bits\n",
+                    width, height, layer);
     }
     return &copy;
 }
@@ -3207,6 +3214,43 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
             const auto binding = image.binding;
+            {   // ufc3 (BB_DEPTH_VIEW_LOG=1): depth images read through a colour format, and the
+                // writers of R32G32_UINT images (the floor's shadow min/max map), once per kind.
+                static const bool log_views = [] {
+                    const char* e = std::getenv("BB_DEPTH_VIEW_LOG");
+                    return e && e[0] == '1';
+                }();
+                const auto fmt = desc.view_info.format;
+                const bool depth_as_color = image.info.props.is_depth &&
+                                            fmt != vk::Format::eD16Unorm && fmt != vk::Format::eD32Sfloat &&
+                                            fmt != vk::Format::eD16UnormS8Uint &&
+                                            fmt != vk::Format::eD24UnormS8Uint &&
+                                            fmt != vk::Format::eD32SfloatS8Uint;
+                const bool rg32 = image.info.pixel_format == vk::Format::eR32G32Uint;
+                if (log_views && (depth_as_color || rg32)) {
+                    static std::mutex m;
+                    static std::set<std::tuple<u64, u32, VAddr, u32, bool>> seen;
+                    std::scoped_lock lk{m};
+                    if (seen.emplace(stage.pgm_hash, u32(fmt), image.info.guest_address,
+                                     desc.view_info.range.base.layer, is_storage).second &&
+                        seen.size() < 400) {
+                        std::printf("Depth view log: %s %016llx %s image %#llx %s %ux%u layers %u "
+                                    "levels %u tile %u, view %s layers %u+%u levels %u+%u\n",
+                                    stage.sw_stage == Shader::SwStage::Compute ? "cs" : "gfx",
+                                    (unsigned long long)stage.pgm_hash,
+                                    is_storage ? "WRITES" : "reads",
+                                    (unsigned long long)image.info.guest_address,
+                                    vk::to_string(image.info.pixel_format).c_str(),
+                                    image.info.size.width, image.info.size.height,
+                                    image.info.resources.layers, image.info.resources.levels,
+                                    u32(image.info.tile_mode), vk::to_string(fmt).c_str(),
+                                    desc.view_info.range.base.layer,
+                                    desc.view_info.range.extent.layers,
+                                    desc.view_info.range.base.level,
+                                    desc.view_info.range.extent.levels);
+                    }
+                }
+            }
 
             // bbport: a proxied scene image sampled with normalized coordinates reads the proxy:
             // no resample to the native size (the native image is not touched).
@@ -3262,9 +3306,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             vk::ImageLayout layout = image.backing->state.layout;
             if (!is_storage && !on_helper && image.info.props.is_depth &&
                 desc.view_info.format == vk::Format::eR16Uint &&
-                desc.view_info.range.base.level == 0 && desc.view_info.range.base.layer == 0) {
+                desc.view_info.range.base.level == 0 && desc.view_info.range.extent.layers == 1) {
                 const u32 width = image.info.size.width, height = image.info.size.height;
-                const auto* copy = DepthAsR16Copy(instance, image.GetImage(), width, height);
+                const auto* copy = DepthAsR16Copy(instance, image.GetImage(),
+                                                  desc.view_info.range.base.layer, width, height);
                 if (copy) {
                     // The depth image was transited for reading above; the copy is rebuilt now.
                     scheduler.EndRendering();

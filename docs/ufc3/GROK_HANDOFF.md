@@ -801,3 +801,16 @@ Route, on the model the user confirmed (run81, lights and fighters, 90–100):
   Paths: (1) now: local 2-player + Steam Remote Play Together / Parsec; (2) long: a Blaze emulator
   in the PocketRelay style (redirector + minimal Blaze components + ProtoSSL cert patch + real
   sockets in the runtime + PSN ticket stub).
+
+## 19. Octagon floor noise / gray blocks — FIXED (2026-10-14 17:30)
+
+- BB_DEPTH_VIEW_LOG=1 (new, vk_rasterizer.cpp BindTextures) lists depth images read through a
+  colour format and the writers of R32G32_UINT images. It showed (run112): the spot-light shadow
+  map 0x1079620000 is a **6-layer** Z16 array; cs **34617c9f** reads each layer as R16_UINT and
+  writes the same layer of the R32G32_UINT 512x512x6 min/max map 0x1078616000 that the floor
+  shader 86b28487 reads (the "dirt map" of §6/§11 is this shadow min/max map). cs aae9f6c1 does
+  the same reads.
+- The DepthAsR16 conversion (depth -> R16_UINT copy) only ran for layer 0: lights 1-5 read
+  garbage -> grainy floor and gray blocks. Now one copy per (VkImage, layer), any single layer.
+  Same bug class as shadPS4 PR #5284 (UFC 4, "grainy or shimmering shadows on the octagon floor").
+- run113: user played a fight and confirmed the floor renders correctly.
