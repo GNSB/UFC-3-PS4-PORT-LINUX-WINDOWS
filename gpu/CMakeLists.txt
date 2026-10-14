@@ -2,6 +2,10 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
+# Release archives: source paths in __FILE__ (log messages) relative to the repository, without
+# the build machine's home directory.
+get_filename_component(BB_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+add_compile_options("-ffile-prefix-map=${BB_REPO_ROOT}/=")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -205,6 +209,9 @@ if (WIN32)
     target_link_libraries(bbgpu PUBLIC Vulkan::Vulkan ws2_32 bcrypt ntdll synchronization winmm onecore)
 else()
     target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
+    # shim/glibc_compat.cpp: acosf/sqrtf bound to their pre-2.43 versions (portable releases).
+    target_link_options(bbgpu PRIVATE -Wl,--wrap=acosf -Wl,--wrap=sqrtf)
+    set_source_files_properties(shim/glibc_compat.cpp PROPERTIES COMPILE_OPTIONS "-fno-lto")
 endif()
 
 # sacredfire (Windows): the game executable, the GPU check and the launcher, built here where

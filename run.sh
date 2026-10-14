@@ -101,7 +101,8 @@ fi
 "$PYTHON" scripts/link_libc.py "$game" --out "$out"
 "$PYTHON" scripts/link_modules.py "$game" --out "$out" --modules libc.prx libSceFios2.prx
 # SacredFire: symbol names for this eboot's host-side imports (shadPS4's aerolib list, fetched once).
-"$PYTHON" tools/gen_import_names.py --out "$out"
+aerolib_args=(); [[ -f share/aerolib.inl ]] && aerolib_args=(--aerolib share/aerolib.inl)  # packaged copy
+"$PYTHON" tools/gen_import_names.py --out "$out" "${aerolib_args[@]}"
 "$PYTHON" scripts/content_profile.py "$game" --out "$out" --sku "${BB_CONTENT_SKU:-full}"
 # The game runs at its own 30 FPS against a 60 Hz vblank unless the 60 FPS patch is on. Patches
 # come from patches/CrashTeamRacing.xml (community patches by illusion and TroyWarez, from

@@ -288,6 +288,15 @@ static DWORD run(wchar_t *line, char *captured, size_t capture_size, int is_game
     DWORD code = 1;
     GetExitCodeProcess(process.hProcess, &code);
     if (is_game) game_process = NULL;
+    /* Windows could not load the program itself (its DLLs in bin\): say why in the log. */
+    if (code == 0xC0000022u || code == 0xC0000135u || code == 0xC000007Bu || code == 0xC0000142u) {
+        logw(L"%ls could not start: Windows error 0x%08lX (%ls).\n", line, code,
+             code == 0xC0000022u ? L"access denied" : code == 0xC0000135u ? L"a DLL is missing" :
+             code == 0xC000007Bu ? L"a DLL is not 64-bit" : L"a DLL failed to initialize");
+        logw(L"  Usually: an antivirus blocked or quarantined a file in bin\ (Windows Security > Protection\n"
+             L"  history: allow it), the folder is synced by OneDrive (extract to e.g. C:\\Games\\UFC3Native),\n"
+             L"  or the zip was extracted without being unblocked (zip > Properties > Unblock, extract again).\n");
+    }
     CloseHandle(process.hProcess);
     return code;
 }
@@ -1128,6 +1137,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     /* Started from a console (cmd, a script): its output stays there as well. */
     if (AttachConsole(ATTACH_PARENT_PROCESS)) console_out = GetStdHandle(STD_OUTPUT_HANDLE);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    /* A child that cannot load (0xC0000022 ...) reports to the log, not a system dialog. */
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     managed_env_capture();
     GetModuleFileNameW(NULL, root, PATHW);
     { wchar_t *slash = wcsrchr(root, L'\\'); if (slash) *slash = 0; }

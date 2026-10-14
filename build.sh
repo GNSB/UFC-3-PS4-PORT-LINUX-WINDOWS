@@ -78,7 +78,7 @@ echo "Built $PWD/out/sacredfire"
 # "-dirty" when tracked files differ from it). run.sh prints it, the launcher shows it and the
 # package carries it, so a published binary can be matched to its source. The FSR-Vulkan patch
 # build.sh applies inside its submodule does not count as a change.
-version=$(git describe --tags --match 'v*' --always 2>/dev/null || echo unknown)
+version=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
 git update-index -q --refresh 2>/dev/null || true
 if ! git diff-index --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null; then version="$version-dirty"; fi
 printf '%s\n' "$version" > out/VERSION
