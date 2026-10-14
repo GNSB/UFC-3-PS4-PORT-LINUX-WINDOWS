@@ -30,8 +30,7 @@ and saves.
 
 - Tested on NVIDIA (Linux and Windows). The AMD code paths are SacredFire's (developed on AMD /
   Steam Deck), but **UFC 3 has not been tested on an AMD GPU yet**.
-- Known issues: noise / gray blocks on the octagon floor; the first-run tutorial videos cannot be
-  skipped; moving the window to another monitor *during startup* can crash the NVIDIA driver
+- Known issues: noise / gray blocks on the octagon floor; moving the window to another monitor *during startup* can crash the NVIDIA driver
   (`Swapchain::Destroy`).
 
 ## Requirements
@@ -116,6 +115,7 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
 | `BB_GPU_WRITE_TWINS` | 0 | Incompatible with precise readbacks (deadlock). |
 | `BB_INTERNAL_WIDTH/HEIGHT`, `BB_FSR1`, `BB_RCAS` | from the launcher | Internal resolution and upscaling. |
 | `BB_WINDOW_SIZE` | from the launcher | Window size (`2560x1440`, `3840x2160`…); the game's frame is scaled to it. |
+| `BB_SKIP_MOVIES` | 1 | The EA intro and the first-start video play a short black clip (`share/skip_movie.mkv`). |
 | `BB_USER_NAME` | `Player 1` | The PS4 user name the game shows (16 bytes). |
 | `BB_FRAME_STATS` | 1 in `run.sh` | Periodic statistics in the log (FPS, µs per draw, readbacks, write sites…). |
 

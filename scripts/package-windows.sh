@@ -80,6 +80,7 @@ cp tools/gen_import_names.py "$stage/tools/"
 mkdir -p "$stage/patches"
 find patches -maxdepth 1 -type f -name '*.xml' -exec cp {} "$stage/patches/" \;
 cp "$root/downloads/aerolib.inl" "$stage/share/aerolib.inl"
+cp share/skip_movie.mkv "$stage/share/skip_movie.mkv"
 cp LICENSE "$stage/LICENSE"; cp "$root/bin/VERSION" "$stage/VERSION"
 cp packaging/windows/README-Windows.md "$stage/README-Windows.md"
 # Licences of what is in the archive.

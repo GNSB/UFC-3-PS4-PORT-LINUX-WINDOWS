@@ -31,6 +31,7 @@ your own dump of the game and its 1.14 update.
 - **Display resolution** — the window size: 1080p, 1440p (2K) or 4K. The game's 1080p frame is
   scaled to it; use **Upscaling = AMD FSR 1.0** and some **Sharpening** for a sharp image. In
   fullscreen the monitor's size is used.
+- **Skip the intro videos** — the EA logo and the first-start video (on by default).
 - **Present mode** — *Immediate* reaches the game's 240 FPS cap (may tear); *Mailbox* is capped
   at twice the refresh rate on NVIDIA; *VSync* follows the monitor.
 - **FPS limit** — 60 / 120 / 144 / 240 / Unlimited.
@@ -39,8 +40,12 @@ your own dump of the game and its 1.14 update.
 ## Problems
 
 Send the newest log from `%LOCALAPPDATA%\UFC3Native\logs` (the launcher's **Open logs folder**)
-with a short description. Known issues: noise on the octagon floor; the first-run tutorial
-videos cannot be skipped.
+with a short description. Known issue: noise on the octagon floor.
+
+If the launcher's log says a program "could not start" (Windows error 0xC0000022, access
+denied): allow the file in your antivirus (Windows Security > Protection history), extract the
+archive outside OneDrive (e.g. `C:\Games\UFC3Native`), or unblock the zip (Properties >
+Unblock) and extract it again.
 
 This project is not affiliated with or endorsed by Electronic Arts, Sony Interactive
 Entertainment or the UFC. GPL-2.0-or-later; third-party licences are in `licenses\`.

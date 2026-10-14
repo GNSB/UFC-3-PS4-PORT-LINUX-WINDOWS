@@ -118,6 +118,32 @@ static int translate(const char *guest,char *out,size_t size) {
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
     pthread_mutex_unlock(&lock);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
+    /* ufc3 (BB_SKIP_MOVIES=1, BB_SKIP_MOVIE_FILE=<clip>): the EA intro and the first-start video
+     * (movie/bootflow/, movie/ftue/; BB_SKIP_MOVIES_MATCH: other comma-separated path parts)
+     * open a fraction-of-a-second black clip of the same format instead. */
+    if (!result) {
+        static int skip=-1; static char clip[1024], match[512];
+        if (skip<0) {
+            const char *on=getenv("BB_SKIP_MOVIES"), *file=getenv("BB_SKIP_MOVIE_FILE"), *m=getenv("BB_SKIP_MOVIES_MATCH");
+            skip=on && on[0]=='1' && file && *file;
+            if (skip) {
+                snprintf(clip,sizeof(clip),"%s",file);
+                snprintf(match,sizeof(match),"%s",m && *m ? m : "/movie/bootflow/,/movie/ftue/");
+                printf("Runtime: intro and first-start videos skipped (BB_SKIP_MOVIES: %s)\n",match);
+            }
+        }
+        if (skip && strstr(buffer,".mkv")) {
+            char parts[512]; snprintf(parts,sizeof(parts),"%s",match);
+            for (char *part=parts, *next; part; part=next) {
+                next=strchr(part,','); if (next) *next++=0;
+                if (*part && strstr(buffer,part)) {
+                    if ((size_t)snprintf(out,size,"%s",clip)>=size) result=ENAMETOOLONG;
+                    printf("Runtime: video %s skipped\n",buffer);
+                    break;
+                }
+            }
+        }
+    }
     /* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files). */
     static int trace=-1;
     if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }

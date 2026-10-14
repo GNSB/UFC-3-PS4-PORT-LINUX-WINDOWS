@@ -14,6 +14,8 @@ BB_WINDOW_SIZE=
 BB_FSR1=0
 BB_RCAS=0
 BB_RCAS_ATTENUATION=500
+# Skip the EA intro and the first-start video: 1 skip, 0 play them
+BB_SKIP_MOVIES=1
 # The player name the game shows (16 ASCII characters)
 BB_USER_NAME=Player 1
 # The monitor: its number (1, 2, ...) or part of its name

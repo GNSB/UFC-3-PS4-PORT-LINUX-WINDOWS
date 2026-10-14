@@ -67,6 +67,8 @@ if [[ $BB_GAME_PROFILE == ufc3 ]]; then
     # shader outputs) keep their page open until the next submission instead of a readback each:
     # fights 105-113 -> 140-190 FPS on the 4070 (GROK_HANDOFF §17).
     export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1}
+    # The EA intro and the 2.5-minute first-start video play a short black clip instead.
+    export BB_SKIP_MOVIES=${BB_SKIP_MOVIES:-1} BB_SKIP_MOVIE_FILE=${BB_SKIP_MOVIE_FILE:-$PWD/share/skip_movie.mkv}
     # Frame rate: the game asks for flip rate 1 (30 Hz) through its present-interval setter
     # (guest 0x1182a0); the simulation follows the real frame time, so flip rate 0 with a 120 Hz
     # virtual vblank lets it run at 60-120 FPS. BB_FLIP_RATE=1 BB_VBLANK_HZ=60: the console's 30.

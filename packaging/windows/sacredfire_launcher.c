@@ -49,8 +49,9 @@ typedef struct {
     int resolution, fps_mode, present_mode, show_fps, upscaler, sharpness;
     /* The window (presented image) size: the game's 1080p frame scaled to 1440p / 4K. */
     int display;
+    int skip_movies; /* the EA intro and the first-start video replaced by a short black clip */
 } Settings;
-static Settings settings = {.resolution = 1, .fps_mode = 4, .present_mode = 2, .upscaler = 0, .sharpness = 2};
+static Settings settings = {.resolution = 1, .fps_mode = 4, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
 /* Choices of the Video panel (index = the saved value). */
 static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080"};
 static const wchar_t *const resolution_w[] = {L"1280", L"1920"}, *const resolution_h[] = {L"720", L"1080"};
@@ -75,7 +76,7 @@ static const wchar_t *const managed_env[] = {
     L"BB_FULLSCREEN", L"BB_VK_VALIDATION", L"BB_FRAME_STATS", L"BB_MENU_TRACE", L"BB_GAMEPAD", L"BB_NEO",
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
     L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
-    L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
+    L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
 static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
@@ -144,6 +145,7 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"present_mode")) settings.present_mode = clampi(_wtoi(value), COUNT(present_names));
         else if (!wcscmp(line, L"upscaler")) settings.upscaler = clampi(_wtoi(value), COUNT(upscaler_names));
         else if (!wcscmp(line, L"sharpness")) settings.sharpness = clampi(_wtoi(value), COUNT(sharpness_names));
+        else if (!wcscmp(line, L"skip_movies")) settings.skip_movies = _wtoi(value);
         else if (!wcscmp(line, L"display")) settings.display = clampi(_wtoi(value), COUNT(display_names));
     }
     fclose(f);
@@ -154,10 +156,10 @@ static void settings_save(void) {
     if (!f) return;
     fwprintf(f, L"player=%ls\n", settings.player);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
-                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\n",
+                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
              settings.frame_stats, settings.menu_trace, settings.resolution, settings.fps_mode, settings.present_mode,
-             settings.upscaler, settings.sharpness, settings.display);
+             settings.upscaler, settings.sharpness, settings.display, settings.skip_movies);
     fclose(f);
 }
 /* bbport.ini: "key=value" lines (UTF-8), shared with the in-game menu. */
@@ -293,7 +295,7 @@ static DWORD run(wchar_t *line, char *captured, size_t capture_size, int is_game
         logw(L"%ls could not start: Windows error 0x%08lX (%ls).\n", line, code,
              code == 0xC0000022u ? L"access denied" : code == 0xC0000135u ? L"a DLL is missing" :
              code == 0xC000007Bu ? L"a DLL is not 64-bit" : L"a DLL failed to initialize");
-        logw(L"  Usually: an antivirus blocked or quarantined a file in bin\ (Windows Security > Protection\n"
+        logw(L"  Usually: an antivirus blocked or quarantined a file in bin\\ (Windows Security > Protection\n"
              L"  history: allow it), the folder is synced by OneDrive (extract to e.g. C:\\Games\\UFC3Native),\n"
              L"  or the zip was extracted without being unblocked (zip > Properties > Unblock, extract again).\n");
     }
@@ -322,7 +324,10 @@ static void gamepads_refresh(void) {
     static wchar_t line[32768]; line[0] = 0;
     append_argument(line, 32768, caps_exe); append_argument(line, 32768, L"--gamepads");
     static char out[16384];
-    if (run(line, out, sizeof(out), 0, 10000) != 0) return;
+    DWORD code = run(line, out, sizeof(out), 0, 10000);
+    /* Access denied right after extracting: often an antivirus still scanning the new files. */
+    if (code == 0xC0000022u) { Sleep(2000); code = run(line, out, sizeof(out), 0, 10000); }
+    if (code != 0) return;
     for (char *p = out; *p && gamepad_count < 16;) {
         char *end = strchr(p, '\n'); if (end) *end = 0;
         char *tab = strchr(p, '\t');
@@ -453,6 +458,11 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);
     game_env(L"BB_INTERNAL_HEIGHT", resolution_h[settings.resolution]);
     game_env(L"BB_WINDOW_SIZE", display_sizes[settings.display]);
+    {
+        wchar_t clip[PATHW]; join(clip, PATHW, root, L"share\\skip_movie.mkv");
+        game_env(L"BB_SKIP_MOVIES", settings.skip_movies && exists(clip) ? L"1" : L"0");
+        game_env(L"BB_SKIP_MOVIE_FILE", clip);
+    }
     game_env(L"BB_FSR1", settings.upscaler == 1 ? L"1" : L"0");
     game_env(L"BB_RCAS", settings.sharpness ? L"1" : L"0");
     game_env(L"BB_RCAS_ATTENUATION", sharpness_attenuation[settings.sharpness]);
@@ -669,7 +679,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -908,7 +918,7 @@ static void read_controls(void) {
     }
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
-    settings.fullscreen = checked(ID_FULLSCREEN); settings.clear_cache = checked(ID_CLEAR);
+    settings.fullscreen = checked(ID_FULLSCREEN); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
     settings.validation = checked(ID_VALIDATION); settings.frame_stats = checked(ID_STATS); settings.menu_trace = checked(ID_TRACE);
     settings.resolution = clampi((int)SendMessageW(control(ID_RESOLUTION), CB_GETCURSEL, 0, 0), COUNT(resolution_names));
     settings.fps_mode = clampi((int)SendMessageW(control(ID_FPS), CB_GETCURSEL, 0, 0), COUNT(fps_names));
@@ -1089,6 +1099,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 536, y + 20, 200, 200, ID_FPS);
     make(L"BUTTON", L"Show the FPS counter", BS_AUTOCHECKBOX, 400, y + 56, 330, 20, ID_SHOWFPS);
     make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 88, 330, 20, ID_CLEAR);
+    make(L"BUTTON", L"Skip the intro videos (EA logo, first start)", BS_AUTOCHECKBOX, 400, y + 188, 340, 20, ID_SKIPMOVIES);
     make(L"STATIC", L"2K / 4K: the game draws 1080p; pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
     make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
@@ -1115,7 +1126,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
             SendMessageW(control(combos[c].id), CB_SETCURSEL, combos[c].selected, 0);
         }
     }
-    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_CLEAR, settings.clear_cache);
+    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads();
     set_running(0);
