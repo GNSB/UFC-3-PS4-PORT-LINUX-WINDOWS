@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SacredFire Windows release archive, made on Linux after scripts/build-windows.sh:
-#   dist/SacredFire-windows-x86_64.zip  with .sha256 and .build.txt (source, donor, toolchain, lock)
+#   dist/UFC3Native-windows-x86_64.zip  with .sha256 and .build.txt (source, donor, toolchain, lock)
 # Staged: SacredFire.exe (launcher), bin/ (sacredfire-game.exe, bb-gpu-capabilities.exe, the
 # DLLs they import that are not part of Windows: SDL3, libc++, libunwind, libwinpthread), python/
 # (the official embeddable package, pinned), scripts/ and tools/gen_import_names.py (preparation),
@@ -23,11 +23,11 @@ if [[ -z ${BB_ALLOW_DIRTY:-} ]]; then
     [[ $checkout != *-dirty ]] || { echo "The checkout has uncommitted changes ($checkout): commit and tag first (BB_ALLOW_DIRTY=1 for a test archive)." >&2; exit 1; }
     [[ $built_from == "$checkout" ]] || { echo "out/windows/bin was built from $built_from, the checkout is at $checkout: build again." >&2; exit 1; }
 fi
-stage=$root/stage/SacredFire
+stage=$root/stage/UFC3Native
 rm -rf "$root/stage"
 mkdir -p "$stage/bin" "$stage/python" "$stage/share" "$stage/licenses" "$stage/tools"
 # Programs, stripped of debug information (out/windows/bin keeps the symbols for crash reports).
-"$tc/bin/x86_64-w64-mingw32-strip" --strip-debug -o "$stage/SacredFire.exe" "$root/bin/SacredFire.exe"
+"$tc/bin/x86_64-w64-mingw32-strip" --strip-debug -o "$stage/UFC3.exe" "$root/bin/SacredFire.exe"
 for exe in sacredfire-game.exe bb-gpu-capabilities.exe; do "$tc/bin/x86_64-w64-mingw32-strip" --strip-debug -o "$stage/bin/$exe" "$root/bin/$exe"; done
 # DLL closure: imports of each PE, resolved against the sysroot and the toolchain; Windows' own
 # DLLs (kernel32, user32, the api-ms-win-* sets, vulkan-1 from the graphics driver) are not shipped.
@@ -59,7 +59,7 @@ resolve() {
     done
 }
 echo 'package-windows: DLL closure'
-resolve "$stage/bin/sacredfire-game.exe"; resolve "$stage/bin/bb-gpu-capabilities.exe"; resolve "$stage/SacredFire.exe"
+resolve "$stage/bin/sacredfire-game.exe"; resolve "$stage/bin/bb-gpu-capabilities.exe"; resolve "$stage/UFC3.exe"
 # The Python embeddable package (stdlib in python313.zip; no Tk, no pip) and the preparation
 # scripts. python -I (the launcher's invocation) imports only from there and the script's folder.
 python_zip=$(sed -n 's/^python-embed archive [^ ]*\/\([^ ]*\) .*/\1/p' packaging/windows/deps.lock)
@@ -99,19 +99,19 @@ while IFS= read -r -d '' f; do
     if head -c 4 "$f" | grep -q 'ELF'; then echo "package-windows: ELF object in the archive: $f" >&2; exit 1; fi
     case $f in *.exe|*.dll|*.pyd) "$readobj" --file-headers "$f" | grep -q IMAGE_FILE_MACHINE_AMD64 || { echo "package-windows: $f is not AMD64" >&2; exit 1; } ;; esac
 done < <(find "$stage" -type f -print0)
-if grep -rl -- "$PWD" "$stage/bin" "$stage/SacredFire.exe" 2>/dev/null | head -1 | grep -q .; then echo "package-windows: a staged binary carries the build host path $PWD" >&2; exit 1; fi
+if grep -rl -- "$PWD" "$stage/bin" "$stage/UFC3.exe" 2>/dev/null | head -1 | grep -q .; then echo "package-windows: a staged binary carries the build host path $PWD" >&2; exit 1; fi
 for forbidden in eboot.bin '*.prx' '*.sav' 'boot*.bin' '*.spv'; do
     if find "$stage" -iname "$forbidden" | grep -q .; then echo "package-windows: $forbidden inside the archive" >&2; exit 1; fi
 done
 find "$stage" -name __pycache__ -prune -exec rm -r {} +
 mkdir -p dist
-archive=dist/SacredFire-windows-x86_64.zip
+archive=dist/UFC3Native-windows-x86_64.zip
 archive_path=$PWD/$archive
 rm -f "$archive"
 (cd "$root/stage" && python3 -c "
 import os, sys, zipfile, time
 with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
-    for base, dirs, files in sorted(os.walk('SacredFire')):
+    for base, dirs, files in sorted(os.walk('UFC3Native')):
         dirs.sort()
         for name in sorted(files):
             path = os.path.join(base, name)
@@ -120,12 +120,12 @@ with zipfile.ZipFile(sys.argv[1], 'w', zipfile.ZIP_DEFLATED) as z:
             info.external_attr = (0o755 if name.endswith('.exe') else 0o644) << 16
             with open(path, 'rb') as f: z.writestr(info, f.read())
 " "$archive_path")
-(cd dist && sha256sum SacredFire-windows-x86_64.zip > SacredFire-windows-x86_64.zip.sha256)
+(cd dist && sha256sum UFC3Native-windows-x86_64.zip > UFC3Native-windows-x86_64.zip.sha256)
 donor=$(sed -n 's/^# donor Supermedo\/bloodborne_pc \([0-9a-f]*\).*/\1/p' packaging/windows/deps.lock | head -1)
 {
     printf 'SacredFire %s (Windows x86-64)\nsource commit %s\ndonor Supermedo/bloodborne_pc %s\ntoolchain %s\nlock sha256 %s\nbuild options: BB_LTO=%s BB_PGO=off BB_AVPLAYER=OFF, --disable-high-entropy-va, stack 16 MiB committed\n' \
         "$built_from" "$(git rev-parse HEAD)" "${donor:-unknown}" "${toolchain_tar%.tar.xz}" "$(sha256sum packaging/windows/deps.lock | cut -d' ' -f1)" "${BB_LTO:-OFF}"
     echo 'files:'
-    (cd "$root/stage" && find SacredFire -type f | sort | while read -r f; do printf '  %s %s\n' "$(sha256sum "$f" | cut -c1-16)" "$f"; done)
-} > dist/SacredFire-windows-x86_64.zip.build.txt
-ls -lh "$archive"; head -8 dist/SacredFire-windows-x86_64.zip.build.txt
+    (cd "$root/stage" && find UFC3Native -type f | sort | while read -r f; do printf '  %s %s\n' "$(sha256sum "$f" | cut -c1-16)" "$f"; done)
+} > dist/UFC3Native-windows-x86_64.zip.build.txt
+ls -lh "$archive"; head -8 dist/UFC3Native-windows-x86_64.zip.build.txt

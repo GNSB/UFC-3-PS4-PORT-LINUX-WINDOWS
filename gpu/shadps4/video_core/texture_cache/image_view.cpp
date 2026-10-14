@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -114,6 +115,18 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         Vulkan::LiverpoolToVK::IsFormatStencilCompatible(format)) {
         format = image.info.pixel_format;
         aspect = vk::ImageAspectFlagBits::eStencil;
+    }
+    // ufc3: a depth-stencil image read through another format (UFC 3 reads its Z16S8 buffer as
+    // R16_UINT) still needs a single aspect and a format the image can be viewed as; a view with
+    // both aspects and an incompatible format hung NVIDIA GPUs (Xid 109). Read the depth.
+    if ((aspect & vk::ImageAspectFlagBits::eDepth) && (aspect & vk::ImageAspectFlagBits::eStencil)) {
+        static std::atomic<u32> notes{0};
+        if (notes.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_WARNING(Render_Vulkan, "depth-stencil image viewed as {}: using its depth aspect",
+                        vk::to_string(format));
+        }
+        format = image.info.pixel_format;
+        aspect = vk::ImageAspectFlagBits::eDepth;
     }
 
     const vk::ImageViewCreateInfo image_view_ci = {

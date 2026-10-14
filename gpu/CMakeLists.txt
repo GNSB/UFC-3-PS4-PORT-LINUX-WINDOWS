@@ -104,6 +104,7 @@ function(add_host_shader FILENAME SHADER_NAME)
     set(SHADER_HEADERS ${SHADER_HEADERS} ${OUT} PARENT_SCOPE)
 endfunction()
 add_host_shader(color_to_ms_depth.frag color_to_ms_depth_frag)
+add_host_shader(depth_to_r16ui.comp depth_to_r16ui_comp)
 add_host_shader(ms_image_blit.frag ms_image_blit_frag)
 add_host_shader(ms_image_blit.frag ms_image_blit_msaa_frag SRC_MSAA=1)
 add_host_shader(fault_buffer_process.comp fault_buffer_process_comp)
@@ -224,7 +225,7 @@ if (WIN32)
     target_compile_options(sacredfire-game PRIVATE $<$<COMPILE_LANGUAGE:C>:${BB_C_WARNINGS}>)
     target_compile_definitions(sacredfire-game PRIVATE ${BB_WIN_DEFS})
     target_include_directories(sacredfire-game PRIVATE ${BB_SRC} ${BB_SRC}/src)
-    target_link_libraries(sacredfire-game PRIVATE bbgpu atrac9 Zydis::Zydis onecore bcrypt ws2_32 -pthread)
+    target_link_libraries(sacredfire-game PRIVATE bbgpu atrac9 Zydis::Zydis onecore bcrypt ws2_32 winmm -pthread)
     # The PS4 range (64 GiB - 1 TiB) must stay free of host allocations: no high-entropy ASLR
     # (image ASLR and the other mitigations stay on; docs/sacredfire/13-windows-port.md). The
     # guest main thread runs on the process stack: 16 MiB, committed (no stack probes).

@@ -1192,7 +1192,12 @@ void TextureCache::GarbageCollectImages() {
             const char* env = std::getenv("BB_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        if (instance.IsIntegrated() || forced_budget) {
+        // bbport: GPUs under 8 GB (laptop RTX 3060 6 GB) got their pressure mark at ~40 % of
+        // VRAM from the desktop formula, and UFC 3 fights evicted and re-uploaded hundreds of
+        // images every few seconds at 2.3 GB used. They use the budget rule as well.
+        static const bool small_vram =
+            static_cast<s64>(instance.GetTotalMemoryBudget()) < TARGET_GC_THRESHOLD;
+        if (instance.IsIntegrated() || forced_budget || small_vram) {
             const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
             if (budget != 0) {
                 trigger_gc_memory = budget / 10 * 7;

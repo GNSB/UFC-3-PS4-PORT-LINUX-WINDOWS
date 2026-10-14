@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
+#include <cstdlib>
+#include <cstdio>
 #include "common/assert.h"
 #include "bbport_timeline.h"
 #include "common/elf_info.h"
@@ -141,7 +145,16 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    // ufc3: report what the game asks (0 = 60 Hz, 1 = 30 Hz, 2 = 20 Hz) and from where;
+    // BB_FLIP_RATE overrides it.
+    static const int override_rate = [] {
+        const char* e = std::getenv("BB_FLIP_RATE");
+        return e ? std::atoi(e) : -1;
+    }();
+    std::printf("VideoOut: game sets flip rate %d (caller %p)%s\n", rate, __builtin_return_address(0),
+                override_rate >= 0 ? " -> overridden by BB_FLIP_RATE" : "");
+    std::fflush(stdout);
+    driver->GetPort(handle)->flip_rate = override_rate >= 0 ? override_rate : rate;
     return ORBIS_OK;
 }
 
@@ -354,10 +367,20 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
+            if (port->buffer_labels[buf_id] != 1) { // ufc3: was an ASSERT (crashed after a hitch)
+                LOG_WARNING(Lib_VideoOut, "Out of order flip IRQ for buffer {}", buf_id);
+            }
             BbTimeline::Note(BbTimeline::GuestFlip, 2, buf_id);
-            const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
-            ASSERT_MSG(result, "EOP flip submission failed");
+            // ufc3: a full flip queue (presentation behind the game after a hitch) waits for room
+            // instead of aborting the game; dropped only after 500 ms.
+            bool result = driver->SubmitFlip(port, buf_id, flip_arg, true);
+            for (int tries = 0; !result && tries < 500; ++tries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                result = driver->SubmitFlip(port, buf_id, flip_arg, true);
+            }
+            if (!result) {
+                LOG_ERROR(Lib_VideoOut, "EOP flip dropped: flip queue still full after 500 ms");
+            }
         });
 
     return ORBIS_OK;

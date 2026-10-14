@@ -14,4 +14,8 @@ using RangeCallback = void (*)(std::uint64_t address, std::uint64_t size);
 
 /// Installs the hooks once (GPU side, after the game is loaded).
 void Install(RangeCallback on_gpu_range_allocated);
+
+/// ufc3 (BB_DISCARD_HOOK, Linux): UFC 3's dynamic buffer lock with discard (0xf41ee: a fresh
+/// range from the frame ring for the buffer's size) reports the range it hands out.
+void InstallDiscardLocks(RangeCallback on_discard);
 } // namespace BbGuestHooks

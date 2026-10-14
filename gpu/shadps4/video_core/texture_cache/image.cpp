@@ -172,6 +172,10 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
+    // ufc3: a host format without stencil (BB_Z16S8_AS_D16) has no stencil aspect.
+    if (supported_format == vk::Format::eD16Unorm || supported_format == vk::Format::eD32Sfloat) {
+        aspect_mask &= ~vk::ImageAspectFlagBits::eStencil;
+    }
     const vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),

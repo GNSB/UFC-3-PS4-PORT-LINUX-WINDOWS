@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "bbport_clobber.h"
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "common/signal_context.h"
@@ -115,9 +116,10 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
         return;
     }
     const std::uint64_t regs[] = {reg(FaultRegister::Rax), reg(FaultRegister::Rbx), reg(FaultRegister::Rcx), reg(FaultRegister::Rdx),
-                                  reg(FaultRegister::Rsi), reg(FaultRegister::Rdi), reg(FaultRegister::R14), reg(FaultRegister::R15)};
-    const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
-    for (int i = 0; i < 8; ++i) {
+                                  reg(FaultRegister::Rsi), reg(FaultRegister::Rdi), reg(FaultRegister::R14), reg(FaultRegister::R15),
+                                  reg(FaultRegister::R12), reg(FaultRegister::R13)};
+    const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15", "r12", "r13"};
+    for (int i = 0; i < 10; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }
     const char* sources[] = {"backing",      "WriteData",           "fence",
@@ -175,5 +177,20 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
             ++shown;
         }
     }
+    // ufc3: writes whose data holds the value found in a register (the corrupted pointer), and
+    // the remembered port writes (BbClobber ring) into the slot the game read it from.
+    shown = 0;
+    for (std::uint64_t i = n; i-- > (n > Size ? n - Size : 0) && shown < 32;) {
+        const Entry& e = ring[i % Size];
+        for (const auto r : regs) {
+            if (r > 0x10000 && r < 0x100000000ull && ((e.first & 0xffffffffull) == r || (e.first >> 32) == r)) {
+                print(e, "holds a register value");
+                ++shown;
+                break;
+            }
+        }
+    }
+    std::fprintf(stderr, "Write log: port writes (clobber ring) into [r14+0x18]:\n");
+    BbClobber::DumpWritesInto(reg(FaultRegister::R14) + 0x18, 8);
     std::fprintf(stderr, "Write log: %llu writes logged\n", (unsigned long long)n);
 }

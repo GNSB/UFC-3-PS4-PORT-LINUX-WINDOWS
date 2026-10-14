@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The game files this port runs, keyed on the executable's loaded image.
 
-Profile: Crash Team Racing Nitro-Fueled CUSA13795 with the 1.21 update merged in. The check
+Profile: EA SPORTS UFC 3 CUSA06534 (EU) with the 1.14 update merged in. The check
 compares the loaded executable image, whose hash is the same whatever tool dumped it (the SELF
 headers around it differ). BB_SKIP_GAME_CHECK=1 skips it. bbport's Bloodborne profile was removed
 on 2026-10-09.
@@ -21,23 +21,21 @@ from pathlib import Path
 # `modules` are the sce_module PRXs link_modules.py links natively; `patches` says whether
 # patches.py has a patch file for it.
 SUPPORTED = {
-    '2f2115893ac6656925d20a0221f118cff398fbd754cb9c10154451411dbcf8e6': dict(
-        name='ctr', title='CUSA13795', version='01.21', game='Crash Team Racing Nitro-Fueled', update='CUSA13795-patch',
-        modules=('libc.prx', 'libSceFios2.prx', 'libSceNpToolkit2.prx'), patches=True),
+    '46c2477702ae5d3fbff3a1911f10841aa150d20941d515ffb3edec75153f055b': dict(
+        name='ufc3', title='CUSA06534', version='01.14', game='EA SPORTS UFC 3', update='CUSA06534-patch',
+        modules=('libc.prx', 'libSceFios2.prx'), patches=False),
 }
 BY_TITLE = {p['title']: p for p in SUPPORTED.values()}
-# Images that are known NOT to be 1.21: the base game's executable (1.00). With a 1.21 param.sfo
+# Images that are known NOT to be 1.14: the base game's executable (1.00). With a 1.14 param.sfo
 # these mean the update's eboot.bin was not copied in.
 OLD_IMAGES = {
-    'a9cdc80f2170624e08bdddab128fc9cdaf5c71aa90c00fc669d830e366ba6833': '01.00',
+    '1dc99716a77f5411834d004d6becc3c829e382a244aa0dcbd63932a7eeee0bf1': '01.00',
 }
-# The 1.21 update's original build, for firmware 6.72+.
-KNOWN_672 = {
-    'e3b7a068b5e7be0f976102aa223a74425e7817c67e26e21416163291750c1b83',
-}
-SUPPORTED_TITLE = 'CUSA13795'
-SUPPORTED_VERSION = '01.21'
-SUPPORTED_IMAGE = '2f2115893ac6656925d20a0221f118cff398fbd754cb9c10154451411dbcf8e6'
+# Other builds of the supported update (none known for UFC 3).
+KNOWN_672 = set()
+SUPPORTED_TITLE = 'CUSA06534'
+SUPPORTED_VERSION = '01.14'
+SUPPORTED_IMAGE = '46c2477702ae5d3fbff3a1911f10841aa150d20941d515ffb3edec75153f055b'
 
 
 def image_sha256(game):

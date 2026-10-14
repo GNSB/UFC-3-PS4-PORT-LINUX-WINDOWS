@@ -903,9 +903,32 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
  * read protection (BB_READBACKS=2: GPU-written pages) must not stop. A fault there would ask the
  * GPU thread for a readback while it waits for these very copies (a hang at start). Gaps read
  * as zeros. */
+/* ufc3: the GPU library reads constants through here on every draw (precise readbacks); a
+ * per-thread entry of the last region skips the table lock while the table generation holds
+ * (perf: the rwlock was ~9 % of the GPU thread). */
+typedef struct { uint64_t generation; uintptr_t start, end; uint64_t phys; } BackingCache;
+static __thread BackingCache backing_cache;
 void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
     unsigned char *out=data;
+    {
+        const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+        const BackingCache c=backing_cache;
+        if (!(generation & 1) && c.generation==generation && c.end && c.start<=address &&
+            address+size<=c.end) {
+            memcpy(out,backing_base+c.phys+(address-c.start),size);
+            return;
+        }
+    }
     read_lock();
+    {
+        const size_t i=vma_index(address);
+        if (i<vma_count && vmas[i].start<=address && address+size<=vmas[i].end &&
+            vmas[i].kind!=KIND_RESERVED) {
+            const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+            if (!(generation & 1))
+                backing_cache=(BackingCache){generation,vmas[i].start,vmas[i].end,vmas[i].phys};
+        }
+    }
     for (uintptr_t at=address, end=address+size; at<end;) {
         const size_t i=vma_index(at);
         uint64_t n;

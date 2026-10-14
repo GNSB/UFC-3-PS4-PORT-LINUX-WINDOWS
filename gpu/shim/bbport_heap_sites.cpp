@@ -15,6 +15,12 @@
 #include <cstdlib>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+
 namespace BbHeapSites {
 namespace {
 using u32 = std::uint32_t;
@@ -226,6 +232,27 @@ void InstallWrappers(bool counters) {
         return;
     }
     if ((!wanted && !counters) || done) {
+        return;
+    }
+    // Bloodborne's libc layout: another game (UFC 3) has nothing mapped there, so the table is
+    // only read when its page exists (msync fails with ENOMEM on an unmapped page).
+    static const bool mapped = [] {
+        const u64 page = (LibcBase + SlotMalloc) & ~u64(0xfff);
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION info{};
+        const bool ok = VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == sizeof(info) &&
+                        info.State == MEM_COMMIT;
+#else
+        const bool ok = msync(reinterpret_cast<void*>(page), 0x1000, MS_ASYNC) == 0;
+#endif
+        if (!ok) {
+            std::printf("Heap sites: no libc malloc table at +%#llx (not Bloodborne); off\n",
+                        (unsigned long long)(LibcBase + SlotMalloc - ImageBase));
+        }
+        return ok;
+    }();
+    if (!mapped) {
+        done = true;
         return;
     }
     auto* slots = reinterpret_cast<u64*>(LibcBase);

@@ -94,7 +94,7 @@ public:
     /// now (otherwise the GPU writes it, in stream order).
     [[nodiscard]] bool DmaMayWriteOnCpu(VAddr dst, u32 num_bytes);
     u32 ReadDataFromGds(u32 gsd_offset);
-    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false, bool* step = nullptr);
     /// bbport: data written into GPU memory by a path we hear of (file reads, the game's resource
     /// loaders, DMA on the CPU): invalidated, and an asset for the buffer cache.
     void NoteAssetWrite(VAddr addr, u64 size);
@@ -230,7 +230,10 @@ public:
     bool IsGpuSideThreadId(u32 tid) const;
     /// A guest write hit a protected page.
     /// `guest_rip`: the guest instruction that wrote (0: unknown), see BufferCache::NoteCpuWrite.
-    bool OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip = 0);
+    /// ufc3: *step = true when the write is to be single-stepped instead (BB_WRITE_STEP).
+    bool OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip = 0, bool* step = nullptr);
+    /// ufc3 (BB_WRITE_STEP): CPU bytes a single-stepped write changed on a GPU-written page.
+    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);

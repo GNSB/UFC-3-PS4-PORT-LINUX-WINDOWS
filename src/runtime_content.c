@@ -86,7 +86,35 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
     if (hits) *hits=0;
     ++lists; return 0;
 }
+/* UFC 3: temporary data lives in /temp0 (a writable user directory, see runtime_file.c); no
+ * add-ons are mounted, so an add-on mount reports NOT_FOUND. */
+static ABI int32_t temp_mount2(uint32_t option,char *mount_point) {
+    require_initialized();
+    if (!mount_point) return PARAMETER;
+    memset(mount_point,0,16); memcpy(mount_point,"/temp0",6);
+    printf("Runtime: AppContent temporary data mounted at /temp0 (option %u)\n",option);
+    return 0;
+}
+static ABI int32_t temp_format(const char *mount_point) {
+    require_initialized();
+    return mount_point ? 0 : PARAMETER;
+}
+static ABI int32_t temp_space(const char *mount_point,uint64_t *kb) {
+    require_initialized();
+    if (!mount_point || !kb) return PARAMETER;
+    *kb=1024*1024; return 0; /* 1 GiB free */
+}
+static ABI int32_t addcont_mount(uint32_t service,const void *entitlement,char *mount_point) {
+    require_initialized(); (void)service; (void)entitlement; (void)mount_point;
+    return (int32_t)0x80D90005; /* SCE_APP_CONTENT_ERROR_NOT_FOUND */
+}
+static ABI int32_t addcont_unmount(const char *mount_point) { (void)mount_point; return 0; }
 uintptr_t runtime_content_resolve(const char *name) {
+    if (runtime_nid_equals(name,"buYbeLOGWmA#libSceAppContent")) return (uintptr_t)temp_mount2;
+    if (runtime_nid_equals(name,"a5N7lAG0y2Q#libSceAppContent")) return (uintptr_t)temp_format;
+    if (runtime_nid_equals(name,"SaKib2Ug0yI#libSceAppContent")) return (uintptr_t)temp_space;
+    if (runtime_nid_equals(name,"VANhIWcqYak#libSceAppContent")) return (uintptr_t)addcont_mount;
+    if (runtime_nid_equals(name,"3rHWaV-1KC4#libSceAppContent")) return (uintptr_t)addcont_unmount;
     if (runtime_nid_equals(name,"g8cM39EUZ6o#libSceSysmodule")) return (uintptr_t)module_load;
     if (runtime_nid_equals(name,"fMP5NHUOaMk#libSceSysmodule")) return (uintptr_t)module_loaded;
     if (runtime_nid_equals(name,"eR2bZFAAU0Q#libSceSysmodule")) return (uintptr_t)module_unload;

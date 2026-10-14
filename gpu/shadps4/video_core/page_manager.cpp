@@ -1,3 +1,5 @@
+#include <vector>
+#include <memory>
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -62,6 +64,8 @@
 
 extern "C" void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch);
 
+extern "C" void runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
+
 namespace VideoCore {
 
 constexpr size_t PM_PAGE_SIZE = 4_KB;
@@ -109,6 +113,13 @@ struct ImageFaultSite {
     std::atomic<u32> width{0}, height{0}, format{0}, tiling{0};
 };
 std::array<ImageFaultSite, 256> image_fault_sites;
+
+/// ufc3: write faults that ended in a readback, keyed by site and reason.
+struct ReadbackSite {
+    std::atomic<u64> key{0}; // site key | reason << 56
+    std::atomic<u64> caller{0}, count{0}, last_address{0}, gpu_bytes{0};
+};
+std::array<ReadbackSite, 256> readback_sites;
 
 void NoteFaultSite(void* context, VAddr address) {
     current_fault_rip = 0;
@@ -202,7 +213,57 @@ void PageManager::NoteImageFault(VAddr image_address, u64 image_size, u32 width,
     }
 }
 
+void PageManager::NoteReadbackSite(u32 reason, VAddr address, u64 gpu_bytes) {
+    const u64 key = (current_fault_rip ? current_fault_rip : 1) | (u64(reason & 3) << 56);
+    for (u64 i = 0, slot = (key * 0x9E3779B97F4A7C15ull) >> 56; i < readback_sites.size(); ++i) {
+        auto& site = readback_sites[(slot + i) % readback_sites.size()];
+        u64 expected = 0;
+        if (site.key.load(std::memory_order_relaxed) == key ||
+            site.key.compare_exchange_strong(expected, key)) {
+            site.caller.store(current_fault_caller, std::memory_order_relaxed);
+            site.last_address.store(address, std::memory_order_relaxed);
+            site.gpu_bytes.store(gpu_bytes, std::memory_order_relaxed);
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+namespace {
+void ReportReadbackSites() {
+    struct Row {
+        u64 key, caller, count, address, gpu_bytes;
+    };
+    std::array<Row, 256> rows{};
+    std::size_t n = 0;
+    u64 total = 0;
+    for (auto& site : readback_sites) {
+        const u64 count = site.count.exchange(0, std::memory_order_relaxed);
+        if (count != 0) {
+            rows[n++] = {site.key.load(), site.caller.load(), count, site.last_address.load(),
+                         site.gpu_bytes.load()};
+            total += count;
+        }
+    }
+    if (total == 0) {
+        return;
+    }
+    std::sort(rows.begin(), rows.begin() + n, [](const Row& a, const Row& b) { return a.count > b.count; });
+    static constexpr const char* Reasons[] = {"host copy", "page > max", "near GPU", "other"};
+    std::printf("Readback sites (write faults, this window): %llu", (unsigned long long)total);
+    for (std::size_t i = 0; i < std::min<std::size_t>(n, 10); ++i) {
+        const u64 site = rows[i].key & ~(u64{3} << 56);
+        std::printf("%s %s (from +%#llx) [%s, %llu GPU B] %llu at %#llx", i ? ";" : ":",
+                    site == 1 ? "?" : SiteName(site).c_str(), (unsigned long long)rows[i].caller,
+                    Reasons[(rows[i].key >> 56) & 3], (unsigned long long)rows[i].gpu_bytes,
+                    (unsigned long long)rows[i].count, (unsigned long long)rows[i].address);
+    }
+    std::printf("\n");
+}
+} // namespace
+
 void PageManager::ReportFaultSites() {
+    ReportReadbackSites();
     struct Row {
         u64 rip, caller, count, address;
     };
@@ -229,6 +290,28 @@ void PageManager::ReportFaultSites() {
     }
     std::printf("\n");
 }
+
+namespace {
+// ufc3 (BB_WRITE_STEP): see PageManager::Impl::ArmStep.
+struct StepSlot {
+    std::atomic<u64> tid{0};
+    u32 count = 0;
+    VAddr pages[2]{};
+    std::array<u8, TRACKER_BYTES_PER_PAGE> before[2];
+};
+std::array<StepSlot, 64> step_slots;
+
+// ufc3 (BB_WRITE_WINDOW): open pages and their contents when opened.
+struct WriteWindow {
+    VAddr page;
+    std::array<u8, TRACKER_BYTES_PER_PAGE> before;
+};
+std::mutex windows_mutex;
+std::vector<std::unique_ptr<WriteWindow>> open_windows;
+std::atomic<u32> open_window_count{0};
+thread_local bool want_window = false, fault_from_guest = false;
+constexpr std::size_t MaxWindows = 512;
+} // namespace
 
 struct PageManager::Impl {
     struct PageState {
@@ -303,9 +386,26 @@ struct PageManager::Impl {
         }
         if (Common::IsWriteError(context)) {
             BbStats::Timer timer{BbStats::t_write_faults};
-            const bool handled = rasterizer->OnWriteFault(
-                addr, is_gpu_thread,
-                Common::GetFaultRegister(context, Common::FaultRegister::Rip));
+            const u64 rip = Common::GetFaultRegister(context, Common::FaultRegister::Rip);
+            // Only stores of the game's own code are single-stepped (the per-frame writes beside
+            // GPU labels); bulk copies by the host's memcpy (asset loading) keep the normal path.
+            bool step = false;
+            const bool guest_store = rip >= GuestImage && rip < GuestImageEnd;
+            fault_from_guest = guest_store;
+            want_window = false;
+            const bool windows = WriteWindowsEnabled() && !is_gpu_thread;
+            bool handled = rasterizer->OnWriteFault(addr, is_gpu_thread, rip,
+                                                    guest_store || windows ? &step : nullptr);
+            if (handled && step && want_window) {
+                // ufc3 (BB_WRITE_WINDOW): the page stays open until the next submission.
+                want_window = false;
+                if (!OpenWindow(addr)) {
+                    handled = rasterizer->OnWriteFault(addr, is_gpu_thread, rip);
+                }
+            } else if (handled && step && !ArmStep(context, addr)) {
+                // ufc3 (BB_WRITE_STEP): the write runs with its page open for one instruction.
+                handled = rasterizer->OnWriteFault(addr, is_gpu_thread, rip);
+            }
             current_fault_rip = 0;
             return handled;
         } else {
@@ -314,6 +414,157 @@ struct PageManager::Impl {
             return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
         }
         return false;
+    }
+
+    // ufc3 (BB_WRITE_STEP): threads single-stepping a write on a GPU-written page. The page is
+    // open (read/write) for that one instruction; the trap compares it with the copy taken
+    // before, hands the changed words to the buffer cache, and re-applies the protection the
+    // page's watchers ask for. A table instead of thread_local (signal context). Two pages per
+    // thread: an instruction may fault on a second page while stepping.
+    inline static Impl* self = nullptr;
+
+    static u64 StepTid() {
+#ifdef _WIN32
+        return GetCurrentThreadId();
+#else
+        return u64(syscall(SYS_gettid));
+#endif
+    }
+
+    static StepSlot* FindStepSlot(u64 tid, bool claim) {
+        for (auto& slot : step_slots) {
+            if (slot.tid.load(std::memory_order_acquire) == tid) {
+                return &slot;
+            }
+        }
+        if (!claim) {
+            return nullptr;
+        }
+        for (auto& slot : step_slots) {
+            u64 expected = 0;
+            if (slot.tid.compare_exchange_strong(expected, tid, std::memory_order_acq_rel)) {
+                slot.count = 0;
+                return &slot;
+            }
+        }
+        return nullptr;
+    }
+
+    static bool ArmStep(void* context, VAddr addr) {
+        if (!self) {
+            return false;
+        }
+        const VAddr page = addr & ~VAddr(PM_PAGE_SIZE - 1);
+        StepSlot* slot = FindStepSlot(StepTid(), true);
+        if (!slot) {
+            return false;
+        }
+        bool open = false;
+        for (u32 i = 0; i < slot->count; ++i) {
+            open |= slot->pages[i] == page;
+        }
+        if (!open) {
+            if (slot->count >= 2) {
+                return false;
+            }
+            runtime_memory_read_backing(page, slot->before[slot->count].data(), PM_PAGE_SIZE);
+            slot->pages[slot->count++] = page;
+            self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
+        }
+        Common::SetTrapFlag(context, true);
+        return true;
+    }
+
+    static bool OpenWindow(VAddr addr) {
+        if (!self) {
+            return false;
+        }
+        const VAddr page = addr & ~VAddr(PM_PAGE_SIZE - 1);
+        std::scoped_lock wl{windows_mutex};
+        for (const auto& window : open_windows) {
+            if (window->page == page) {
+                return true; // opened by another thread meanwhile: the write is retried
+            }
+        }
+        if (open_windows.size() >= MaxWindows) {
+            return false;
+        }
+        auto window = std::make_unique<WriteWindow>();
+        window->page = page;
+        runtime_memory_read_backing(page, window->before.data(), PM_PAGE_SIZE);
+        open_windows.push_back(std::move(window));
+        open_window_count.store(u32(open_windows.size()), std::memory_order_release);
+        self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
+        return true;
+    }
+
+    static void CloseWindows() {
+        if (!self || open_window_count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::vector<std::unique_ptr<WriteWindow>> closing;
+        {
+            std::scoped_lock wl{windows_mutex};
+            closing.swap(open_windows);
+            open_window_count.store(0, std::memory_order_release);
+        }
+        std::array<u8, TRACKER_BYTES_PER_PAGE> after;
+        for (const auto& window : closing) {
+            const VAddr page = window->page;
+            {
+                // Protected first: a write after this faults (a new window), none is lost.
+                const size_t page_index = page >> PM_PAGE_BITS;
+                std::scoped_lock lk{self->locks[page_index / PAGES_PER_LOCK]};
+                self->Protect(page, PM_PAGE_SIZE, self->cached_pages[page_index].Perms());
+            }
+            runtime_memory_read_backing(page, after.data(), PM_PAGE_SIZE);
+            const auto& before = window->before;
+            for (u64 at = 0; at < PM_PAGE_SIZE;) {
+                if (std::memcmp(after.data() + at, before.data() + at, 4) == 0) {
+                    at += 4;
+                    continue;
+                }
+                u64 end = at + 4;
+                while (end < PM_PAGE_SIZE &&
+                       std::memcmp(after.data() + end, before.data() + end, 4) != 0) {
+                    end += 4;
+                }
+                rasterizer->NoteSteppedWrite(page + at, std::vector<u8>(after.data() + at, after.data() + end));
+                at = end;
+            }
+        }
+    }
+
+    static bool OnStepTrap(void* context) {
+        StepSlot* slot = FindStepSlot(StepTid(), false);
+        if (!slot || !self) {
+            return false;
+        }
+        Common::SetTrapFlag(context, false);
+        std::array<u8, TRACKER_BYTES_PER_PAGE> after;
+        for (u32 i = 0; i < slot->count; ++i) {
+            const VAddr page = slot->pages[i];
+            runtime_memory_read_backing(page, after.data(), PM_PAGE_SIZE);
+            const auto& before = slot->before[i];
+            for (u64 at = 0; at < PM_PAGE_SIZE;) {
+                if (std::memcmp(after.data() + at, before.data() + at, 4) == 0) {
+                    at += 4;
+                    continue;
+                }
+                u64 end = at + 4;
+                while (end < PM_PAGE_SIZE && std::memcmp(after.data() + end, before.data() + end, 4) != 0) {
+                    end += 4;
+                }
+                rasterizer->NoteSteppedWrite(page + at, std::vector<u8>(after.data() + at, after.data() + end));
+                at = end;
+            }
+            const size_t page_index = page >> PM_PAGE_BITS;
+            std::scoped_lock lk{self->locks[page_index / PAGES_PER_LOCK]};
+            self->Protect(page, PM_PAGE_SIZE, self->cached_pages[page_index].Perms());
+        }
+        slot->count = 0;
+        slot->tid.store(0, std::memory_order_release);
+        return true;
     }
 
     template <bool track, bool is_read>
@@ -612,6 +863,7 @@ public:
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
+        self = this;
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -637,6 +889,35 @@ struct SignalImpl : public PageManager::Impl {
     }
 
 };
+
+bool PageManager::OnStepTrap(void* context) {
+    return Impl::OnStepTrap(context);
+}
+
+bool PageManager::WriteWindowsEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_WRITE_WINDOW");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::printf("GPU: CPU writes beside GPU data open their page until the next submission "
+                        "(BB_WRITE_WINDOW)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+bool PageManager::FaultFromGuest() {
+    return fault_from_guest;
+}
+
+void PageManager::RequestWindow() {
+    want_window = true;
+}
+
+void PageManager::CloseWriteWindows() {
+    Impl::CloseWindows();
+}
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 #ifdef __linux__

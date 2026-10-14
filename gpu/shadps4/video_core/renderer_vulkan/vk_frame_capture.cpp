@@ -78,7 +78,7 @@ void AddSampled(Entry& entry) {
 }
 
 void AddShader(Entry& entry, u64 hash) {
-    if (entry.shaders.size() < 8 && std::ranges::find(entry.shaders, hash) == entry.shaders.end()) {
+    if (entry.shaders.size() < 64 && std::ranges::find(entry.shaders, hash) == entry.shaders.end()) {
         entry.shaders.push_back(hash);
     }
 }
@@ -127,9 +127,25 @@ void Write(VAddr presented) {
 
 } // namespace
 
+
+namespace {
+// ufc3: games whose last pass is not a render pass into a display buffer (UFC 3) never hit the
+// BeginPass boundary; BB_CAPTURE_ON_FLIP=1 records from one flip to the next instead. OnFlip
+// only raises the flag; the GPU thread (BeginPass, Dispatch) acts on it.
+std::atomic<bool> flip_boundary{false};
+bool CaptureOnFlip() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_CAPTURE_ON_FLIP");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
 void FrameCapture::OnFlip(VAddr presented_address) {
     last_presented.store(presented_address, std::memory_order_relaxed);
     flips.fetch_add(1, std::memory_order_release);
+    flip_boundary.store(true, std::memory_order_release); // ufc3: see FlipBoundary
     static const char* trigger = std::getenv("BB_CAPTURE_TRIGGER");
     if (trigger && state.load(std::memory_order_relaxed) == Idle &&
         std::filesystem::exists(trigger)) {
@@ -170,6 +186,22 @@ void FrameCapture::AddDisplayBuffer(VAddr address) {
 
 void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_colors,
                              const VideoCore::ImageInfo* depth) {
+    if (CaptureOnFlip() && flip_boundary.exchange(false, std::memory_order_acq_rel)) {
+        const auto st = state.load(std::memory_order_relaxed);
+        if (st == Recording && !entries.empty()) {
+            Write(last_presented.load(std::memory_order_relaxed));
+            entries.clear();
+            pending_sampled.clear();
+            pending_buffers.clear();
+            state.store(Idle, std::memory_order_release);
+        } else if (st == Armed) {
+            entries.clear();
+            pending_sampled.clear();
+            pending_buffers.clear();
+            pass_open = false;
+            state.store(Recording, std::memory_order_release);
+        }
+    }
     std::vector<Target> targets;
     bool display = false;
     {
@@ -222,11 +254,36 @@ void FrameCapture::Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_insta
     e.indices += u64(num_indices) * std::max(num_instances, 1u);
     AddShader(e, vs_hash);
     AddShader(e, ps_hash);
+    // ufc3: one line per draw (shaders, size, textures), for mapping a defect to its draw.
+    if (e.draws <= 256) {
+        std::string line = std::format("\n  draw {} vs {:08x} ps {:08x} idx {} inst {}:", e.draws,
+                                       u32(vs_hash), u32(ps_hash), num_indices, num_instances);
+        for (const auto& [t, storage] : pending_sampled) {
+            line += std::format(" {}{}", storage ? "W:" : "", Describe(t));
+        }
+        e.note += line;
+    }
     AddSampled(e);
     AddBuffers(e);
 }
 
 void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {
+    if (CaptureOnFlip() && flip_boundary.exchange(false, std::memory_order_acq_rel)) {
+        const auto st = state.load(std::memory_order_relaxed);
+        if (st == Recording && !entries.empty()) {
+            Write(last_presented.load(std::memory_order_relaxed));
+            entries.clear();
+            pending_sampled.clear();
+            pending_buffers.clear();
+            state.store(Idle, std::memory_order_release);
+        } else if (st == Armed) {
+            entries.clear();
+            pending_sampled.clear();
+            pending_buffers.clear();
+            pass_open = false;
+            state.store(Recording, std::memory_order_release);
+        }
+    }
     if (state.load(std::memory_order_relaxed) != Recording) {
         pending_sampled.clear();
         pending_buffers.clear();

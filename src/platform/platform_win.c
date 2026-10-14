@@ -14,6 +14,7 @@
 #endif
 #include "platform.h"
 #include <windows.h>
+#include <mmsystem.h>
 #include <bcrypt.h>
 #include <tlhelp32.h>
 #include <direct.h>
@@ -296,6 +297,10 @@ uint64_t platform_patch_guest_tls_loads(unsigned char *image, const uint64_t *se
                 operands[1].mem.base == ZYDIS_REGISTER_NONE && operands[1].mem.index == ZYDIS_REGISTER_NONE &&
                 operands[1].mem.disp.value == 0 && !memcmp(at, load, sizeof(load));
             if (is_tcb_load) { memcpy(at + 5, &displacement, 4); ++patched; at += sizeof(load) - 1; continue; }
+            /* A byte scan also meets 0x64/0x65 that end another instruction (UFC 3: `jne +0x64`
+             * then `mov rdi, [0x10]`, EA's assert trap). Only a [0] load is a TCB access; the Linux
+             * linker leaves every other form alone too, so they stay as they are here. */
+            if (at[5] | at[6] | at[7] | at[8]) continue;
             if (rejected++ < 8)
                 fprintf(stderr, "STOP: unsupported guest TLS access form at image offset 0x%" PRIxPTR " (%02x %02x %02x %02x %02x ...): only `mov rax, gs:[0]` is handled\n",
                         (uintptr_t)(at - image), at[0], at[1], at[2], at[3], at[4]);
@@ -321,6 +326,12 @@ void platform_thread_set_name(const char *name) {
     wide[n > 0 ? n : 0] = 0;
     SetThreadDescription(GetCurrentThread(), wide);
     pthread_setname_np(pthread_self(), name); /* winpthreads keeps it for pthread_getname_np */
+    /* As the GoW3R port: the threads on the frame's critical path (the game's main, simulation
+     * and render threads, audio) run above normal so job pools and loaders cannot preempt them
+     * on a loaded laptop; everything else keeps the default. */
+    static const char *const critical[] = {"Main", "main", "Sim", "Render", "Audio", "audio", "Sound"};
+    for (size_t i = 0; i < sizeof(critical) / sizeof(critical[0]); ++i)
+        if (strstr(name, critical[i])) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL); break; }
 }
 void platform_thread_get_name(char *out, size_t size) {
     if (size) { out[0] = '?'; out[size > 1 ? 1 : 0] = 0; }
@@ -348,16 +359,24 @@ clockid_t platform_wait_clock(void) { return CLOCK_REALTIME; }
 void platform_cond_init_waitclock(pthread_cond_t *cond) { pthread_cond_init(cond, NULL); }
 /* One high-resolution timer per thread (Windows 10 1803+); a plain waitable timer before. */
 static __thread HANDLE sleep_timer;
+/* As the GoW3R port: a high-resolution waitable timer (Windows 10 1803+, wakes within ~0.5 ms)
+ * for all but the last 100 us, which are spun, so short guest sleeps are not stretched to the
+ * scheduler tick. */
 int platform_sleep_ns(uint64_t ns) {
+    enum { SPIN_NS = 100000 };
     if (!ns) { SwitchToThread(); return 0; }
-    if (!sleep_timer) {
-        sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!sleep_timer) sleep_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    const uint64_t deadline = platform_monotonic_ns() + ns;
+    if (ns > SPIN_NS) {
+        if (!sleep_timer) {
+            sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!sleep_timer) sleep_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+        }
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)((ns - SPIN_NS) / 100); /* relative, 100 ns units */
+        if (sleep_timer && due.QuadPart < 0 && SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(sleep_timer, INFINITE);
+        else Sleep((DWORD)((ns - SPIN_NS) / 1000000));
     }
-    LARGE_INTEGER due;
-    due.QuadPart = -(LONGLONG)((ns + 99) / 100); /* relative, 100 ns units */
-    if (sleep_timer && SetWaitableTimer(sleep_timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(sleep_timer, INFINITE);
-    else Sleep((DWORD)((ns + 999999) / 1000000));
+    while (platform_monotonic_ns() < deadline) YieldProcessor();
     return 0;
 }
 void platform_sleep_until_ns(uint64_t deadline_ns) {
@@ -659,9 +678,12 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     TerminateProcess(GetCurrentProcess(), 3);
     return EXCEPTION_CONTINUE_SEARCH;
 }
+static PlatformStepHandler step_handler;
+void platform_install_step_handler(PlatformStepHandler handler) { step_handler = handler; }
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record = info->ExceptionRecord;
     DWORD code = record->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP && step_handler && step_handler(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_fault && gpu_fault(info, (void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
@@ -772,6 +794,14 @@ void platform_restart(void) {
     _exit(0);
 }
 void platform_process_init(void) {
+    /* As the GoW3R port: 1 ms scheduler tick for every wait of the process, above-normal
+     * priority, and no execution-speed throttling (EcoQoS would park the game on efficiency
+     * cores or low clocks on a laptop when its window is not in front). */
+    timeBeginPeriod(1);
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    PROCESS_POWER_THROTTLING_STATE throttling = {.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                                                 .ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED, .StateMask = 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
     /* Heap objects handed to the guest come from the CRT heap, which lies below 4 GiB without
      * high-entropy ASLR (the 40-bit pointer packing of the guest is satisfied). Checked once. */
     void *probe = malloc(16);

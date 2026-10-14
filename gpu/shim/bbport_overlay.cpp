@@ -623,8 +623,9 @@ void FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
     ImGui::SetNextWindowPos(
-        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, viewport->WorkPos.y + pad),
-        ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        // ufc3: top-left corner
+        ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + pad),
+        ImGuiCond_Always, ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowBgAlpha(0.5f);
     ImGui::Begin("##fps", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |

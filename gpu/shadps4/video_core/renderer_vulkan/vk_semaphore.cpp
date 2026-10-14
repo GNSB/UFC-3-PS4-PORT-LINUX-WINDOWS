@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <limits>
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -10,7 +11,7 @@
 
 namespace Vulkan {
 
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
+constexpr u64 WAIT_TIMEOUT = 2000000000ULL; // ufc3: 2 s per try, then report and retry
 
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
@@ -67,10 +68,24 @@ void Semaphore::Wait(u64 tick) {
     };
 
     // bbport: a lost device ends the wait with a report instead of a silent endless loop.
+    u32 timeouts = 0;
     while (true) {
         const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT);
         if (result == vk::Result::eSuccess) {
             break;
+        }
+        // ufc3: a wait that never ends says whether the tick was submitted and how far the GPU got.
+        if (result == vk::Result::eTimeout && (++timeouts == 1 || timeouts % 64 == 0)) {
+            u64 gpu_value = 0;
+            (void)instance.GetDevice().getSemaphoreCounterValue(semaphore.get(), &gpu_value);
+            std::printf("GPU wait stuck: tick %llu, next tick %llu (%s), GPU completed %llu, %u timeouts\n",
+                        (unsigned long long)tick, (unsigned long long)CurrentTick(),
+                        tick < CurrentTick() ? "submitted" : "NOT submitted",
+                        (unsigned long long)gpu_value, timeouts);
+            std::fflush(stdout);
+            if (timeouts == 1) {
+                Breadcrumbs::ReportStuck("GPU wait stuck");
+            }
         }
         if (result == vk::Result::eErrorDeviceLost) {
             Breadcrumbs::ReportDeviceLost("waiting for a submission");

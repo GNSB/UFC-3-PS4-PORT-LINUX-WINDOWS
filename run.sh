@@ -47,15 +47,47 @@ fi
 if [[ -z ${PYTHON:-} ]]; then echo 'Install Python 3 or set PYTHON.' >&2; exit 1; fi
 # BB_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default: orig/CUSA13795, SacredFire's
 # read-only link tree of the merged CTR dump (update 1.21 over the base game).
-game=${BB_GAME_DIR:-orig/CUSA13795}
+game=${BB_GAME_DIR:-orig/CUSA06534}
 if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set BB_GAME_DIR)." >&2; exit 1; fi
 # The game check (scripts/game_check.py) compares the executable image with the supported one
 # (Crash Team Racing Nitro-Fueled CUSA13795 1.21) and names the profile the runtime reads.
 profile=$("$PYTHON" scripts/game_check.py "$game") || { echo "$profile" >&2; exit 2; }
 # The update's build (5.05, 6.72+ or ?): the address-keyed diagnostics know the 5.05 build only.
 export BB_GAME_VARIANT=$("$PYTHON" scripts/game_check.py "$game" --variant 2>/dev/null || echo '?')
-export BB_GAME_PROFILE=${profile:-ctr}
+export BB_GAME_PROFILE=${profile:-ufc3}
 echo "Game profile: $BB_GAME_PROFILE"
+# ufc3: the fight scene renders black without precise readbacks of linear images (the same as
+# shadPS4 issue #4375 for UFC 4, same engine); both are defaults for this game.
+if [[ $BB_GAME_PROFILE == ufc3 ]]; then
+    export BB_READBACKS=${BB_READBACKS:-2} BB_READBACK_LINEAR=${BB_READBACK_LINEAR:-1}
+    # Precise readbacks deadlock against the GPU write twins (twins_mutex held by the thread a
+    # readback waits for); off for this game.
+    export BB_GPU_WRITE_TWINS=${BB_GPU_WRITE_TWINS:-0}
+    # CPU writes beside GPU-written bytes (the engine's dynamic buffers share pages with small
+    # shader outputs) keep their page open until the next submission instead of a readback each:
+    # fights 105-113 -> 140-190 FPS on the 4070 (GROK_HANDOFF §17).
+    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1}
+    # Frame rate: the game asks for flip rate 1 (30 Hz) through its present-interval setter
+    # (guest 0x1182a0); the simulation follows the real frame time, so flip rate 0 with a 120 Hz
+    # virtual vblank lets it run at 60-120 FPS. BB_FLIP_RATE=1 BB_VBLANK_HZ=60: the console's 30.
+    export BB_FLIP_RATE=${BB_FLIP_RATE:-0} BB_VBLANK_HZ=${BB_VBLANK_HZ:-480} BB_FPS_LIMIT=${BB_FPS_LIMIT:-120}
+    # Z16+S8 depth kept as D16_UNORM (stencil dropped): the game uploads Z16 shadow data from
+    # memory, and a D32 float image read those 16-bit texels as floats (speckled floor shadows).
+    export BB_Z16S8_AS_D16=${BB_Z16S8_AS_D16:-1}
+    # Shader patches (patches/shaders/<shader>.comp, GLSL): compiled into the user shader patch
+    # directory, which the pipeline cache loads instead of the translated shader of that hash.
+    patch_out="${BB_USER_DIR:-$data/user}/shader/patch"
+    mkdir -p "$patch_out"
+    for src in patches/shaders/*.comp; do
+        [[ -e $src ]] || continue
+        spv="$patch_out/$(basename "${src%.comp}").spv"
+        if [[ ! -f $spv || $src -nt $spv ]]; then
+            glslangValidator -V --target-env vulkan1.3 -S comp "$src" -o "$spv" > /dev/null \
+                || { echo "Shader patch failed: $src" >&2; exit 1; }
+        fi
+    done
+    echo "UFC 3: readbacks ${BB_READBACKS} (2 = precise), linear image readbacks ${BB_READBACK_LINEAR}"
+fi
 original_game=$game
 game=$("$PYTHON" scripts/mods.py "$game" --out "$out" \
     --mods-dir "${BB_MODS_DIR:-$data/mods}" --config "${BB_MODS_CONFIG:-$data/mods.json}" \
@@ -67,7 +99,7 @@ if [[ $game != "$(realpath "$original_game")" ]]; then
 fi
 "$PYTHON" scripts/prepare.py "$game" --out "$out"
 "$PYTHON" scripts/link_libc.py "$game" --out "$out"
-"$PYTHON" scripts/link_modules.py "$game" --out "$out" --modules libc.prx libSceFios2.prx libSceNpToolkit2.prx
+"$PYTHON" scripts/link_modules.py "$game" --out "$out" --modules libc.prx libSceFios2.prx
 # SacredFire: symbol names for this eboot's host-side imports (shadPS4's aerolib list, fetched once).
 "$PYTHON" tools/gen_import_names.py --out "$out"
 "$PYTHON" scripts/content_profile.py "$game" --out "$out" --sku "${BB_CONTENT_SKU:-full}"
@@ -77,19 +109,19 @@ fi
 # keys) or patches.json; BB_PATCHES_DIR adds a folder of further shadPS4-format XML files.
 fps=${BB_FPS:-30}
 "$PYTHON" scripts/patches.py --patches-dir "${BB_PATCHES_DIR:-patches}" --patches-config "${BB_PATCHES_CONFIG:-$data/patches.json}" \
-    --app-version 01.21 --title-id CUSA13795 --out "$out" --settings "$BB_CONFIG"
+    --app-version 01.14 --title-id CUSA06534 --out "$out" --settings "$BB_CONFIG"
 patch_args=(--patches "$out/patches.bin")
 # BB_NEO=1: PS4 Pro mode (sceKernelIsNeoMode, 7-CPU mode, 5568 MiB direct memory); the game then
 # picks its Pro rendering path. Off by default: the Steam Deck is closer to a base PS4.
 export BB_NEO=${BB_NEO:-0}
 echo "PS4 Pro mode: ${BB_NEO} (BB_NEO=1 turns it on)"
-# The on-disk shader/pipeline cache (user/cache/CUSA13795) is kept across launches: the GPU
+# The on-disk shader/pipeline cache (user/cache/CUSA06534) is kept across launches: the GPU
 # library preloads every pipeline from earlier sessions at start, so areas seen before no longer
 # compile shaders mid-race. BB_CLEAR_SHADER_CACHE=1 (launcher: "Clear the shader cache at start")
 # deletes it first; the fur breakage that once forced a clear per launch is fixed
 # (docs/sacredfire/06-fur.md: geometry specialization and preload fetch shader).
 if [[ ${BB_CLEAR_SHADER_CACHE:-0} == 1 ]]; then
-    rm -rf "${BB_USER_DIR:-$data/user}/cache/CUSA13795"
+    rm -rf "${BB_USER_DIR:-$data/user}/cache/CUSA06534"
     echo "Shader cache: cleared for this launch (BB_CLEAR_SHADER_CACHE=1)"
 fi
 # With the 60 FPS patch the game's own limiter paces frames; a 60 Hz virtual vblank would

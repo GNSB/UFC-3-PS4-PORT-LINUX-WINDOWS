@@ -177,6 +177,22 @@ static ABI int32_t save_umount(const MountPoint *point) {
     pthread_mutex_unlock(&lock);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
+/* UFC 3: SceSaveDataMountInfo {blocks, freeBlocks, reserved[32]}; 32 KiB blocks, 1 GiB per save. */
+typedef struct { uint64_t blocks, free_blocks; uint8_t reserved[32]; } MountInfo;
+static ABI int32_t save_mount_info(const MountPoint *point, MountInfo *info) {
+    if (!initialized) return ERR_NOT_INITIALIZED;
+    if (!info) return ERR_PARAMETER;
+    pthread_mutex_lock(&lock);
+    int slot=slot_of(point);
+    pthread_mutex_unlock(&lock);
+    if (slot<0) return ERR_NOT_MOUNTED;
+    memset(info,0,sizeof(*info)); info->blocks=32768; info->free_blocks=32000;
+    return 0;
+}
+/* No backups, icons or transfer data exist: the queries find nothing; an unmount with backup is
+ * a plain unmount. */
+static ABI int32_t save_not_found(void) { return initialized ? ERR_NOT_FOUND : ERR_NOT_INITIALIZED; }
+static ABI int32_t save_umount_backup(const MountPoint *point) { return save_umount(point); }
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!buffer) return ERR_PARAMETER;
@@ -322,6 +338,10 @@ static const RuntimeExport exports[]={
     {"sceSaveDataMount",save_mount}, {"sceSaveDataMount2",save_mount2}, {"sceSaveDataUmount",save_umount},
     {"sceSaveDataSetParam",save_set_param}, {"sceSaveDataSaveIcon",save_icon}, {"sceSaveDataDelete",save_delete},
     {"sceSaveDataDirNameSearch",save_search},
+    {"sceSaveDataGetMountInfo",save_mount_info}, {"sceSaveDataUmountWithBackup",save_umount_backup},
+    {"sceSaveDataLoadIcon",save_not_found}, {"sceSaveDataGetEventResult",save_not_found},
+    {"sceSaveDataTransferringMount",save_not_found}, {"sceSaveDataCheckBackupData",save_not_found},
+    {"sceSaveDataRestoreBackupData",save_not_found},
     {"sceSaveDataSetupSaveDataMemory",memory_setup}, {"sceSaveDataGetSaveDataMemory",memory_get},
     {"sceSaveDataSetSaveDataMemory",memory_set},
 };

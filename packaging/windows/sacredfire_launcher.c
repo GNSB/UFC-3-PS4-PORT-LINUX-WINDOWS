@@ -44,9 +44,50 @@ static wchar_t python[PATHW], game_exe[PATHW], caps_exe[PATHW];
 typedef struct {
     wchar_t game[PATHW], gamepad[128];
     int neo, fullscreen, clear_cache, validation, frame_stats, menu_trace;
-    int patch_60fps, patch_no_motion_blur, patch_pro_1080p, fps_unlocked; /* mirrors of bbport.ini */
+    /* UFC 3, as the GoW3R launcher's Video panel: the PS4 output size, the frame-rate cap,
+     * the swapchain present mode; show_fps mirrors bbport.ini. */
+    int resolution, fps_mode, present_mode, show_fps, upscaler, sharpness;
 } Settings;
-static Settings settings;
+static Settings settings = {.resolution = 1, .fps_mode = 4, .present_mode = 2, .upscaler = 0, .sharpness = 2};
+/* Choices of the Video panel (index = the saved value). */
+static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080"};
+static const wchar_t *const resolution_w[] = {L"1280", L"1920"}, *const resolution_h[] = {L"720", L"1080"};
+static const wchar_t *const fps_names[] = {L"60 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
+static const wchar_t *const fps_limits[] = {L"60", L"120", L"144", L"240", L"0"};
+/* Immediate is the default on Windows: NVIDIA's Mailbox there paced the menu at twice the
+ * display refresh (120 on a 60 Hz laptop panel, Omen 16 in discrete mode; Immediate 240). */
+static const wchar_t *const present_names[] = {L"Mailbox (capped at 2x refresh on NVIDIA)", L"VSync (FIFO)", L"Immediate (uncapped, may tear)"};
+static const wchar_t *const present_modes[] = {L"Mailbox", L"Fifo", L"Immediate"};
+/* Upscaling at present (spatial, so it fits any game): FSR 1.0 when the window or screen is
+ * larger than the game's output; RCAS sharpening with it (attenuation in stops: lower = sharper). */
+static const wchar_t *const upscaler_names[] = {L"Off (bilinear)", L"AMD FSR 1.0"};
+static const wchar_t *const sharpness_names[] = {L"Off", L"Low", L"Medium", L"High"};
+static const wchar_t *const sharpness_attenuation[] = {L"2000", L"1000", L"500", L"200"};
+#define COUNT(a) (int)(sizeof(a) / sizeof((a)[0]))
+/* Variables the launcher sets for the game: their values from the environment the launcher was
+ * started with (a value there wins over the window), captured once, because Play sets them in
+ * this process and a second Play must not take the first one's values for the user's. */
+static const wchar_t *const managed_env[] = {
+    L"BB_FULLSCREEN", L"BB_VK_VALIDATION", L"BB_FRAME_STATS", L"BB_MENU_TRACE", L"BB_GAMEPAD", L"BB_NEO",
+    L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
+    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
+    L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
+};
+static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
+static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
+static void managed_env_capture(void) {
+    for (int i = 0; i < (int)(sizeof(managed_env) / sizeof(managed_env[0])); ++i) {
+        const DWORD n = GetEnvironmentVariableW(managed_env[i], managed_value[i], 1024);
+        managed_given[i] = n && n < 1024;
+    }
+}
+/* The user's value if the launcher was started with one, else `value` (NULL: unset). */
+static void game_env(const wchar_t *name, const wchar_t *value) {
+    for (int i = 0; i < (int)(sizeof(managed_env) / sizeof(managed_env[0])); ++i)
+        if (!wcscmp(managed_env[i], name)) { if (managed_given[i]) value = managed_value[i]; break; }
+    SetEnvironmentVariableW(name, value);
+}
+static int clampi(int v, int n) { return v < 0 || v >= n ? 0 : v; }
 
 static int exists(const wchar_t *path) { return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
 static void join(wchar_t *out_path, size_t n, const wchar_t *a, const wchar_t *b) {
@@ -93,6 +134,11 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"validation")) settings.validation = _wtoi(value);
         else if (!wcscmp(line, L"frame_stats")) settings.frame_stats = _wtoi(value);
         else if (!wcscmp(line, L"menu_trace")) settings.menu_trace = _wtoi(value);
+        else if (!wcscmp(line, L"resolution")) settings.resolution = clampi(_wtoi(value), COUNT(resolution_names));
+        else if (!wcscmp(line, L"fps_mode")) settings.fps_mode = clampi(_wtoi(value), COUNT(fps_names));
+        else if (!wcscmp(line, L"present_mode")) settings.present_mode = clampi(_wtoi(value), COUNT(present_names));
+        else if (!wcscmp(line, L"upscaler")) settings.upscaler = clampi(_wtoi(value), COUNT(upscaler_names));
+        else if (!wcscmp(line, L"sharpness")) settings.sharpness = clampi(_wtoi(value), COUNT(sharpness_names));
     }
     fclose(f);
 }
@@ -100,9 +146,11 @@ static void settings_save(void) {
     wchar_t path[PATHW]; settings_path(path);
     FILE *f = _wfopen(path, L"w, ccs=UTF-8");
     if (!f) return;
-    fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n",
+    fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
+                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
-             settings.frame_stats, settings.menu_trace);
+             settings.frame_stats, settings.menu_trace, settings.resolution, settings.fps_mode, settings.present_mode,
+             settings.upscaler, settings.sharpness);
     fclose(f);
 }
 /* bbport.ini: "key=value" lines (UTF-8), shared with the in-game menu. */
@@ -122,7 +170,6 @@ static const char *ini_value(const char *key) {
     fclose(f);
     return result;
 }
-static int ini_flag(const char *key) { const char *v = ini_value(key); return v && !strcmp(v, "1"); }
 /* Replaces the key's line, or appends it; the file is rewritten whole and swapped in as the
  * in-game menu does. */
 static void ini_set(const char *key, const char *value) {
@@ -144,10 +191,8 @@ static void ini_set(const char *key, const char *value) {
     MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 }
 static void patches_load(void) {
-    settings.patch_60fps = ini_flag("patch_60fps");
-    settings.patch_no_motion_blur = ini_flag("patch_no_motion_blur");
-    settings.patch_pro_1080p = ini_flag("patch_pro_1080p");
-    settings.fps_unlocked = ini_flag("fps_unlocked");
+    const char *fps = ini_value("show_fps");
+    settings.show_fps = !fps || !strcmp(fps, "1"); /* on until the menu or the launcher turns it off */
 }
 
 /* ---- the log: window, file, console ---- */
@@ -284,8 +329,8 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     join(out, PATHW, data, L"out"); ensure_directory(out);
     join(user_dir, PATHW, data, L"user"); ensure_directory(user_dir);
     config_path(config);
-    if (!exists(python)) { fail(L"python\\python.exe is missing next to SacredFire.exe: the package is incomplete."); return 2; }
-    if (!exists(game_exe)) { fail(L"bin\\sacredfire-game.exe is missing next to SacredFire.exe: the package is incomplete."); return 2; }
+    if (!exists(python)) { fail(L"python\\python.exe is missing next to the launcher: the package is incomplete."); return 2; }
+    if (!exists(game_exe)) { fail(L"bin\\sacredfire-game.exe is missing next to the launcher: the package is incomplete."); return 2; }
     SetEnvironmentVariableW(L"BB_CONFIG", config);
     SetEnvironmentVariableW(L"BB_USER_DIR", env_or(L"BB_USER_DIR", user_dir));
     SetEnvironmentVariableW(L"BB_GPU_USER_DIR", env_or(L"BB_GPU_USER_DIR", user_dir));
@@ -294,20 +339,40 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     wchar_t eboot[PATHW]; join(eboot, PATHW, game, L"eboot.bin");
     if (!game[0] || !exists(eboot)) {
         wchar_t m[PATHW + 128];
-        _snwprintf(m, PATHW + 128, L"No eboot.bin in \"%ls\": choose the game folder (the one with eboot.bin, with the 1.21 update merged in).", game);
+        _snwprintf(m, PATHW + 128, L"No eboot.bin in \"%ls\": choose the game folder (CUSA06534, with CUSA06534-patch beside it or merged in).", game);
         m[PATHW + 127] = 0; fail(m); return 2;
+    }
+    /* Base and update side by side (CUSA06534 + CUSA06534-patch, as PKG extractors leave them):
+     * merge_update.py links them into CUSA06534-merged once, and that folder is played. */
+    static wchar_t merged_game[PATHW];
+    {
+        static char merged[PATHW * 3];
+        const wchar_t *args[] = {game};
+        if (script(L"scripts", L"merge_update.py", args, 1, merged, sizeof(merged))) {
+            logf("%s", merged);
+            fail(L"Merging the 1.14 update into the game folder failed (see the log).");
+            return 2;
+        }
+        /* The folder is the last line (progress lines come before it). */
+        trim(merged);
+        char *last = strrchr(merged, '\n');
+        if (last) { *last = 0; logf("%s\n", merged); last += 1; } else last = merged;
+        MultiByteToWideChar(CP_UTF8, 0, last, -1, merged_game, PATHW); merged_game[PATHW - 1] = 0;
+        trimw(merged_game);
+        if (merged_game[0]) game = merged_game;
+        logw(L"Game folder: %ls\n", game);
     }
     char profile[256] = "";
     if (wcscmp(env_or(L"BB_SKIP_GAME_CHECK", L"0"), L"1")) {
         const wchar_t *args[] = {game};
         if (script(L"scripts", L"game_check.py", args, 1, profile, sizeof(profile))) {
             logf("%s", profile);
-            fail(L"The game check failed (see the log): the folder is not Crash Team Racing Nitro-Fueled CUSA13795 with the 1.21 update merged in.");
+            fail(L"The game check failed (see the log): the folder is not EA SPORTS UFC 3 CUSA06534 with the 1.14 update (CUSA06534-patch) beside it or merged in.");
             return 2;
         }
         trim(profile);
     }
-    if (!profile[0]) snprintf(profile, sizeof(profile), "ctr");
+    if (!profile[0]) snprintf(profile, sizeof(profile), "ufc3");
     /* The update's build (5.05, 6.72+ or ?): the address-keyed diagnostics know the 5.05 build only. */
     {
         char variant[64] = "?";
@@ -324,8 +389,8 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     const wchar_t *prepare[] = {game, L"--out", out};
     if (script(L"scripts", L"prepare.py", prepare, 3, NULL, 0)) { fail(L"prepare.py failed (see the log)"); return 2; }
     if (script(L"scripts", L"link_libc.py", prepare, 3, NULL, 0)) { fail(L"link_libc.py failed (see the log)"); return 2; }
-    const wchar_t *link_args[] = {game, L"--out", out, L"--modules", L"libc.prx", L"libSceFios2.prx", L"libSceNpToolkit2.prx"};
-    if (script(L"scripts", L"link_modules.py", link_args, 7, NULL, 0)) { fail(L"link_modules.py failed (see the log)"); return 2; }
+    const wchar_t *link_args[] = {game, L"--out", out, L"--modules", L"libc.prx", L"libSceFios2.prx"};
+    if (script(L"scripts", L"link_modules.py", link_args, 6, NULL, 0)) { fail(L"link_modules.py failed (see the log)"); return 2; }
     wchar_t aerolib[PATHW]; join(aerolib, PATHW, root, L"share\\aerolib.inl");
     const wchar_t *names_args[] = {L"--out", out, L"--aerolib", aerolib};
     if (script(L"tools", L"gen_import_names.py", names_args, 4, NULL, 0)) { fail(L"gen_import_names.py failed (see the log)"); return 2; }
@@ -334,7 +399,7 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     wchar_t patches_dir[PATHW], patches_config[PATHW];
     join(patches_dir, PATHW, root, L"patches"); join(patches_config, PATHW, data, L"patches.json");
     const wchar_t *patch_args[] = {L"--patches-dir", env_or(L"BB_PATCHES_DIR", patches_dir), L"--patches-config", env_or(L"BB_PATCHES_CONFIG", patches_config),
-                                   L"--app-version", L"01.21", L"--title-id", L"CUSA13795", L"--out", out, L"--settings", config};
+                                   L"--app-version", L"01.14", L"--title-id", L"CUSA06534", L"--out", out, L"--settings", config};
     if (script(L"scripts", L"patches.py", patch_args, 12, NULL, 0)) { fail(L"patches.py failed (see the log)"); return 2; }
     /* The count of guest TCB loads the linker rewrote (link.json fs_loads_patched): the game
      * executable cross-checks its own scan against it. */
@@ -348,34 +413,41 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
             if (key && (key = strchr(key, ':'))) _snwprintf(tls_loads, 32, L"%ld", strtol(key + 1, NULL, 10));
         }
     }
-    /* The switches (the window's, or the saved ones with --play) and run.sh's defaults. */
-    SetEnvironmentVariableW(L"BB_NEO", settings.neo ? L"1" : L"0");
-    logw(L"PS4 Pro mode: %d\n", settings.neo);
-    if (settings.fullscreen) SetEnvironmentVariableW(L"BB_FULLSCREEN", L"1");
-    if (settings.validation) SetEnvironmentVariableW(L"BB_VK_VALIDATION", L"1");
-    if (settings.frame_stats) SetEnvironmentVariableW(L"BB_FRAME_STATS", L"1");
-    if (settings.menu_trace) SetEnvironmentVariableW(L"BB_MENU_TRACE", L"1");
-    if (settings.gamepad[0]) SetEnvironmentVariableW(L"BB_GAMEPAD", settings.gamepad);
-    if (!env_or(L"BB_PREUPLOAD", NULL)) SetEnvironmentVariableW(L"BB_PREUPLOAD", L"1");
-    if (!env_or(L"BB_COPY_GPU_BUFFERS", NULL)) SetEnvironmentVariableW(L"BB_COPY_GPU_BUFFERS", L"1");
-    if (!env_or(L"BB_GPU_WRITE_TWINS", NULL)) SetEnvironmentVariableW(L"BB_GPU_WRITE_TWINS", L"1");
-    if (!env_or(L"BB_GPU_WRITE_TWINS_MAX", NULL)) SetEnvironmentVariableW(L"BB_GPU_WRITE_TWINS_MAX", L"65536");
+    /* The switches (the window's, or the saved ones with --play) and run.sh's defaults for the
+     * ufc3 profile. An environment variable set before the launcher wins over each of them. */
+    game_env(L"BB_FULLSCREEN", settings.fullscreen ? L"1" : NULL);
+    game_env(L"BB_VK_VALIDATION", settings.validation ? L"1" : NULL);
+    game_env(L"BB_FRAME_STATS", settings.frame_stats ? L"1" : NULL);
+    game_env(L"BB_MENU_TRACE", settings.menu_trace ? L"1" : NULL);
+    game_env(L"BB_GAMEPAD", settings.gamepad[0] ? settings.gamepad : NULL);
+    /* The fight scene renders black without precise readbacks of linear images (shadPS4 issue
+     * #4375, UFC 4, same engine); precise readbacks deadlock against the GPU write twins, so
+     * those stay off. The game asks for flip rate 1 (30 Hz); its simulation follows the real
+     * frame time, so flip rate 0 with a 480 Hz virtual vblank and the present thread's cap set
+     * the rate. Z16+S8 shadow data uploaded from memory is kept as D16 (stencil dropped). */
+    game_env(L"BB_NEO", L"0");
+    game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
+    game_env(L"BB_WRITE_WINDOW", L"1");
+    game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
+    game_env(L"BB_Z16S8_AS_D16", L"1");
+    game_env(L"BB_PREUPLOAD", L"1"); game_env(L"BB_COPY_GPU_BUFFERS", L"1");
+    game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
+    game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
+    game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);
+    game_env(L"BB_INTERNAL_HEIGHT", resolution_h[settings.resolution]);
+    game_env(L"BB_FSR1", settings.upscaler == 1 ? L"1" : L"0");
+    game_env(L"BB_RCAS", settings.sharpness ? L"1" : L"0");
+    game_env(L"BB_RCAS_ATTENUATION", sharpness_attenuation[settings.sharpness]);
     SetEnvironmentVariableW(L"BB_UFFD", L"0");            /* Linux only */
     SetEnvironmentVariableW(L"BB_GUEST_IN_PLACE", L"0");  /* dma-buf memory model: Linux only */
-    {
-        const wchar_t *fps = env_or(L"BB_FPS", L"30");
-        const int sixty = ini_flag("patch_60fps");
-        if (!env_or(L"BB_VBLANK_HZ", NULL))
-            SetEnvironmentVariableW(L"BB_VBLANK_HZ", sixty ? L"480" : !wcscmp(fps, L"uncap") ? L"480" : !wcscmp(fps, L"90") ? L"90" : L"60");
-        /* The 60 FPS patch removes the game's cap altogether; above 60 FPS its physics misbehave
-         * (slopes bleed speed, karts stick on ledges), so the present thread caps at 60 unless
-         * BB_FPS=uncap or BB_FPS_LIMIT (0: none) says otherwise. */
-        if (sixty && !env_or(L"BB_FPS_LIMIT", NULL))
-            SetEnvironmentVariableW(L"BB_FPS_LIMIT", (!wcscmp(fps, L"uncap") || ini_flag("fps_unlocked")) ? L"0" : L"60");
-        if (sixty) logw(L"60 FPS patch on: frame limit %ls FPS (0: none; the launcher's or the menu's Unlocked frame rate)\n", env_or(L"BB_FPS_LIMIT", L"60"));
-    }
+    /* env_or keeps 8 values at a time: two lines. */
+    logw(L"UFC 3: output %lsx%ls, frame limit %ls (0: none), present mode %ls, fullscreen %ls\n",
+         env_or(L"BB_INTERNAL_WIDTH", L"?"), env_or(L"BB_INTERNAL_HEIGHT", L"?"), env_or(L"BB_FPS_LIMIT", L"?"),
+         env_or(L"BB_PRESENT_MODE", L"?"), env_or(L"BB_FULLSCREEN", L"0"));
+    logw(L"UFC 3: FSR 1.0 %ls, RCAS %ls (attenuation %ls), readbacks %ls (2 = precise)\n",
+         env_or(L"BB_FSR1", L"0"), env_or(L"BB_RCAS", L"?"), env_or(L"BB_RCAS_ATTENUATION", L"?"), env_or(L"BB_READBACKS", L"?"));
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
-        wchar_t cache[PATHW]; join(cache, PATHW, env_or(L"BB_USER_DIR", user_dir), L"cache\\CUSA13795");
+        wchar_t cache[PATHW]; join(cache, PATHW, env_or(L"BB_USER_DIR", user_dir), L"cache\\CUSA06534");
         if (exists(cache)) {
             wchar_t command[PATHW + 64]; _snwprintf(command, PATHW + 64, L"cmd.exe /c rd /s /q \"%ls\"", cache); command[PATHW + 63] = 0;
             run(command, NULL, 0, 0, INFINITE);
@@ -578,7 +650,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_GAMEPAD, ID_RESCAN, ID_P60, ID_PBLUR, ID_P1080, ID_UNLOCKED, ID_NEO, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_GAMEPAD, ID_RESCAN, ID_RESOLUTION, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -612,14 +684,16 @@ static void read_controls(void) {
     GetWindowTextW(control(ID_GAME), settings.game, PATHW); trimw(settings.game);
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
-    settings.neo = checked(ID_NEO); settings.fullscreen = checked(ID_FULLSCREEN); settings.clear_cache = checked(ID_CLEAR);
+    settings.fullscreen = checked(ID_FULLSCREEN); settings.clear_cache = checked(ID_CLEAR);
     settings.validation = checked(ID_VALIDATION); settings.frame_stats = checked(ID_STATS); settings.menu_trace = checked(ID_TRACE);
-    const int p60 = checked(ID_P60), pblur = checked(ID_PBLUR), p1080 = checked(ID_P1080), unlocked = checked(ID_UNLOCKED);
-    if (p60 != settings.patch_60fps) ini_set("patch_60fps", p60 ? "1" : "0");
-    if (pblur != settings.patch_no_motion_blur) ini_set("patch_no_motion_blur", pblur ? "1" : "0");
-    if (p1080 != settings.patch_pro_1080p) ini_set("patch_pro_1080p", p1080 ? "1" : "0");
-    if (unlocked != settings.fps_unlocked) ini_set("fps_unlocked", unlocked ? "1" : "0");
-    settings.patch_60fps = p60; settings.patch_no_motion_blur = pblur; settings.patch_pro_1080p = p1080; settings.fps_unlocked = unlocked;
+    settings.resolution = clampi((int)SendMessageW(control(ID_RESOLUTION), CB_GETCURSEL, 0, 0), COUNT(resolution_names));
+    settings.fps_mode = clampi((int)SendMessageW(control(ID_FPS), CB_GETCURSEL, 0, 0), COUNT(fps_names));
+    settings.present_mode = clampi((int)SendMessageW(control(ID_PRESENT), CB_GETCURSEL, 0, 0), COUNT(present_names));
+    settings.upscaler = clampi((int)SendMessageW(control(ID_UPSCALER), CB_GETCURSEL, 0, 0), COUNT(upscaler_names));
+    settings.sharpness = clampi((int)SendMessageW(control(ID_SHARPNESS), CB_GETCURSEL, 0, 0), COUNT(sharpness_names));
+    const int show_fps = checked(ID_SHOWFPS);
+    ini_set("show_fps", show_fps ? "1" : "0"); /* written always: the game's own default is off */
+    settings.show_fps = show_fps;
     settings_save();
 }
 static int pick_folder(wchar_t *out_path) {
@@ -629,7 +703,7 @@ static int pick_folder(wchar_t *out_path) {
         DWORD options = 0;
         dialog->lpVtbl->GetOptions(dialog, &options);
         dialog->lpVtbl->SetOptions(dialog, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-        dialog->lpVtbl->SetTitle(dialog, L"The game folder: the one with eboot.bin, with the 1.21 update merged in");
+        dialog->lpVtbl->SetTitle(dialog, L"The game folder (CUSA06534; CUSA06534-patch beside it is merged automatically)");
         if (SUCCEEDED(dialog->lpVtbl->Show(dialog, main_window))) {
             IShellItem *item = NULL;
             if (SUCCEEDED(dialog->lpVtbl->GetResult(dialog, &item))) {
@@ -741,13 +815,13 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
         if (!ui_font) ui_font = GetStockObject(DEFAULT_GUI_FONT);
     }
     WNDCLASSW wc = {.lpfnWndProc = window_proc, .hInstance = instance, .hCursor = LoadCursorW(NULL, IDC_ARROW),
-                    .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"SacredFireLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
+                    .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"UFC3NativeLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
     RegisterClassW(&wc);
     const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
     /* The client area is 760x640 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(664);
-    main_window = CreateWindowExW(0, wc.lpszClassName, L"SacredFire", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
+    const int client_w = sx(760), client_h = sx(728);
+    main_window = CreateWindowExW(0, wc.lpszClassName, L"EA SPORTS UFC 3 - native PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
     open_log_file(L"launcher.log");
@@ -762,21 +836,28 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
              GetDpiForWindow(main_window), GetSystemMetrics(SM_CYCAPTION));
     }
     int y = 12;
-    make(L"STATIC", L"Game folder (the one with eboot.bin, update 1.21 merged in):", 0, 12, y, 600, 18, 0); y += 20;
+    make(L"STATIC", L"EA SPORTS UFC 3 (CUSA06534): the game folder (CUSA06534-patch beside it is merged automatically):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"EDIT", settings.game, WS_BORDER | ES_AUTOHSCROLL, 12, y, 640, 24, ID_GAME);
     make(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 660, y, 88, 24, ID_BROWSE); y += 34;
-    make(L"STATIC", L"Controller for port 1 (ports 2-4 for split screen: in-game menu, L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
+    make(L"STATIC", L"Controller for player 1 (in-game menu: L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 640, 200, ID_GAMEPAD);
     make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 660, y, 88, 24, ID_RESCAN); y += 34;
-    make(L"BUTTON", L"Game patches (by illusion and TroyWarez; applied at start)", BS_GROUPBOX, 12, y, 360, 120, 0);
-    make(L"BUTTON", L"60 FPS unlock (capped at 60)", BS_AUTOCHECKBOX, 24, y + 20, 330, 20, ID_P60);
-    make(L"BUTTON", L"Unlocked frame rate (physics bugs above 60)", BS_AUTOCHECKBOX, 24, y + 44, 330, 20, ID_UNLOCKED);
-    make(L"BUTTON", L"Disable motion blur", BS_AUTOCHECKBOX, 24, y + 68, 330, 20, ID_PBLUR);
-    make(L"BUTTON", L"1080p in PS4 Pro mode", BS_AUTOCHECKBOX, 24, y + 92, 330, 20, ID_P1080);
-    make(L"BUTTON", L"Display and console", BS_GROUPBOX, 388, y, 360, 120, 0);
-    make(L"BUTTON", L"PS4 Pro mode (7 CPUs, 5568 MiB; needed for 1080p)", BS_AUTOCHECKBOX, 400, y + 20, 340, 20, ID_NEO);
-    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 400, y + 44, 330, 20, ID_FULLSCREEN);
-    make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 68, 330, 20, ID_CLEAR); y += 130;
+    make(L"BUTTON", L"Video", BS_GROUPBOX, 12, y, 360, 184, 0);
+    make(L"STATIC", L"Output resolution", 0, 24, y + 24, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 20, 200, 200, ID_RESOLUTION);
+    make(L"STATIC", L"Present mode", 0, 24, y + 56, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 52, 200, 200, ID_PRESENT);
+    make(L"STATIC", L"Upscaling", 0, 24, y + 88, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 84, 200, 200, ID_UPSCALER);
+    make(L"STATIC", L"Sharpening (RCAS)", 0, 24, y + 120, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 116, 200, 200, ID_SHARPNESS);
+    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 152, 330, 20, ID_FULLSCREEN);
+    make(L"BUTTON", L"Frame rate", BS_GROUPBOX, 388, y, 360, 184, 0);
+    make(L"STATIC", L"FPS limit", 0, 400, y + 24, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 536, y + 20, 200, 200, ID_FPS);
+    make(L"BUTTON", L"Show the FPS counter", BS_AUTOCHECKBOX, 400, y + 56, 330, 20, ID_SHOWFPS);
+    make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 88, 330, 20, ID_CLEAR);
+    make(L"STATIC", L"FSR 1.0 works when the screen is larger than the output\r\n(e.g. output 720p on a 1080p screen, fullscreen).", 0, 400, y + 120, 340, 40, 0); y += 194;
     make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
     make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
@@ -786,11 +867,22 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 664 - y - 12, ID_LOG);
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 728 - y - 12, ID_LOG);
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
-    set_checked(ID_P60, settings.patch_60fps); set_checked(ID_PBLUR, settings.patch_no_motion_blur); set_checked(ID_P1080, settings.patch_pro_1080p);
-    set_checked(ID_UNLOCKED, settings.fps_unlocked);
-    set_checked(ID_NEO, settings.neo); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_CLEAR, settings.clear_cache);
+    {
+        const struct { int id, count, selected; const wchar_t *const *names; } combos[] = {
+            {ID_RESOLUTION, COUNT(resolution_names), settings.resolution, resolution_names},
+            {ID_FPS, COUNT(fps_names), settings.fps_mode, fps_names},
+            {ID_PRESENT, COUNT(present_names), settings.present_mode, present_names},
+            {ID_UPSCALER, COUNT(upscaler_names), settings.upscaler, upscaler_names},
+            {ID_SHARPNESS, COUNT(sharpness_names), settings.sharpness, sharpness_names},
+        };
+        for (int c = 0; c < COUNT(combos); ++c) {
+            for (int i = 0; i < combos[c].count; ++i) SendMessageW(control(combos[c].id), CB_ADDSTRING, 0, (LPARAM)combos[c].names[i]);
+            SendMessageW(control(combos[c].id), CB_SETCURSEL, combos[c].selected, 0);
+        }
+    }
+    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads();
     set_running(0);
@@ -810,6 +902,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     /* Started from a console (cmd, a script): its output stays there as well. */
     if (AttachConsole(ATTACH_PARENT_PROCESS)) console_out = GetStdHandle(STD_OUTPUT_HANDLE);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    managed_env_capture();
     GetModuleFileNameW(NULL, root, PATHW);
     { wchar_t *slash = wcsrchr(root, L'\\'); if (slash) *slash = 0; }
     SetCurrentDirectoryW(root);
@@ -837,7 +930,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     else {
         PWSTR local = NULL;
         if (FAILED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local))) { fail(L"no %LOCALAPPDATA%"); return 2; }
-        join(data, PATHW, local, L"SacredFire"); CoTaskMemFree(local);
+        join(data, PATHW, local, L"UFC3Native"); CoTaskMemFree(local);
     }
     ensure_directory(data);
     join(python, PATHW, root, L"python\\python.exe");

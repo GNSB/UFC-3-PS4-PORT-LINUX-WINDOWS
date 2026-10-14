@@ -983,11 +983,21 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
     if (!IsFormatSupported(format, flags)) [[unlikely]] {
         switch (format) {
         case vk::Format::eD16UnormS8Uint:
-            if (IsFormatSupported(vk::Format::eD24UnormS8Uint, flags)) {
-                return vk::Format::eD24UnormS8Uint;
+            // ufc3 experiment BB_Z16S8_AS_D16=1: Z16+S8 kept as D16_UNORM (stencil dropped), so
+            // Z16 data uploaded from guest memory lands bit-exact (a D32 float image reads the
+            // 16-bit texels as floats: garbage shadow maps).
+            if (const char* e = std::getenv("BB_Z16S8_AS_D16"); e && e[0] == '1' &&
+                IsFormatSupported(vk::Format::eD16Unorm, flags)) {
+                return vk::Format::eD16Unorm;
             }
+            // ufc3: D32S8 first, as on AMD (where bbport/SacredFire are tested). NVIDIA has D24S8,
+            // but games read these depth buffers through R16/R32 views (UFC 3's compute pass
+            // aae9f6c1 reads one as R16_UINT); such views on D24S8 hung the GPU (Xid 109).
             if (IsFormatSupported(vk::Format::eD32SfloatS8Uint, flags)) {
                 return vk::Format::eD32SfloatS8Uint;
+            }
+            if (IsFormatSupported(vk::Format::eD24UnormS8Uint, flags)) {
+                return vk::Format::eD24UnormS8Uint;
             }
             break;
         case vk::Format::eR8Srgb:

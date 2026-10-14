@@ -578,6 +578,21 @@ static ABI int32_t sce_check_reachability(const char *p) {
     GuestStat s; return (int32_t)sce(do_stat(p,&s));
 }
 
+/* UFC 3: fcntl (F_GETFL/F_SETFL only: every file is blocking and stays that way), chmod and utimes
+ * on existing paths (permission bits and times are not kept). */
+static ABI int32_t sce_fcntl(int fd,int cmd,int64_t arg) {
+    (void)arg;
+    if (fd<0) return ERR(9);
+    if (cmd==3) return 0x2;  /* F_GETFL: O_RDWR */
+    return 0;                /* F_SETFL and the rest: accepted */
+}
+static ABI int32_t sce_chmod(const char *p,uint16_t mode) {
+    (void)mode; GuestStat st; return (int32_t)sce(do_stat(p,&st));
+}
+static ABI int32_t sce_utimes(const char *p,const void *times) {
+    (void)times; GuestStat st; return (int32_t)sce(do_stat(p,&st));
+}
+
 static const RuntimeExport exports[]={
     {"sceKernelOpen",sce_open}, {"open",posix_open}, {"_open",posix_open},
     {"sceKernelClose",sce_close}, {"close",posix_close}, {"_close",posix_close},
@@ -598,6 +613,7 @@ static const RuntimeExport exports[]={
     {"sceKernelMkdir",sce_mkdir}, {"mkdir",posix_mkdir},
     {"sceKernelRmdir",sce_rmdir}, {"rmdir",posix_rmdir},
     {"sceKernelUnlink",sce_unlink}, {"unlink",posix_unlink},
+    {"sceKernelFcntl",sce_fcntl}, {"sceKernelChmod",sce_chmod}, {"sceKernelUtimes",sce_utimes},
 };
 uintptr_t runtime_file_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 /* Host-side helpers for other modules (e.g. SaveData, Fios). */

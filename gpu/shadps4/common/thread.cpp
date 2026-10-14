@@ -111,13 +111,29 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
                    const bool interruptible) {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
-    LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
-    };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    // bbport (Windows): a plain waitable timer fires on the system tick (15.6 ms unless raised),
+    // which turned the 480 Hz virtual vblank of the present thread into ~64 Hz. A per-thread
+    // high-resolution timer (Windows 10 1803+) for all but the last 100 us, which are spun.
+    constexpr auto spin = std::chrono::microseconds(100);
+    thread_local HANDLE timer = [] {
+        HANDLE t = ::CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+        return t ? t : ::CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }();
+    DWORD ret = WAIT_OBJECT_0;
+    if (duration > spin && timer) {
+        LARGE_INTEGER interval{
+            .QuadPart = -1 * ((duration - spin).count() / 100u),
+        };
+        if (interval.QuadPart < 0 && SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0)) {
+            ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+        }
+    }
+    if (ret == WAIT_OBJECT_0) {
+        while (std::chrono::high_resolution_clock::now() - begin_sleep < duration) {
+            YieldProcessor();
+        }
+    }
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();

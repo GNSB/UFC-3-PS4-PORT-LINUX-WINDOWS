@@ -35,10 +35,27 @@ public:
     /// bbport: the guest code behind write faults on tracked pages over the last window (frame
     /// stats): which game functions write GPU memory, to replace tracking by explicit hooks.
     static void ReportFaultSites();
+    /// ufc3: a write fault on this thread became a readback (reason: 0 host copy, 1 page over
+    /// the step limit, 2 near GPU bytes, 3 other); reported with the fault sites.
+    static void NoteReadbackSite(u32 reason, VAddr address, u64 gpu_bytes);
     /// bbport: the write fault being handled on this thread hit an image (diagnostics: which guest
     /// code writes textures, BB_WRITE_TRACKING=1).
     static void NoteImageFault(VAddr image_address, u64 image_size, u32 width, u32 height,
                                u32 format, u32 tiling);
+
+    /// ufc3 (BB_WRITE_STEP): the single-step trap after a write on an opened GPU-written page;
+    /// false when this thread is not stepping one (the trap is not ours).
+    static bool OnStepTrap(void* context);
+
+    /// ufc3 (BB_WRITE_WINDOW=1): GPU-written pages the CPU writes beside the GPU bytes stay open
+    /// for the CPU until the game's next submission, then their changed words go to VRAM.
+    static bool WriteWindowsEnabled();
+    /// Whether the write fault being handled on this thread comes from the game's code.
+    static bool FaultFromGuest();
+    /// DecideWriteStep: open a window for this fault instead of single-stepping it.
+    static void RequestWindow();
+    /// Closes every open window (the submitting thread, before the GPU side sees the submission).
+    static void CloseWriteWindows();
 
     /// Register a range of mapped gpu memory.
     void OnGpuMap(VAddr address, size_t size);

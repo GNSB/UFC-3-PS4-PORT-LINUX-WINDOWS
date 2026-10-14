@@ -1,3 +1,4 @@
+#include "video_core/page_manager.h"
 #include "bbport_write_log.h"
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
@@ -343,6 +344,10 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return BbFreeCheck::OnStaleTrapFault(reinterpret_cast<std::uint64_t>(address)) ? 1 : 0;
 }
 
+extern "C" int bbgpu_handle_step(void* context) {
+    return VideoCore::PageManager::OnStepTrap(context) ? 1 : 0;
+}
+
 extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGnmHooks::PatchImage(image, size);
 }
@@ -360,6 +365,10 @@ static std::atomic<u32> asio_requests;
 static std::jthread service_thread;
 
 void KernelSignalRequest() {
+    // ufc3: the service thread runs io_context for good (a work guard keeps run() from
+    // returning), so timers need no wake-up. The old run()/restart()/counter-reset loop lost a
+    // timer scheduled while run() was returning: the game's RenderThread slept forever on an
+    // EAThread timer and the screen stayed black, only without gdb (timing).
     std::unique_lock lock{m_asio_req};
     ++asio_requests;
     cv_asio_req.notify_one();
@@ -367,15 +376,13 @@ void KernelSignalRequest() {
 
 static void KernelServiceThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("bb:kernel_service");
+    auto guard = boost::asio::make_work_guard(io_context);
+    std::stop_callback on_stop{stoken, [] { io_context.stop(); }};
     while (!stoken.stop_requested()) {
-        {
-            std::unique_lock lock{m_asio_req};
-            cv_asio_req.wait(lock, stoken, [] { return asio_requests != 0; });
-        }
-        if (stoken.stop_requested()) break;
         io_context.run();
-        io_context.restart();
-        asio_requests = 0;
+        if (!stoken.stop_requested()) {
+            io_context.restart(); // run() only returns on stop() or an exception
+        }
     }
 }
 

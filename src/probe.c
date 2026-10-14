@@ -1,5 +1,8 @@
 /* Minimal x86-64 native loader experiment. Not a PS4 emulator or game port. */
 #define _GNU_SOURCE
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,7 +107,14 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
 /* Fault handling (platform_install_fault_handlers): GPU page tracking first, then a speculative
  * read's recovery point, then the fatal report with the guest write log. */
-static int gpu_fault(void *context, void *address) { return gpu_enabled && bbgpu_handle_fault(context, address); }
+/* ufc3: a speculative read (a draw-preparation worker walking guest tables under the pipeline
+ * cache's shared lock) must not be resolved by a GPU readback: the readback waits for the GPU
+ * thread, which waits for that lock. Its recovery point takes over and the GPU thread redoes it. */
+static int gpu_fault(void *context, void *address) {
+    if (runtime_fault_recover) return 0;
+    return gpu_enabled && bbgpu_handle_fault(context, address);
+}
+static int gpu_step(void *context) { return gpu_enabled && bbgpu_handle_step(context); }
 static bb_fault_jmp_buf *recover_point(void) { bb_fault_jmp_buf *r = runtime_fault_recover; runtime_fault_recover = NULL; return r; }
 static void fault_extra(void *context) { if (gpu_enabled) bbgpu_dump_guest_writes(context); }
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
@@ -187,6 +197,11 @@ void runtime_restart(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+    /* ufc3: BB_ALLOW_PTRACE=1 lets a debugger attach later (Yama ptrace_scope 1 allows only
+     * descendants otherwise): stacks of a hang that does not happen under gdb. */
+    if (getenv("BB_ALLOW_PTRACE")) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
     /* Host preparation before anything else allocates: glibc's heap below 1 TiB (Linux); the
      * PS4 user range reserved and the guest TCB's TEB TLS slot claimed before any driver loads
@@ -246,6 +261,7 @@ int main(int argc, char **argv) {
     bbgpu_register_kernel();
     page_size = platform_page_size();
     platform_install_fault_handlers(gpu_fault, recover_point, fault_extra, NULL, 0);
+    platform_install_step_handler(gpu_step);
     platform_watchdog_start(timeout_seconds, NULL); /* 0 disables the watchdog */
     FILE *f = fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");

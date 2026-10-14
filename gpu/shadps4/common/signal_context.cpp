@@ -69,4 +69,17 @@ u64 GetFaultRegister(void* ctx, FaultRegister which) {
 #endif
 }
 
+void SetTrapFlag(void* ctx, bool on) {
+    constexpr u64 TrapFlag = 0x100;
+#if defined(_WIN32)
+    auto& flags = ((EXCEPTION_POINTERS*)ctx)->ContextRecord->EFlags;
+    flags = on ? (flags | DWORD(TrapFlag)) : (flags & ~DWORD(TrapFlag));
+#elif defined(__linux__) && defined(ARCH_X86_64)
+    auto& flags = ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_EFL];
+    flags = on ? (flags | greg_t(TrapFlag)) : (flags & ~greg_t(TrapFlag));
+#else
+    (void)ctx; (void)on;
+#endif
+}
+
 } // namespace Common

@@ -6,7 +6,7 @@
 #   --runtime  cmake -S gpu -B out/windows/build with cmake/windows-x86_64-llvm-mingw.cmake, then
 #              ninja: sacredfire-game.exe, SacredFire.exe, bb-gpu-capabilities.exe -> out/windows/bin
 #   --tests    the Windows probes and runtime tests (ninja windows-tests) -> out/windows/tests
-# Then scripts/package-windows.sh makes the release archive. Options: BB_JOBS, BB_LTO (OFF),
+# Then scripts/package-windows.sh makes the release archive. Options: BB_JOBS, BB_LTO (ON; ufc3: the GPU thread is CPU-bound on laptops),
 # BB_WINDOWS_ROOT (out/windows). Nothing here needs Windows or Wine; nothing is downloaded
 # outside --fetch.
 set -euo pipefail
@@ -34,8 +34,8 @@ if [[ $stage == all || $stage == --runtime || $stage == --tests ]]; then
     cmake -S gpu -B "$root/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/windows-x86_64-llvm-mingw.cmake" \
         -DLLVM_MINGW_ROOT="$LLVM_MINGW_ROOT" -DWINDOWS_TARGET_ROOT="$WINDOWS_TARGET_ROOT" \
-        -DBB_PGO=off -DBB_LTO="${BB_LTO:-OFF}" -DBB_AVPLAYER=OFF > "$root/configure.log" 2>&1 || { cat "$root/configure.log" >&2; exit 1; }
-    echo "build-windows: configured (LTO ${BB_LTO:-OFF}, no AvPlayer/FFmpeg)"
+        -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_AVPLAYER=OFF > "$root/configure.log" 2>&1 || { cat "$root/configure.log" >&2; exit 1; }
+    echo "build-windows: configured (LTO ${BB_LTO:-ON}, no AvPlayer/FFmpeg)"
     if [[ $stage == --tests ]]; then
         ninja -C "$root/build" -j "${BB_JOBS:-$(nproc)}" windows-tests > "$root/tests-build.log" 2>&1 || { grep -v '^\[' "$root/tests-build.log" | tail -40 >&2; echo "build-windows: test build failed (log: $root/tests-build.log)" >&2; exit 1; }
         mkdir -p "$root/tests"

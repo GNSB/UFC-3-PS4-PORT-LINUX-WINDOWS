@@ -18,5 +18,7 @@ bool IsWriteError(void* ctx);
 // bbport: general registers of the faulting thread, the same on every host (x86-64 only).
 enum class FaultRegister : u8 { Rax, Rbx, Rcx, Rdx, Rsi, Rdi, Rbp, Rsp, R8, R9, R10, R11, R12, R13, R14, R15, Rip };
 u64 GetFaultRegister(void* ctx, FaultRegister which);
+/// bbport: sets or clears the trap flag (single step) in a fault context.
+void SetTrapFlag(void* ctx, bool on);
 
 } // namespace Common

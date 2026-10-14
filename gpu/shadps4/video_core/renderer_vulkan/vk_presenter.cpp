@@ -449,14 +449,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     draw_scheduler.Flush(info);
     BbTimeline::Note(BbTimeline::PipeTask, 5, frame->ready_tick);
 
-    // bbport: the GPU command thread runs at most BB_FRAMES_AHEAD (default 1) guest frames
-    // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
-    // bottleneck it finishes frames at an even rate; without this bound the command thread ran
-    // ahead and then blocked wherever a resource ran out, so flips (and the guest's frame
-    // timing) came in bursts: 12.5/25 ms alternation at 80 FPS. 0 turns it off.
+    // The command thread used to wait for the frame one flip back (BB_FRAMES_AHEAD=1). In a
+    // lit UFC fight that wait was ~24% of the window while the GPU sat near 49%, so the two
+    // sides took turns instead of overlapping. Two frames of overlap is the default now.
+    // 1 is the old pacing. 0 lets the thread run unbounded and the flips stuttered
+    // (12.5/25 ms at 80 FPS).
     static const u32 frames_ahead = [] {
         const char* env = std::getenv("BB_FRAMES_AHEAD");
-        return env ? u32(std::max(0, std::atoi(env))) : 1u;
+        const u32 n = env ? u32(std::max(0, std::atoi(env))) : 2u;
+        std::printf("Frames ahead: %u (BB_FRAMES_AHEAD=1 is the old one-frame wait)\n", n);
+        return n;
     }();
     if (frames_ahead) {
         recent_frame_ticks.push_back(frame->ready_tick);

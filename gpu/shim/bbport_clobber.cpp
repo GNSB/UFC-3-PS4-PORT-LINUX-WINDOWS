@@ -86,6 +86,15 @@ std::size_t RoundUp(std::size_t bytes) {
 } // namespace
 
 std::int64_t FirstBadHeader(const std::uint32_t* words, std::uint64_t dwords) {
+    // ufc3: diagnostic for SacredFire issue #2 (a packet walk per submission, twice: ~1.4 % of
+    // the GPU thread). Off unless BB_CLOBBER_CHECK=1.
+    static const bool enabled = [] {
+        const char* e = std::getenv("BB_CLOBBER_CHECK");
+        return e && e[0] == '1';
+    }();
+    if (!enabled) {
+        return -1;
+    }
     std::uint64_t at = 0;
     while (at < dwords) {
         const std::uint32_t header = words[at];
@@ -120,6 +129,14 @@ void NoteDecoding(std::uint64_t seq) {
 }
 
 void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source) {
+    // ufc3: the guest write ring and its reports are part of the issue-#2 diagnostics.
+    static const bool enabled = [] {
+        const char* e = std::getenv("BB_CLOBBER_CHECK");
+        return e && e[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
     if (bytes == 0 || address == 0) {
         return;
     }

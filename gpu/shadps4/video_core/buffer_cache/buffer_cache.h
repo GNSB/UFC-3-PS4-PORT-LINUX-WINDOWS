@@ -106,13 +106,17 @@ public:
     }
 
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
+    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false, bool* step = nullptr);
 
     /// bbport: a guest write fault at `device_addr` was handled; unprotect its neighbourhood.
     void ExtendWriteFault(VAddr device_addr, u64 guest_rip = 0);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false,
+                    bool* step = nullptr);
+    /// ufc3 (BB_WRITE_STEP): whether a guest write fault is single-stepped instead of read back.
+    bool DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks, u32* reason = nullptr,
+                         u64* gpu_bytes_out = nullptr);
 
     /// bbport: a new draw or dispatch is being recorded: the per-binding housekeeping of
     /// EnsureResident (unmaps, demotions, assets, late writes) runs once for it, not per binding.
@@ -173,6 +177,8 @@ public:
     /// blocks lose the asset mark and are bound in place, since what writes them next may be code
     /// the GPU side does not hear of.
     void NoteFreshRange(VAddr addr, u64 size);
+    /// ufc3 (BB_DISCARD_HOOK): a discard lock's fresh range; the GPU's old bytes there are dead.
+    void NoteDiscardRange(VAddr addr, u64 size);
     /// bbport, without write tracking: the command processor wrote `data` at addr in decode order.
     /// Where the GPU's data there lives in VRAM (GPU-modified, not in place) the same bytes are
     /// written into it in stream order and true is returned; else the caller invalidates.
@@ -185,6 +191,8 @@ public:
     /// the backing mapping, which nothing sees). Where VRAM holds a copy of them it gets them too, at
     /// the next binding.
     void NoteLateCommandWrite(VAddr addr, const void* data, u64 size);
+    /// ufc3 (BB_WRITE_STEP): bytes a single-stepped CPU write changed beside GPU data.
+    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes);
     /// bbport, without write tracking (any thread): the CPU wrote [addr, addr + size) next to data
     /// the GPU keeps in VRAM. Exactly those bytes are copied into VRAM from the game's memory at the
     /// next binding: no readback of the GPU's data, nothing uploaded over it.
@@ -393,6 +401,9 @@ private:
     IntervalList<> promote_candidates; ///< in-place blocks that may get a VRAM copy again
     IntervalList<> copy_back_blocks;   ///< VRAM blocks with GPU data, handed out again in part
     IntervalList<> gpu_written_bytes;  ///< bound for GPU writes since handed out (known data too)
+    /// Any GPU write seen, including ones too rare to count as known data. Those blocks stay in
+    /// place: BB_GARLIC_READS_VRAM only moves blocks the GPU has never written.
+    IntervalList<> gpu_write_seen;
     u64 promoted_bytes = 0;
     /// VRAM slots of blocks that left VRAM, for the next blocks moved there (in their chunks).
     u64 free_slot_count = 0;
@@ -406,6 +417,7 @@ private:
     std::atomic<bool> assets_pending{false};
     std::mutex late_writes_mutex;
     std::vector<std::pair<VAddr, std::vector<u8>>> late_writes;
+    std::vector<std::pair<VAddr, std::vector<u8>>> stepped_writes;
     std::vector<std::pair<VAddr, u64>> precise_uploads;
     std::atomic<bool> late_writes_pending{false};
     u64 bind_wait_tick = 0;                            ///< the next arena binds wait for it

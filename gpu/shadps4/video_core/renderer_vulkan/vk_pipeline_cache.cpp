@@ -1051,7 +1051,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(spv, instance.GetDevice());
     }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    // ufc3: the on-disk cache preloads this binary on later starts; store the patch when one
+    // is used, or a cached run would quietly drop it.
+    RegisterShaderBinary(is_patched ? std::vector<u32>(*patch) : std::move(spv), info.pgm_hash,
+                         perm_idx);
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);

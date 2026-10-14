@@ -49,6 +49,8 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+extern "C" void runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
@@ -65,9 +67,18 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     };
     thread_local std::unordered_map<const u32*, CachedParse> cache;
     if (const auto it = cache.find(code);
-        !BbToggle::Disabled(BbToggle::FetchShaderCache) && it != cache.end() &&
-        std::memcmp(code, it->second.code.data(), it->second.code.size() * sizeof(u32)) == 0) {
-        return it->second.data;
+        !BbToggle::Disabled(BbToggle::FetchShaderCache) && it != cache.end()) {
+        // ufc3: revalidate against the backing view. UFC 3 rewrites its fetch shaders through
+        // the GPU (256-byte copies), so the code page is GPU-modified and read-protected with
+        // precise readbacks: a direct memcmp faulted and waited for a GPU finish on every draw.
+        // A mismatch falls through to the decode below, which reads the current code.
+        const size_t bytes = it->second.code.size() * sizeof(u32);
+        thread_local std::vector<u32> current;
+        current.resize(it->second.code.size());
+        runtime_memory_read_backing(reinterpret_cast<uintptr_t>(code), current.data(), bytes);
+        if (std::memcmp(current.data(), it->second.code.data(), bytes) == 0) {
+            return it->second.data;
+        }
     }
 
     FetchShaderData data{};

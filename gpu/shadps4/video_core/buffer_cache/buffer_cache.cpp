@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <shared_mutex>
 #include <chrono>
 #include <array>
 #include <map>
@@ -21,6 +22,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -36,6 +38,8 @@
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
 extern "C" int runtime_memory_direct_phys(uintptr_t address, uint64_t* phys, uintptr_t* end);
+
+extern "C" void runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
 
 namespace VideoCore {
 
@@ -288,6 +292,61 @@ std::mutex twins_mutex;
 std::map<VAddr, std::vector<u8>> twins; ///< start -> guest bytes when the twin was made
 std::atomic<u64> twin_faults{0}, twin_kept_bytes{0}, twin_guest_bytes{0};
 
+// ufc3 (BB_WRITE_SKIP_NO_OVERLAP=1, experimental, default off): a CPU write fault that does not touch any
+// GPU-written byte of the page skips the download (and its GPU finish). The GPU-written bytes of
+// such pages are remembered here so the next upload of the page does not overwrite them in the
+// arena with the guest's older copy.
+bool SkipNoOverlapEnabled() {
+    static const bool enabled = [] {
+        // Off by default: it made fighters' skin vanish (run70/71), no FPS gain.
+        const char* env = std::getenv("BB_WRITE_SKIP_NO_OVERLAP");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+// ufc3: BB_WRITE_STEP (see ReadMemory). Off with BB_WRITE_STEP=0.
+bool WriteStepEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_WRITE_STEP");
+        const bool on = !env || env[0] != '0';
+        std::printf("GPU: single-stepped writes beside GPU data %s (BB_WRITE_STEP)\n", on ? "on" : "off");
+        return on;
+    }();
+    return enabled;
+}
+/// Pages with more GPU-written bytes than this (skinned vertices, whole GPU outputs) keep the
+/// download (measured: every page stepped made fights slower, 2500 steps/s). BB_WRITE_STEP_MAX_BYTES (default 256).
+u64 WriteStepMaxGpuBytes() {
+    static const u64 max_bytes = [] {
+        const char* env = std::getenv("BB_WRITE_STEP_MAX_BYTES");
+        return env ? std::strtoull(env, nullptr, 10) : 256ull;
+    }();
+    return max_bytes;
+}
+std::atomic<u64> stepped_write_faults{0}, stepped_write_uploads{0}, stepped_write_conflicts{0};
+// ufc3: why GPU-page write faults were not stepped (frame stats "Stepped writes").
+std::atomic<u64> step_no_host{0}, step_no_near{0}, step_no_big{0}, step_no_burst{0}, step_no_other{0};
+std::atomic<u64> window_opens{0};
+
+// ufc3 (BB_WRITE_STEP): gpu_modified_ranges is written on the GPU side; faulting threads read
+// it under this lock to decide a single step themselves (a command to the GPU thread drains the
+// draw pipe first: ~400 drains/s in fights). Writers take it exclusively, only around changes.
+std::shared_mutex gpu_ranges_mutex;
+// ufc3 (BB_READBACK_INORDER=1, experimental, default off): readbacks run as ordered tasks on
+// the draw recording thread (Liverpool::SendInOrderCommand) instead of after a drain of the
+// command thread. Measured (run98): the command drains go, but the recording thread then waits
+// for the GPU (83 % busy) and the command thread waits for it instead: fights 95 vs 105-113.
+bool ReadbackInOrder() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_READBACK_INORDER");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+std::mutex keep_gpu_mutex;
+RangeSet keep_gpu_bytes;
+std::atomic<u64> skipped_write_downloads{0};
+
 enum class TwinRun { None, Unchanged, Changed };
 
 /// Calls func(start, end, TwinRun) over [begin, end) in order (twins_mutex held).
@@ -307,7 +366,12 @@ void ForEachTwinRun(VAddr begin, VAddr end, Func&& func) {
         if (cursor < from) {
             func(cursor, from, TwinRun::None);
         }
-        const u8* guest = reinterpret_cast<const u8*>(from);
+        // ufc3: read through the backing view; GPU-written pages are read-protected with
+        // precise readbacks and a fault here (twins_mutex held) deadlocked the GPU thread.
+        thread_local std::vector<u8> guest_copy;
+        guest_copy.resize(to - from);
+        runtime_memory_read_backing(from, guest_copy.data(), to - from);
+        const u8* guest = guest_copy.data();
         const u8* twin = it->second.data() + (from - start);
         VAddr run = from;
         bool same = guest[0] == twin[0];
@@ -406,6 +470,23 @@ bool GarlicInVram() {
     return on;
 }
 
+/// Read-only Garlic (type 3) with no GPU write in the block goes to VRAM on first bind.
+/// run80 proved the copy: in-place traffic fell, and the fight rendered unlit with the
+/// fighters missing (~65 FPS, worse than run79). CPU writes the GPU side never hears
+/// about stay stale in that copy. Off unless BB_GARLIC_READS_VRAM=1.
+bool GarlicReadsInVram() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_GARLIC_READS_VRAM");
+        const bool enabled = env && env[0] == '1';
+        if (enabled) {
+            std::printf("Guest memory: read-only Garlic blocks go to VRAM "
+                        "(BB_GARLIC_READS_VRAM=1; off by default, run80 was unlit)\n");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 void DisableGuestInPlace() {
     Detail::guest_in_place.store(2, std::memory_order_relaxed);
     Detail::write_tracking.store(0, std::memory_order_relaxed); // recomputed: now on
@@ -488,6 +569,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         std::printf("Guest memory: the PC memory model is off with this driver; the GPU uses copies "
                     "in VRAM (as BB_GUEST_IN_PLACE=0)\n");
     }
+    {
+        static BufferCache* discard_cache = this;
+        BbGuestHooks::InstallDiscardLocks(
+            [](u64 address, u64 size) { discard_cache->NoteDiscardRange(address, size); });
+    }
     if (GuestInPlace()) {
         static BufferCache* hooked_cache = this;
         BbGuestHooks::Install([](u64 address, u64 size) { hooked_cache->NoteFreshRange(address, size); });
@@ -533,10 +619,99 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() = default;
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
-    memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
-        ReadMemory(device_addr, size, true, assume_locks);
-    });
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks, bool* step) {
+    memory_tracker->InvalidateRegion(device_addr, size,
+                                     [this, device_addr, size, assume_locks, step] {
+                                         u32 reason = 0;
+                                         u64 gpu_bytes = 0;
+                                         if (step && DecideWriteStep(device_addr, size, assume_locks,
+                                                                     &reason, &gpu_bytes)) {
+                                             *step = true;
+                                             return;
+                                         }
+                                         if (!step) {
+                                             step_no_host.fetch_add(1, std::memory_order_relaxed);
+                                         }
+                                         PageManager::NoteReadbackSite(reason, device_addr, gpu_bytes);
+                                         ReadMemory(device_addr, size, true, assume_locks);
+                                     });
+}
+
+// ufc3 (BB_WRITE_STEP, default on): a guest write to a page that holds only a few GPU-written
+// bytes (a label or counter beside per-frame CPU data, 0x10013fd160 in UFC 3) and does not touch
+// them is single-stepped with the page open, instead of waiting for the GPU to finish and
+// downloading the page. The page stays GPU-modified and protected, so CPU reads of the GPU bytes
+// still read them back; the bytes the write changed go to VRAM (NoteSteppedWrite). Decided on
+// the faulting thread (gpu_ranges_mutex): no command to the GPU thread (it drains the draw pipe).
+// Bursts on one page (a memcpy) take the normal path.
+bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks, u32* reason,
+                                  u64* gpu_bytes_out) {
+    u32 why = 3;
+    u64 gpu_bytes = 0;
+    const auto out = [&] {
+        if (reason) {
+            *reason = why;
+        }
+        if (gpu_bytes_out) {
+            *gpu_bytes_out = gpu_bytes;
+        }
+    };
+    if (assume_locks || TwinsEnabled() || !WriteStepEnabled()) {
+        step_no_other.fetch_add(1, std::memory_order_relaxed);
+        out();
+        return false;
+    }
+    const bool windows = PageManager::WriteWindowsEnabled();
+    const bool from_guest = !windows || PageManager::FaultFromGuest();
+    const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+    constexpr u64 Margin = 16;
+    const VAddr near_begin = std::max(page, device_addr - std::min(device_addr - page, Margin));
+    const VAddr near_end =
+        std::min(page + TRACKER_BYTES_PER_PAGE, device_addr + std::max<u64>(size, 8) + Margin);
+    bool near = false;
+    {
+        std::shared_lock rl{gpu_ranges_mutex};
+        gpu_modified_ranges.ForEachInRange(page, TRACKER_BYTES_PER_PAGE,
+                                           [&](VAddr a, VAddr b) { gpu_bytes += b - a; });
+        gpu_modified_ranges.ForEachInRange(near_begin, near_end - near_begin,
+                                           [&](VAddr, VAddr) { near = true; });
+    }
+    // BB_WRITE_WINDOW: past the step limit (or a host copy, which cannot be stepped) the page
+    // stays open until the next submission.
+    if (windows && !near && gpu_bytes != 0 && (!from_guest || gpu_bytes > WriteStepMaxGpuBytes())) {
+        window_opens.fetch_add(1, std::memory_order_relaxed);
+        PageManager::RequestWindow();
+        return true;
+    }
+    if (near || gpu_bytes == 0 || gpu_bytes > WriteStepMaxGpuBytes()) {
+        (near ? step_no_near : gpu_bytes == 0 ? step_no_other : step_no_big)
+            .fetch_add(1, std::memory_order_relaxed);
+        why = near ? 2 : gpu_bytes == 0 ? 3 : 1;
+        out();
+        return false;
+    }
+    static std::mutex burst_mutex;
+    static std::unordered_map<VAddr, std::pair<u64, u32>> bursts;
+    std::scoped_lock lk{burst_mutex};
+    auto& burst = bursts[page];
+    const u64 tick = scheduler.CurrentTick();
+    if (burst.first != tick) {
+        burst = {tick, 0};
+    }
+    if (burst.second >= 8) {
+        if (windows) {
+            window_opens.fetch_add(1, std::memory_order_relaxed);
+            PageManager::RequestWindow();
+            return true;
+        }
+        step_no_burst.fetch_add(1, std::memory_order_relaxed);
+        why = 3;
+        out();
+        return false;
+    }
+    ++burst.second;
+    stepped_write_faults.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 // bbport: the game fills its per-frame buffers (constants, skinning output) sequentially and
@@ -588,15 +763,17 @@ void BufferCache::ExtendWriteFault(VAddr device_addr, u64 guest_rip) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
-void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    BbStats::readbacks.fetch_add(1, std::memory_order_relaxed);
+void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks,
+                             bool* step) {
     std::array<char, 16> requester{};
     if (Readbacks()) {
         pthread_getname_np(pthread_self(), requester.data(), requester.size());
     }
+    (void)step; // ufc3: steps are decided before (DecideWriteStep)
     const auto flush_request = [this, device_addr, size, is_write, requester] {
         readback_requester = requester.data();
         readback_is_write = is_write;
+        BbStats::readbacks.fetch_add(1, std::memory_order_relaxed);
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -631,8 +808,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                             // have been written since it was taken.
                             ForEachTwinRun(start, end, [&](VAddr from, VAddr to, TwinRun run) {
                                 if (run == TwinRun::None) {
-                                    const u8* guest = reinterpret_cast<const u8*>(from);
-                                    twins[from] = std::vector<u8>(guest, guest + (to - from));
+                                    std::vector<u8> snapshot(to - from); // ufc3: backing read
+                                    runtime_memory_read_backing(from, snapshot.data(), to - from);
+                                    twins[from] = std::move(snapshot);
                                 }
                             });
                         });
@@ -657,13 +835,64 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                 download_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
             }
         }
-        DownloadMemory(arena, download_start, download_end - download_start);
+        // ufc3 (as eltutz/shadPS4 upstream): a CPU *write* fault downloads only the pages it
+        // touches. The 512 KB window made RenderThread's per-frame writes at 0x1001380000 wait
+        // (a full GPU finish, ~100/s) for tiny GPU writes ~500 KB away on other pages.
+        // BB_READBACK_WRITE_WINDOW=1 restores the window for writes.
+        static const bool write_window = [] {
+            const char* e = std::getenv("BB_READBACK_WRITE_WINDOW");
+            return e && e[0] == '1';
+        }();
+        if (is_write && !write_window) {
+            download_start = std::max(download_start,
+                                      Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE));
+            download_end = std::min(download_end,
+                                    Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE));
+        }
+        bool skip_download = false;
+        if (is_write && !TwinsEnabled() && SkipNoOverlapEnabled()) {
+            bool overlap = false;
+            gpu_modified_ranges.ForEachInRange(device_addr, size,
+                                               [&](VAddr, VAddr) { overlap = true; });
+            // Only pages where the GPU wrote a few bytes (labels, counters): pages full of GPU
+            // output (skinned vertices) must keep the normal download, or the game reads or
+            // uploads stale data (fighters turned black). BB_WRITE_SKIP_MAX_BYTES (default 64).
+            static const u64 max_gpu_bytes = [] {
+                const char* env = std::getenv("BB_WRITE_SKIP_MAX_BYTES");
+                return env ? std::strtoull(env, nullptr, 10) : 64ull;
+            }();
+            const VAddr page_begin = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+            const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+            u64 page_gpu_bytes = 0;
+            gpu_modified_ranges.ForEachInRange(page_begin, page_end - page_begin,
+                                               [&](VAddr a, VAddr b) { page_gpu_bytes += b - a; });
+            if (!overlap && page_gpu_bytes <= max_gpu_bytes) {
+                std::scoped_lock lk{keep_gpu_mutex};
+                gpu_modified_ranges.ForEachInRange(
+                    page_begin, page_end - page_begin,
+                    [&](VAddr start, VAddr end) { keep_gpu_bytes.Add(start, end - start); });
+                skip_download = true;
+                skipped_write_downloads.fetch_add(1, std::memory_order_relaxed);
+                // The page stops being GPU-modified for the tracker (a page that is both GPU-
+                // and CPU-modified asks for write-only protection); the bytes the GPU owns are
+                // tracked byte-exact in keep_gpu_bytes / gpu_modified_ranges instead.
+                memory_tracker->UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+            }
+        }
+        if (!skip_download) {
+            DownloadMemory(arena, download_start, download_end - download_start);
+        }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     };
-    if (assume_locks) {
+    // bbport: stage B of the draw pipe runs packets for the command processor (an EOP's image
+    // downloads under BB_GUEST_IN_PLACE invalidate here), while the command processor may be
+    // draining the pipe: sending the request to it would deadlock, so it runs in place.
+    if (assume_locks || Vulkan::DrawPipe::OnStageB()) {
         flush_request();
+    } else if (ReadbackInOrder()) {
+        liverpool->SendInOrderCommand(flush_request);
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
     }
@@ -688,7 +917,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             total_size_bytes += (new_size + align - 1) & mask;
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
+        { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(address, size); }
     });
     if (total_size_bytes == 0) {
         return;
@@ -992,7 +1221,33 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             BbStats::buffer_upload_bytes.load(std::memory_order_relaxed) - uploaded_before;
     }
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Add(device_addr, size); }
+        // ufc3 (BB_WATCH_GPU_WRITE=<hex address>[,<hex address>...]): written bindings over a page.
+        static const std::vector<VAddr> watch = [] {
+            std::vector<VAddr> pages;
+            if (const char* env = std::getenv("BB_WATCH_GPU_WRITE")) {
+                for (const char* p = env; *p;) {
+                    char* end = nullptr;
+                    const VAddr a = std::strtoull(p, &end, 16);
+                    if (end == p) break;
+                    pages.push_back(a & ~VAddr{4095});
+                    p = *end == ',' ? end + 1 : end;
+                }
+            }
+            return pages;
+        }();
+        for (const VAddr page : watch) {
+            if (device_addr < page + 4096 && page < device_addr + size) {
+                static std::atomic<u32> printed{0};
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 40) {
+                    std::printf("GPU write watch: page %#llx inside written binding [%#llx, +%#llx) "
+                                "texel %d, tick %llu\n",
+                                (unsigned long long)page, (unsigned long long)device_addr,
+                                (unsigned long long)size, int(is_texel_buffer),
+                                (unsigned long long)scheduler.CurrentTick());
+                }
+            }
+        }
         WriteTicks().Note(device_addr, size, scheduler.CurrentTick());
         if (Readbacks()) {
             written_bindings[written_head.fetch_add(1) % written_bindings.size()] =
@@ -1418,7 +1673,7 @@ void BufferCache::EvictVramBlock(u64 block) {
     }
     resident_ranges.Subtract(block, block + 1);
     memory_tracker->UnmarkRegionAsGpuModified(address, block_size);
-    gpu_modified_ranges.Subtract(address, block_size);
+    { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(address, block_size); }
     memory_tracker->MarkRegionAsCpuModified(address, block_size);
     ReleaseResidencySlot(memory, offset);
     // After the work submitted so far: it may still read the block.
@@ -1513,7 +1768,19 @@ bool BufferCache::VramEligible(u64 block, bool garlic_known) {
                                });
         // Any memory type: what decides is that every write there is one we hear of (Onion data
         // the CPU keeps writing is written by code we do not hear of, so it is not known data).
-        return known;
+        if (known) {
+            return true;
+        }
+        // Read-only Garlic. A GPU write anywhere in the block keeps it in place until the whole
+        // block is known data (the check above). `garlic_known` from BindInPlace is not trusted
+        // here: with write tracking off that caller passes true for every memory type.
+        if (!GarlicReadsInVram() ||
+            gpu_write_seen.Overlaps(block << block_shift, (block + 1) << block_shift)) {
+            return false;
+        }
+        int prot = 0, type = -1;
+        uintptr_t vma_end = 0;
+        return runtime_memory_vma_info(block << block_shift, &prot, &type, &vma_end) && type == 3;
     }
     int prot = 0, type = -1;
     uintptr_t vma_end = 0;
@@ -1757,6 +2024,42 @@ void BufferCache::NoteFreshRange(VAddr addr, u64 size) {
     assets_pending.store(true, std::memory_order_release);
 }
 
+namespace {
+std::atomic<u64> discard_locks{0}, discard_gpu_bytes{0}, discard_pages_cleared{0};
+} // namespace
+
+void BufferCache::NoteDiscardRange(VAddr addr, u64 size) {
+    discard_locks.fetch_add(1, std::memory_order_relaxed);
+    u64 dead = 0;
+    std::array<VAddr, 8> clear{};
+    std::size_t n = 0;
+    {
+        std::unique_lock rl{gpu_ranges_mutex};
+        gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr a, VAddr b) { dead += b - a; });
+        if (dead == 0) {
+            return;
+        }
+        gpu_modified_ranges.Subtract(addr, size);
+        // Pages with no GPU bytes left stop being GPU-modified: their next write needs no readback.
+        const VAddr first = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+        for (VAddr page = first; page < addr + size && n < clear.size();
+             page += TRACKER_BYTES_PER_PAGE) {
+            bool any = false;
+            gpu_modified_ranges.ForEachInRange(page, TRACKER_BYTES_PER_PAGE,
+                                               [&](VAddr, VAddr) { any = true; });
+            if (!any) {
+                clear[n++] = page;
+            }
+        }
+    }
+    // Outside gpu_ranges_mutex (the tracker's page locks are taken before it elsewhere).
+    for (std::size_t i = 0; i < n; ++i) {
+        memory_tracker->UnmarkRegionAsGpuModified(clear[i], TRACKER_BYTES_PER_PAGE);
+    }
+    discard_pages_cleared.fetch_add(n, std::memory_order_relaxed);
+    discard_gpu_bytes.fetch_add(dead, std::memory_order_relaxed);
+}
+
 void BufferCache::NoteCpuWriteRange(VAddr addr, u64 size) {
     if (!GuestInPlace() || size == 0) {
         return;
@@ -1788,6 +2091,7 @@ void BufferCache::ProcessPendingAssets() {
             }
             asset_bytes.Subtract(addr, addr + size);
             gpu_written_bytes.Subtract(addr, addr + size);
+            gpu_write_seen.Subtract(addr, addr + size);
             promote_candidates.Subtract(first, end);
             for (u64 block = first; block < end; ++block) {
                 const VAddr block_addr = block << block_shift;
@@ -1911,17 +2215,62 @@ void BufferCache::NotePreciseUpload(VAddr addr, u64 size) {
     late_writes_pending.store(true, std::memory_order_release);
 }
 
+void BufferCache::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes) {
+    if (bytes.empty()) {
+        return;
+    }
+    std::scoped_lock lk{late_writes_mutex};
+    stepped_writes.emplace_back(addr, std::move(bytes));
+    late_writes_pending.store(true, std::memory_order_release);
+}
+
 void BufferCache::ProcessLateWrites() {
     if (!late_writes_pending.load(std::memory_order_acquire)) {
         return;
     }
     std::vector<std::pair<VAddr, u64>> uploads;
-    std::vector<std::pair<VAddr, std::vector<u8>>> writes;
+    std::vector<std::pair<VAddr, std::vector<u8>>> writes, stepped;
     {
         std::scoped_lock lk{late_writes_mutex};
         writes.swap(late_writes);
         uploads.swap(precise_uploads);
+        stepped.swap(stepped_writes);
         late_writes_pending.store(false, std::memory_order_release);
+    }
+    // ufc3 (BB_WRITE_STEP): the changed bytes of a single-stepped CPU write, in 4-byte words
+    // (vkCmdUpdateBuffer). A word with GPU-owned bytes is not uploaded (the guest copy of the GPU
+    // part is stale); such conflicts are counted (frame stats "stepped writes").
+    for (const auto& [addr, bytes] : stepped) {
+        const u64 size = bytes.size();
+        const u64 first = addr >> block_shift, last = (addr + size - 1) >> block_shift;
+        if (((addr | size) & 3) != 0 || !resident_ranges.Contains(first, last + 1) ||
+            in_place_blocks.Overlaps(first, last + 1)) {
+            continue; // not in VRAM: the next upload of the page reads the guest's bytes
+        }
+        const auto* arena = GetArena(first, last);
+        for (u64 at = 0; at < size;) {
+            u64 run = 0;
+            bool conflict = false;
+            gpu_modified_ranges.ForEachInRange(addr + at, 4, [&](VAddr, VAddr) { conflict = true; });
+            if (conflict) {
+                stepped_write_conflicts.fetch_add(1, std::memory_order_relaxed);
+                at += 4;
+                continue;
+            }
+            while (at + run < size) {
+                bool next_conflict = false;
+                gpu_modified_ranges.ForEachInRange(addr + at + run, 4,
+                                                   [&](VAddr, VAddr) { next_conflict = true; });
+                if (next_conflict) {
+                    break;
+                }
+                run += 4;
+            }
+            runtime.UpdateBuffer(arena, arena->Offset(addr + at),
+                                 std::span<const u8>(bytes.data() + at, run));
+            stepped_write_uploads.fetch_add(1, std::memory_order_relaxed);
+            at += run;
+        }
     }
     for (const auto& [addr, bytes] : writes) {
         const u64 size = bytes.size();
@@ -2022,7 +2371,14 @@ bool BufferCache::UpdateGpuWritten(VAddr addr, std::span<const u8> data) {
 }
 
 void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
-    if (size == 0 || gpu_written_bytes.Contains(addr, addr + size)) {
+    if (size == 0) {
+        return;
+    }
+    // Before the 3-frame rule, so a buffer written once is not promoted as a read-only Garlic block.
+    if (!gpu_write_seen.Contains(addr, addr + size)) {
+        gpu_write_seen.Add({addr, addr + size});
+    }
+    if (gpu_written_bytes.Contains(addr, addr + size)) {
         return;
     }
     // Only what the GPU writes regularly (in 3 frames of 60) is its data, like a default heap: a
@@ -2118,7 +2474,7 @@ void BufferCache::QueueCopyBacks(u64 submitted) {
             }
         }
         memory_tracker->UnmarkRegionAsGpuModified(address, block_size);
-        gpu_modified_ranges.Subtract(address, block_size);
+        { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(address, block_size); }
         memory_tracker->MarkRegionAsCpuModified(address, block_size);
         BbStats::copied_back_blocks.fetch_add(1, std::memory_order_relaxed);
         moved = true;
@@ -2148,7 +2504,7 @@ void BufferCache::QueuePromotions(u64 submitted) {
             continue;
         }
         memory_tracker->UnmarkRegionAsGpuModified(address, block_size);
-        gpu_modified_ranges.Subtract(address, block_size);
+        { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(address, block_size); }
         const auto [memory, offset] = AllocateResidency(block_size);
         Backing backing;
         backing.start = block;
@@ -2195,6 +2551,31 @@ void BufferCache::UnmapInPlace(VAddr addr, u64 size) {
 
 void BufferCache::Maintain() {
     maintained_epoch = packet_epoch;
+    // ufc3 (BB_WRITE_STEP): a line every 5 s while writes are being single-stepped.
+    static auto last_report = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - last_report > std::chrono::seconds(5)) {
+        last_report = now;
+        const u64 faults = stepped_write_faults.exchange(0, std::memory_order_relaxed);
+        if (faults != 0) {
+            std::printf("Stepped writes: %.1f/s instead of a readback, %.1f uploads/s, %llu conflicts; "
+                        "not stepped/s: host copy %.1f, near GPU bytes %.1f, page > max bytes %.1f, "
+                        "burst %.1f, other %.1f\n",
+                        faults / 5.0, stepped_write_uploads.exchange(0) / 5.0,
+                        (unsigned long long)stepped_write_conflicts.exchange(0),
+                        step_no_host.exchange(0) / 5.0, step_no_near.exchange(0) / 5.0,
+                        step_no_big.exchange(0) / 5.0, step_no_burst.exchange(0) / 5.0,
+                        step_no_other.exchange(0) / 5.0);
+            if (const u64 opens = window_opens.exchange(0)) {
+                std::printf("Write windows: %.1f/s opened instead of a readback\n", opens / 5.0);
+            }
+            if (const u64 locks = discard_locks.exchange(0)) {
+                std::printf("Discard locks: %.1f/s, %.1f KB/s of dead GPU bytes dropped, %.1f pages/s "
+                            "no longer GPU-modified\n",
+                            locks / 5.0, discard_gpu_bytes.exchange(0) / 5.0 / 1024.0,
+                            discard_pages_cleared.exchange(0) / 5.0);
+            }
+        }
+    }
     ProcessPendingUnmaps();
     ProcessIdleBlocks();
     ProcessDemotions();
@@ -2219,6 +2600,7 @@ void BufferCache::ProcessPendingUnmaps() {
         IntervalList<> unbind;
         asset_bytes.Subtract(first << block_shift, end << block_shift);
         gpu_written_bytes.Subtract(first << block_shift, end << block_shift);
+        gpu_write_seen.Subtract(first << block_shift, end << block_shift);
         copy_back_blocks.Subtract(first, end);
         promote_candidates.Subtract(first, end);
         idle_demoted.Subtract(first, end);
@@ -2243,6 +2625,7 @@ void BufferCache::ProcessPendingUnmaps() {
             in_place_blocks.Subtract(range.start, range.end);
             asset_bytes.Subtract(range.start << block_shift, range.end << block_shift);
             gpu_written_bytes.Subtract(range.start << block_shift, range.end << block_shift);
+            gpu_write_seen.Subtract(range.start << block_shift, range.end << block_shift);
             promote_candidates.Subtract(range.start, range.end);
         }
         // bbport: blocks wholly unmapped that have a VRAM copy leave VRAM too (their slots go
@@ -2304,6 +2687,38 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             total_size_bytes += size;
         },
         [&] {
+            // ufc3: bytes kept for the GPU (see SkipNoOverlapEnabled) and still GPU-modified are
+            // not uploaded; kept bytes the GPU no longer owns are forgotten.
+            if (SkipNoOverlapEnabled() && !copies.empty()) {
+                std::scoped_lock lk{keep_gpu_mutex};
+                if (!keep_gpu_bytes.Empty()) {
+                    boost::container::small_vector<vk::BufferCopy, 4> kept;
+                    u64 offset = 0;
+                    for (const auto& copy : copies) {
+                        VAddr at = copy.dstOffset;
+                        const VAddr end = copy.dstOffset + copy.size;
+                        const auto emit = [&](VAddr from, VAddr to) {
+                            if (from < to) {
+                                kept.push_back({offset, from, to - from});
+                                offset += to - from;
+                            }
+                        };
+                        keep_gpu_bytes.ForEachInRange(at, end - at, [&](VAddr ks, VAddr ke) {
+                            bool still_gpu = false;
+                            gpu_modified_ranges.ForEachInRange(ks, ke - ks,
+                                                               [&](VAddr, VAddr) { still_gpu = true; });
+                            if (still_gpu) {
+                                emit(at, std::max(at, ks));
+                                at = std::max(at, ke);
+                            }
+                        });
+                        emit(at, end);
+                        keep_gpu_bytes.Subtract(copy.dstOffset, copy.size);
+                    }
+                    copies.assign(kept.begin(), kept.end());
+                    total_size_bytes = offset;
+                }
+            }
             // bbport (BB_GPU_WRITE_TWINS): bytes whose guest copy still matches its twin keep the
             // GPU's data in the arena; twin bytes the guest wrote since are uploaded and no
             // longer GPU-modified.
@@ -2322,7 +2737,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                            }
                                            if (run == TwinRun::Changed) {
                                                twin_guest_bytes.fetch_add(to - from);
-                                               gpu_modified_ranges.Subtract(from, to - from);
+                                               { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(from, to - from); }
                                                changed.emplace_back(from, to);
                                            }
                                            kept.push_back({offset, from, to - from});
@@ -2690,6 +3105,18 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     const u64 signal_tick = memory_semaphore.NextTick();
     const auto signal_sema = memory_semaphore.Handle();
     info.AddWait(signal_sema, signal_tick);
+    {   // ufc3: trace arena binds (the submission waits for them; they may wait for a work tick)
+        static std::atomic<u32> traced{0};
+        const u32 n = traced.fetch_add(1, std::memory_order_relaxed);
+        if (n < 40 || wait_tick >= submitted) {
+            std::printf("Arena bind: wait work tick %llu, submission tick %llu, current %llu, gpu %llu, mem signal %llu%s\n",
+                        (unsigned long long)wait_tick, (unsigned long long)submitted,
+                        (unsigned long long)scheduler.CurrentTick(),
+                        (unsigned long long)scheduler.GetWorkSemaphore()->KnownGpuTick(),
+                        (unsigned long long)signal_tick, wait_tick >= submitted ? "  <-- waits for itself or later" : "");
+            std::fflush(stdout);
+        }
+    }
 
     // The binds go into the queue right before the submission (BB_ASYNC_SUBMIT: later, from a
     // recording thread), after the submissions still on their way there.
@@ -2720,7 +3147,19 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
             .signalSemaphoreCount = 1u,
             .pSignalSemaphores = &signal_sema,
         };
+        u64 bound_bytes = 0;
+        for (const auto& arena_binds : *binds) {
+            for (const auto& b : arena_binds.binds) bound_bytes += b.size;
+        }
+        // ufc3 experiment: BB_UFC3_BIND_IDLE=1 drains the queue before each sparse bind.
+        static const bool bind_idle = [] { const char* e = std::getenv("BB_UFC3_BIND_IDLE"); return e && e[0] == '1'; }();
+        if (bind_idle) {
+            (void)instance.GetGraphicsQueue().waitIdle();
+        }
         auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        std::printf("Arena bind %llu: %zu arenas, %llu MiB, result %s\n", (unsigned long long)signal_tick,
+                    binds->size(), (unsigned long long)(bound_bytes >> 20), vk::to_string(submit_result).c_str());
+        std::fflush(stdout);
         if (submit_result == vk::Result::eErrorDeviceLost) {
             Vulkan::Breadcrumbs::ReportDeviceLost("submit");
         }

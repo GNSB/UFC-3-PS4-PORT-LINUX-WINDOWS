@@ -30,6 +30,12 @@ constexpr u64 AllocReturn = 0x26aa255;
 constexpr unsigned char AllocReturnCode[4] = {0x48, 0x83, 0xc4, 0x18};
 RangeCallback on_range_allocated = nullptr;
 
+/// ufc3: `mov [r14], rax` after the discard lock's ring allocation (0xf41ff call 0xf4240): rax the
+/// fresh range, [rbx + 0x84] the buffer size, r14 the lock's output.
+constexpr u64 DiscardLockStore = 0xf4204;
+constexpr unsigned char DiscardLockStoreCode[3] = {0x49, 0x89, 0x06};
+RangeCallback on_discard = nullptr;
+
 /// The game's other GPU memory heap (TLSF-like, headers in the memory: free at 0x20858a0, alloc at
 /// 0x2085a60), reached through a pointer at 0x54b9f38 set at startup. Its only three callers
 /// (wrappers that record {address, size} in a map) pass r8 = rbp - 0x50 for the size handed out and
@@ -71,6 +77,16 @@ struct sigaction previous_action {};
 void OnTrap(int sig, siginfo_t* info, void* context) {
     auto* g = static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
     const u64 rip = u64(g[REG_RIP]) - 1; // past the int3
+    if (on_discard && rip == ImageBase + DiscardLockStore) {
+        const u64 address = u64(g[REG_RAX]);
+        *reinterpret_cast<u64*>(g[REG_R14]) = address;
+        const std::uint32_t size = *reinterpret_cast<const std::uint32_t*>(u64(g[REG_RBX]) + 0x84);
+        if (address != 0 && size != 0) {
+            on_discard(address, size);
+        }
+        g[REG_RIP] = greg_t(ImageBase + DiscardLockStore + sizeof(DiscardLockStoreCode));
+        return;
+    }
     if (rip == ImageBase + ReleaseCheck) {
         const auto result = static_cast<std::int32_t>(g[REG_RAX] & 0xffffffff);
         BbHeapSites::NoteReleaseCheck(std::uint32_t(result));
@@ -210,6 +226,30 @@ void Install(RangeCallback on_gpu_range_allocated) {
         Patch(ImageBase + ReleaseCheck, ReleaseCheckCode, sizeof(ReleaseCheckCode));
     }
 }
+
+void InstallDiscardLocks(RangeCallback callback) {
+    static std::atomic<bool> installed{false};
+    if (installed.exchange(true)) {
+        return;
+    }
+    const char* env = std::getenv("BB_DISCARD_HOOK");
+    if (!env || env[0] != '1') {
+        return;
+    }
+    struct sigaction action {};
+    action.sa_sigaction = OnTrap;
+    action.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&action.sa_mask);
+    struct sigaction old {};
+    sigaction(SIGTRAP, &action, &old);
+    if (old.sa_sigaction != OnTrap) {
+        previous_action = old;
+    }
+    on_discard = callback;
+    const bool ok = Patch(ImageBase + DiscardLockStore, DiscardLockStoreCode, sizeof(DiscardLockStoreCode));
+    std::printf("Guest hooks: dynamic buffer discard locks %s (BB_DISCARD_HOOK)\n",
+                ok ? "report their fresh ranges" : "not found");
+}
 } // namespace BbGuestHooks
 #else
 // Windows: the hooks patch guest code and use SIGTRAP single-stepping (Linux). For CTR none of the
@@ -220,5 +260,6 @@ namespace BbGuestHooks {
 void Install(RangeCallback) {
     if (std::getenv("BB_HEAP_HOOKS") || std::getenv("BB_HEAP_SITES")) std::puts("BB_HEAP_HOOKS/BB_HEAP_SITES are not available on this host (Linux signals)");
 }
+void InstallDiscardLocks(RangeCallback) {}
 } // namespace BbGuestHooks
 #endif

@@ -1,203 +1,174 @@
-# SacredFire
+# UFC 3 — PS4 port nativo para Linux y Windows
 
-SacredFire runs *Crash Team Racing: Nitro-Fueled* (PlayStation 4, CUSA13795, update 1.21) as a
-native x86-64 Linux executable. It is built on [bbport](https://github.com/deadinside28/bloodborne_pc)
-(GPL-2.0-or-later), the native Linux port of Bloodborne: the game's own code runs on the CPU, a
-small runtime replaces the PS4 system libraries, and a renderer derived from
-[shadPS4](https://github.com/shadps4-emu/shadPS4) translates the PS4 GPU work to Vulkan.
-Developed and tested on a Steam Deck.
+**EA SPORTS UFC 3** (PlayStation 4, `CUSA06534`, actualización **1.14**) ejecutándose como
+programa **nativo x86-64** en Linux y Windows. No es un emulador de CPU: el código original del
+juego corre directamente en el procesador del PC, un runtime propio reemplaza las librerías del
+sistema de la PS4 y un renderer derivado de [shadPS4](https://github.com/shadps4-emu/shadPS4)
+traduce el trabajo de la GPU de la PS4 a Vulkan.
 
-> **No game files are included.** You need your own dump of the game and its 1.21 update. Both
-> builds of the 1.21 update are accepted: the one for firmware 5.05 and the one for 6.72+ (the
-> game patches find their sites by signature, so they apply on either).
-> This project is not affiliated with or endorsed by Sony Interactive Entertainment, Activision
-> or Beenox. *Crash Team Racing*, *Nitro-Fueled* and *PlayStation* are trademarks of their
-> owners, named here only to identify the game this software runs.
+Está construido sobre [SacredFire](https://github.com/T3CHNOLOG1C/SacredFire) (Crash Team
+Racing: Nitro-Fueled), que a su vez viene de [bbport](https://github.com/deadinside28/bloodborne_pc),
+el port nativo de Bloodborne. Todo el código es GPL-2.0-or-later.
 
-**Status: playable.** Menus, arcade and adventure races with sound, controller and saving; split
-screen with a second controller; fur and the sky render correctly. 30 FPS as on the PS4, or the
-60 FPS patch from the in-game menu (60 FPS in menus, 37–45 FPS in races on the Steam Deck). A
-full play-through has not been verified, and the Steam Deck (RADV) is the only tested machine.
+> **No incluye archivos del juego.** Necesitas tu propio dump de UFC 3 (`CUSA06534`) y su
+> actualización 1.14. Este proyecto no está afiliado ni respaldado por Electronic Arts, Sony
+> Interactive Entertainment ni la UFC. *EA SPORTS UFC*, *PlayStation* y las marcas relacionadas
+> pertenecen a sus dueños y se nombran solo para identificar el juego.
 
-## How it works
+---
 
-- **Native execution.** The eboot is converted offline (`scripts/`) into a flat memory image
-  with the game's own PS4 libc, libSceFios2 and libSceNpToolkit2 linked in as native code. No
-  CPU emulation: the game code runs at full speed.
-- **A runtime for this game** (`src/runtime_*.c`) implements the PS4 OS functions the game calls:
-  memory, threads, synchronisation, event flags, files, audio (ATRAC9 included), pad, saves,
-  user service, network stubs. Imports are resolved by NID and library name; the names come
-  from shadPS4's aerolib list, fetched once at the first start.
-- **GPU** (`gpu/`): the vendored shadPS4 video core and shader recompiler with bbport's
-  multi-threaded command processing (decode and draw recording on separate threads) and
-  SacredFire's fixes: geometry-shader ring addressing (fur), 1D textures lowered to 2D (the
-  sky's colour LUT), texture overlap resolution at 1080p, PM4 stream resynchronisation, a
-  reliable on-disk shader cache.
-- **Game patches** from [illusionyy/PS-Game-Patch](https://github.com/illusionyy/PS-Game-Patch)
-  (`patches/CrashTeamRacing.xml`, authors illusion and TroyWarez) are compiled at start:
-  60 FPS unlock, motion blur off, 1080p in PS4 Pro mode (the published address of that one was
-  off by one byte; our copy is corrected).
+## Estado
 
-## Requirements
+**Jugable.** Menús, carga, peleas (incluida la pelea de demostración del menú), sonido, control
+y partidas guardadas.
 
-- Linux x86-64 with a Vulkan 1.3 GPU. Tested: Steam Deck (AMD Van Gogh, Mesa RADV). Geometry
-  shaders are required (fur), so macOS/MoltenVK is out; see
-  [docs/sacredfire/10-other-platforms.md](docs/sacredfire/10-other-platforms.md).
-- Your decrypted dump of CUSA13795 with the 1.21 update merged in: copy the dumped update over
-  the base game, replacing files (eboot.bin and sce_sys too). The launcher and `run.sh` check
-  the executable image and say what is missing (`BB_SKIP_GAME_CHECK=1` skips the check).
-- To build: GCC, CMake, Ninja, Python 3, glslang, SDL3, Vulkan headers and the libraries in
-  `shell.nix` (with [Nix](https://nixos.org), `shell.nix` provides them). On Arch:
-  `tools/deps.sh` fetches the header-only libraries the distribution lacks. FFmpeg is no
-  longer needed: the AvPlayer video libraries are Bloodborne's and CTR imports none of them
-  (`-DBB_AVPLAYER=ON` builds them again).
+| Escena | Linux · Ryzen 5 5600 + RTX 4070 | Windows · Omen 16 (RTX 3060 Laptop, 6 GB) |
+|---|---|---|
+| Menús / pantallas de carga | 240 FPS (el tope del propio juego) | 240 FPS (modo de presentación *Immediate*) |
+| Pelea, sin límite de FPS | **137–196 FPS** | 66–83 FPS antes de las ventanas de escritura; pendiente medir el zip nuevo |
+| Pelea, límite 120 | 120 FPS estables | — |
 
-## Build and run
+- Se probó en NVIDIA (Linux y Windows). El código de AMD es el mismo de SacredFire (que se
+  desarrolló en AMD / Steam Deck), pero **UFC 3 no se ha probado todavía en una GPU AMD**.
+- Problemas conocidos: ruido/bloques grises en el piso del octágono; los videos tutoriales del
+  primer arranque no se pueden saltar; mover la ventana a otro monitor *durante el arranque*
+  puede botar el driver de NVIDIA (`Swapchain::Destroy`).
+
+## Requisitos
+
+- CPU x86-64 con AVX (el código del juego, compilado para el Jaguar de la PS4, usa AVX).
+- GPU con Vulkan 1.3. Recomendado ≥ 6 GB de VRAM (con menos se activa un recolector de
+  texturas más agresivo).
+- Dump del juego: carpeta base `CUSA06534` y la actualización 1.14, por ejemplo:
+
+  ```
+  PS4/CUSA06534          (juego base, eboot.bin)
+  PS4/CUSA06534-patch    (actualización 1.14; también vale -PATCH, -update, _patch…)
+  ```
+
+  `scripts/merge_update.py` las une automáticamente en `CUSA06534-merged` usando *hard links*
+  (no ocupa espacio extra; en discos sin hard links copia los archivos).
+
+## Windows
+
+1. Descarga o compila el zip (`dist/UFC3Native-windows-x86_64.zip`, ver *Compilar*) y
+   descomprímelo.
+2. Abre **`UFC3.exe`**. Elige la carpeta `CUSA06534` (la base; la actualización al lado se
+   detecta sola) y pulsa **Play**.
+3. La primera vez se prepara el juego (unos segundos) en `%LOCALAPPDATA%\UFC3Native`. Los logs
+   de cada partida quedan en `%LOCALAPPDATA%\UFC3Native\logs\`.
+
+### Opciones del launcher (estilo port de God of War III)
+
+| Opción | Valores | Notas |
+|---|---|---|
+| Resolución | 720p / 1080p | Resolución interna de render. |
+| Límite de FPS | 60 / 120 / 144 / 240 / **Ilimitado** | El juego no pasa de 240. |
+| Modo de presentación | Mailbox / VSync (FIFO) / **Immediate** | En NVIDIA, Mailbox se queda en 2× la tasa del monitor; Immediate deja llegar a 240 (puede haber *tearing*). |
+| Escalado | Off / AMD FSR 1.0 | Para usar resolución interna menor que la del monitor. |
+| Nitidez (RCAS) | Off / Baja / Media / Alta | |
+| Contador de FPS | sí / no | Arriba a la izquierda. |
+
+Las variables de entorno que el usuario ya tenga definidas tienen prioridad sobre el launcher.
+
+## Linux
 
 ```bash
-git clone --recursive https://github.com/T3CHNOLOG1C/SacredFire.git && cd SacredFire
-bash build.sh                        # out/sacredfire and out/gpu/libbbgpu.so (~40 CPU-minutes)
-BB_GAME_DIR=/path/to/CUSA13795 bash run.sh
+# dependencias: compilador C/C++, CMake, Vulkan, SDL3 y Python 3 (ver shell.nix / build.sh)
+git clone <este repo> ufc3 && cd ufc3
+git submodule update --init --recursive
+bash build.sh                                       # compila runtime + renderer
+python3 scripts/merge_update.py /ruta/PS4/CUSA06534 # une base + 1.14 -> /ruta/PS4/CUSA06534-merged
+BB_GAME_DIR=/ruta/PS4/CUSA06534-merged bash run.sh  # por defecto busca orig/CUSA06534
 ```
 
-`run.sh` prepares the image (`out/`), compiles the selected patches, builds if needed and starts
-the game. The game folder defaults to `orig/CUSA13795`. Saves and the shader cache go to `user/`,
-settings to `bbport.ini`; `BB_DATA_DIR` moves all of them. The first start compiles shaders as it
-goes; later starts preload them from the cache (`BB_CLEAR_SHADER_CACHE=1` starts fresh).
+`run.sh` detecta el perfil `ufc3` y aplica los valores por defecto del juego; cualquier variable
+se puede sobrescribir en la línea de comandos (`BB_FPS_LIMIT=0 bash run.sh`).
 
-Or the launcher (pick the game folder and the controller, then *Start*):
+## Compilar el zip de Windows (desde Linux)
 
 ```bash
-bash launcher/bb-launcher.sh         # launcher/install-desktop.sh adds it to the app menu
+bash scripts/build-windows.sh                 # cross-compile con llvm-mingw, LTO activado
+BB_ALLOW_DIRTY=1 bash scripts/package-windows.sh
+# -> dist/UFC3Native-windows-x86_64.zip  (UFC3.exe, bin/, python embebido, scripts/)
 ```
 
-The launcher (GTK4/libadwaita) has pages for the game folder, the controller, the game patches,
-PS4 Pro mode, display (fullscreen, FPS counter) and developer switches (frame statistics, log to
-a file, clear the shader cache, Vulkan validation, extra environment), and shows the game's
-output. `--play` starts the game with the saved settings and no window (Steam Deck game mode).
-The menu entry and the launcher use the game's own icon (`sce_sys/icon0.png`), copied from your
-game folder into your icon theme; the game window shows it too.
+## Variables de entorno importantes
 
-**In-game menu** (Insert, or L3+R3 on the pad): game patches, controller ports for split
-screen, FPS counter, menu language. It is saved to `bbport.ini`; patches apply after a restart.
+| Variable | Defecto UFC 3 | Qué hace |
+|---|---|---|
+| `BB_FPS_LIMIT` | 0 en Windows (ilimitado), 120 en `run.sh` | Límite de FPS (0 = sin límite). |
+| `BB_PRESENT_MODE` | Immediate (Windows) | `Mailbox`, `Fifo` o `Immediate`. |
+| `BB_VBLANK_HZ` / `BB_FLIP_RATE` | 480 / 0 | El juego pide 30 Hz; con flip rate 0 y un vblank virtual alto corre a la tasa real (la simulación usa el tiempo real del frame). |
+| `BB_READBACKS` / `BB_READBACK_LINEAR` | 2 / 1 | Lecturas precisas de memoria escrita por la GPU (sin esto la pelea sale negra, igual que UFC 4 en shadPS4). |
+| `BB_WRITE_STEP` | 1 | Escrituras de la CPU junto a pocos bytes de la GPU se ejecutan paso a paso en vez de esperar a la GPU. |
+| `BB_WRITE_WINDOW` | 1 | Páginas compartidas CPU/GPU quedan abiertas para la CPU hasta el siguiente envío del juego; luego se sube solo lo que cambió (ver *Rendimiento*). |
+| `BB_GPU_WRITE_TWINS` | 0 | Incompatible con las lecturas precisas (deadlock). |
+| `BB_INTERNAL_WIDTH/HEIGHT`, `BB_FSR1`, `BB_RCAS` | según launcher | Resolución interna y escalado. |
+| `BB_FRAME_STATS` | 1 en `run.sh` | Estadísticas cada pocos segundos en el log (FPS, µs por draw, readbacks, sitios de escritura…). |
 
-**Controllers.** SDL3 gamepads; the launcher's *Controller* page or `BB_GAMEPAD=<GUID or part
-of the name>` picks the one for port 1, and the port switches to whichever pad was used last
-when the chosen one is missing. Split screen: assign pads to ports 2–4 in the in-game menu (or
-`port.N=<GUID>` in `bbport.ini`); each port logs a user in and out as the pad comes and goes.
-The keyboard works next to a gamepad: WASD left stick, arrow keys right stick, Space Cross,
-LShift Circle, E Square, Q Triangle, 1/3 L1/R1, R/F L2/R2, Z/C L3/R3, Enter Options, IJKL
-d-pad; `key.<input>=` and `pad.<input>=` lines in `bbport.ini` rebind them.
+## Cómo funciona
 
-**PS4 Pro mode** (`BB_NEO=1`, the launcher's switch): the game sees a PS4 Pro (7-CPU mode,
-5568 MiB of direct memory) and takes its Pro rendering path; with the 1080p patch it renders
-at 1920×1080. Off by default: the Steam Deck is closer to a base PS4.
+- **Ejecución nativa.** El `eboot.bin` se convierte offline (`scripts/prepare.py`,
+  `link_libc.py`, `link_modules.py`) en una imagen de memoria plana con la libc de la PS4 y
+  `libSceFios2` del propio juego enlazadas como código nativo. Los accesos TLS (`fs:`) se
+  reescriben (`gs:` en Linux, ranura TLS del TEB en Windows).
+- **Runtime** (`src/runtime_*.c`): memoria, hilos, mutex/semáforos/event flags, archivos,
+  audio (ATRAC9 y MP3 para el AJM), mando (SDL), partidas guardadas, servicios de usuario y
+  stubs de red/online. En Windows: mutex sobre SRWLOCK, timers de alta resolución,
+  `timeBeginPeriod(1)`, prioridad alta y EcoQoS desactivado.
+- **GPU** (`gpu/`): renderer de shadPS4 adaptado. Los comandos PM4 se decodifican en un hilo y
+  los draws se graban en Vulkan en otro (pipeline de dos etapas), con hilos de preparación de
+  draws y de grabación. La memoria que escribe la GPU se protege por páginas para que las
+  lecturas/escrituras de la CPU la mantengan coherente.
 
-**Mods:** loose-file mod folders (with the game's folders inside) are overlaid on the game
-folder at start, with enable switches and load order in `mods.json`
-(`scripts/mods.py`, [docs/MODS.md](docs/MODS.md), written for bbport). Further shadPS4-format
-patch files go into `patches/` or `BB_PATCHES_DIR`, selected through `patches.json`.
+## Rendimiento: qué se hizo en este port
 
-## AppImage (Steam Deck)
+1. **Frame rate desbloqueado.** El juego pide 30 Hz por su función de *present interval*
+   (guest `0x1182a0`); el port lo ignora y usa un vblank virtual de 480 Hz.
+2. **Windows a la par de Linux.** Los `Sleep` de Windows usaban el tick de 15,6 ms del
+   sistema; se reemplazaron por timers de alta resolución + espera activa de los últimos 100 µs
+   (el loop de presentación iba a la mitad de velocidad).
+3. **`BB_WRITE_STEP`.** Una escritura de la CPU en una página con ≤ 256 bytes escritos por la
+   GPU se ejecuta con la bandera de traza (TF) y solo se suben a VRAM las palabras que cambió,
+   en vez de esperar a la GPU y descargar la página. Los menús quedaron sin sincronización por
+   frame (240 FPS).
+4. **`BB_WRITE_WINDOW`** (la mejora grande de las peleas). Con un nuevo contador por sitio
+   ("Readback sites" en el log) se vio que casi todas las esperas venían del motor de EA: sus
+   buffers dinámicos (lock con descarte en `0x64b50` → `0xf4120`, por ejemplo las matrices de
+   huesos de 48 bytes de los luchadores) comparten página con pequeñas salidas de shaders
+   (p. ej. un binding de 408 bytes en `0x1001338ee0`). Cada escritura de la CPU forzaba
+   esperar a la GPU y leer la página. Ahora la página queda abierta para la CPU hasta el
+   siguiente `SubmitGfx`/`SubmitAsc`; ahí se vuelve a proteger, se compara con la copia tomada al
+   abrirla y se suben solo las palabras cambiadas (saltando las de la GPU). Resultado en Linux:
+   readbacks 380 → 120 por segundo y peleas de **105–113 a 137–196 FPS**.
+   Riesgo conocido: si el juego leyera los bytes de la GPU de una página abierta, vería datos
+   del envío anterior. Si ves algo raro: `BB_WRITE_WINDOW=0`.
 
-`packaging/appimage.sh` builds `dist/SacredFire-x86_64.AppImage` (about 430 MB) with Nix: the
-binaries are built in `nix-shell shell.nix` so the bundle can collect their libraries, then
-`nix bundle` packs them with the GTK launcher, Python and Mesa's Vulkan drivers (the header of
-the script has the exact steps). Running it opens the launcher; `--play` starts the game. Data
-lives in `~/.local/share/sacredfire`, launcher settings in `~/.config/sacredfire-launcher`.
-Without a game folder chosen, the launcher shows the Game row as *not chosen* with Play disabled
-until a folder passes the game check.
+La documentación técnica completa (diagnósticos, experimentos fallidos, mediciones) está en
+[`docs/ufc3/GROK_HANDOFF.md`](docs/ufc3/GROK_HANDOFF.md), [`docs/ufc3/HANDOFF.md`](docs/ufc3/HANDOFF.md)
+y [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 
-**Adding the AppImage to Steam**: the launcher's *Add to Steam* button (header bar, also under *Settings → Steam*) writes the
-shortcut (with `--play`, for the Steam Deck's game mode) while Steam is closed; by hand, *Add a
-Non-Steam Game* needs no options. The compatibility tool does not matter. Steam's overlay is removed before the port's own programs start. Where
-Steam runs games without FUSE, set the launch options to
+## Herramientas de diagnóstico
 
-```
-TMPDIR=$HOME/.cache APPIMAGE_EXTRACT_AND_RUN=1 NO_CLEANUP=1 %command%
-```
+- `tools/ufc3-iter.sh` — compila, ejecuta con timeout y resume dónde terminó.
+- `tools/ufc3-shot.sh salida.png` — captura solo la ventana del juego (Hyprland).
+- `BB_WATCH_GPU_WRITE=<dir>[,<dir>…]` — registra qué bindings escritos por la GPU cubren una página.
+- `BB_SKIP_SHADERS`, `BB_SKIP_FILE`, `BB_CAPTURE_ON_FLIP`, `BB_PATCH_SHADERS` — aislar shaders y
+  capturar frames.
+- `BB_DISCARD_HOOK=1` (experimental, Linux) — reporta los rangos que entrega el lock con descarte.
 
-The AppImage then unpacks itself (~1.2 GB, `~/.cache/appimage_extracted_*`) on the first start
-and reuses that copy; `TMPDIR` keeps that out of a RAM-backed `/tmp`. Add ` --play` after
-`%command%` to skip the launcher. **NVIDIA:** startup discovers the host's 64-bit NVIDIA Vulkan
-ICD and exposes its libraries next to the bundled AMD/Intel drivers (`BB_NVIDIA_LIB_DIR` when
-they are not under `/usr/lib*`); `--vulkan-info` prints what the package sees. MangoHud is
-bundled (launcher switch) and drawn once even when a system MangoHud or Steam's overlay is on.
+## Créditos
 
-## Useful variables
+- [SacredFire](https://github.com/T3CHNOLOG1C/SacredFire) — base del runtime, renderer y empaquetado
+  de Windows (el README original está en [`README.SacredFire.md`](README.SacredFire.md)).
+- [bbport](https://github.com/deadinside28/bloodborne_pc) — el modelo de port nativo.
+- [shadPS4](https://github.com/shadps4-emu/shadPS4) — renderer y recompilador de shaders.
+- El port de God of War III para Windows y el trabajo de *eltutz*, como referencia de ajustes
+  para Windows (timers, prioridades, modelo de lecturas de la GPU).
+- [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
+  [FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), Dear ImGui.
 
-`BB_GAMEPAD` (controller for port 1), `BB_NEO=1` (PS4 Pro mode), `BB_FPS=30|60|uncap` (virtual
-vblank; the 60 FPS patch sets 480 Hz and a 60 FPS limit by itself: the patch removes the game's
-cap altogether, and above 60 FPS its physics misbehave, slopes bleed speed and karts stick on
-ledges; the *Unlocked frame rate* switch of the launchers and the in-game menu, `BB_FPS=uncap` or
-`BB_FPS_LIMIT=0` lifts the limit, `BB_FPS_LIMIT=<n>` sets another), `BB_FRAME_STATS=1` (frame statistics in the
-log, including VRAM, GTT and RSS), `BB_CLEAR_SHADER_CACHE=1`, `BB_VK_VALIDATION=1` (validation
-layer), `BB_FULLSCREEN=1`, `BB_PRESENT_MODE`, `BB_TIMEOUT=N` (stop after N seconds with thread
-stacks; 0 = never), `BB_GAME_DIR`, `BB_USER_DIR`, `BB_DATA_DIR`, `BB_CONFIG`, `BB_PATCHES_DIR`,
-`BB_SKIP_GAME_CHECK=1`, `BB_PAD_RECORD=file` / `BB_PAD_REPLAY=file` (record and replay input),
-`BB_PRESENT_DUMP_TRIGGER=file` with `BB_PRESENT_DUMP_COUNT=N` (dump presented frames),
-`BB_CAPTURE_TRIGGER=file` (frame analysis), `BB_BREADCRUMBS=0` (no GPU breadcrumbs),
-`BB_GPU_PROFILE=1`, `BB_ANISO=N` (anisotropic filtering, 16 by default), `BB_PC_MODEL=1`
-(bbport's experimental in-place memory model: frees CPU time but needs more GPU-visible memory
-than the Steam Deck has). bbport's temporal upscalers (`BB_UPSCALER`, `BB_OBJECT_MOTION`,
-`BB_UPSCALER_MENU=1` for their menu sections) were built for Bloodborne's scene and stay off.
+## Licencia
 
-## Repository layout
-
-| Path | Contents |
-|---|---|
-| `src/` | Loader (`probe.c`) and the runtime |
-| `scripts/` | Offline preparation of the game image, module linking, game check, patch compiler, mods |
-| `gpu/` | Renderer library: vendored shadPS4 video core (`gpu/VENDOR.txt`) with bbport's and SacredFire's changes, shims, ImGui menu |
-| `patches/` | Community patches for CTR (`CrashTeamRacing.xml`) |
-| `launcher/`, `packaging/` | GTK4 launcher and desktop entry; Nix package and AppImage; `packaging/windows/`: the Windows launcher, manifest, pinned inputs (`deps.lock`) and licence list |
-| `src/platform/`, `cmake/` | Host services (Linux and Windows implementations of one header) and the llvm-mingw cross toolchain file |
-| `tools/` | Developer tools: import-name generation, scripted runs, screenshots, A/B toggles, GPU checks |
-| `tests/` | Loader, runtime, patch, game-check and renderer tests |
-| `docs/sacredfire/` | SacredFire's notes: [status](docs/sacredfire/STATUS.md), setup, imports, Bloodborne gating and removal, fur, controllers, patches, other platforms |
-| `docs/` | bbport's design notes and history ([upscaler](docs/upscaler.md), [parallel GPU](docs/parallel_gpu.md), [motion vectors](docs/motion_vectors.md), [roadmap](docs/ROADMAP.md)); its README: [docs/bbport/README.md](docs/bbport/README.md) ([Русский](docs/bbport/README.ru.md)) |
-
-Tests: `bash build.sh --test`, `python3 -m unittest discover -s tests`, and
-`ninja -C out/gpu motion-history-test ui-composition-test scene-resolution-test motion-shader-test settings-test`.
-
-## Reporting problems and contributing
-
-Use the bug report template; the log (launcher *Log* tab or `run.sh` output, with
-`BB_FRAME_STATS=1` for rendering and performance issues) is what matters. If the log says
-`SacredFire issue #2` (the launcher shows a notice with an *Open issue #2* button), the game hit
-the known clobbered command buffer bug: please attach that whole log to
-[issue #2](https://github.com/T3CHNOLOG1C/SacredFire/issues/2), it carries the diagnostics that
-can find the cause. **No game files** in issues or pull requests. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Known limitations
-
-- Races with the 60 FPS patch reach 37–45 FPS on the Steam Deck: the port's GPU command thread
-  is the limit at ~1400 draws per frame ([docs/sacredfire/08-patches.md](docs/sacredfire/08-patches.md)).
-- Online features are stubbed; the game runs offline.
-- Windows: a native x86-64 build is cross-compiled from Linux (`scripts/build-windows.sh`,
-  `scripts/package-windows.sh`, [docs/sacredfire/13-windows-port.md](docs/sacredfire/13-windows-port.md));
-  its state on real Windows is recorded in
-  [docs/sacredfire/13-windows-port-report.md](docs/sacredfire/13-windows-port-report.md). macOS is not
-  supported ([docs/sacredfire/10-other-platforms.md](docs/sacredfire/10-other-platforms.md)).
-
-## History
-
-SacredFire started from bbport on 2026-10-09. The Bloodborne profile, its patches, launcher and
-FSR 4 tooling were removed the same day
-([docs/sacredfire/09-bloodborne-strip.md](docs/sacredfire/09-bloodborne-strip.md)). bbport's
-temporal upscalers and motion vectors remain in `gpu/`, off; its libGnm hook code remains without
-a function table (the table was generated from Bloodborne's executable and is not distributed).
-
-## Credits and licenses
-
-SacredFire is licensed under the **GNU GPL v2 or later** ([LICENSE](LICENSE)): it contains code
-from bbport and shadPS4 (both GPL-2.0-or-later). Third-party components keep their licenses:
-[bbport](https://github.com/deadinside28/bloodborne_pc) by deadinside28 (the loader, runtime and
-renderer this builds on), [shadPS4](https://github.com/shadps4-emu/shadPS4) video core and shader
-recompiler, [sirit](https://github.com/shadps4-emu/sirit), [half](https://half.sourceforge.net/),
-[FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) by FireBurn (MIT), AMD FidelityFX SDK (MIT),
-[LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) (MIT), [Dear ImGui](https://github.com/ocornut/imgui)
-(MIT), DejaVu fonts, [miniz](https://github.com/richgel999/miniz) (MIT). Game patches by illusion
-and TroyWarez ([illusionyy/PS-Game-Patch](https://github.com/illusionyy/PS-Game-Patch)). Import
-names from shadPS4's aerolib list.
+GPL-2.0-or-later, igual que bbport, SacredFire y shadPS4 (ver [`LICENSE`](LICENSE)).

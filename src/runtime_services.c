@@ -492,7 +492,48 @@ static ABI int32_t mouse_close(int32_t handle) { (void)handle; return 0; }
 static ABI int32_t audio_in_open(void) { return AUDIO_IN_NOT_OPENED; }
 
 
+/* ---- UFC 3 (EA SPORTS UFC 3): the remaining online, dialog and device entry points, offline ---- */
+static int32_t dialog_close(int i) { if (!dialogs[i].initialized) return DIALOG_NOT_INITIALIZED; dialogs[i].status=3; return 0; }
+static ABI int32_t msg_close(void) { return dialog_close(1); }
+static ABI int32_t commerce_close(void) { return dialog_close(4); }
+static ABI int32_t invitation_close(void) { return dialog_close(7); }
+static ABI int32_t save_result_ufc(void *result) { if (!dialogs[2].initialized) return DIALOG_NOT_INITIALIZED; if (result) memset(result,0,8); return 0; }
+static ABI int32_t net_mac(unsigned char *mac,int flags) { (void)flags; if (!mac) return NET_ENETUNREACH; memset(mac,0,6); return 0; }
+static ABI int32_t net_resolver_error(int32_t rid,int32_t *err) { (void)rid; if (err) *err=51; return 0; }
+static ABI int32_t netctl_result(int32_t type,int32_t *err) { (void)type; if (err) *err=0; return 0; }
+static ABI int32_t http_errno(int32_t id,int32_t *err) { (void)id; if (err) *err=51; return 0; }
+/* No 3D audio port: the game keeps its stereo/5.1 output (sceAudioOut). */
+#define AUDIO3D_NOT_SUPPORTED ((int32_t)0x80EA0009)
+static ABI int32_t audio3d_unsupported(void) { return AUDIO3D_NOT_SUPPORTED; }
+
 static const RuntimeExport exports[]={
+    /* UFC 3 */
+    {"sceNpWebApiCreateContextA",np_signed_out}, {"sceNpWebApiCreateHandle",lib_init_id}, {"sceNpWebApiDeleteHandle",ok_void},
+    {"sceNpWebApiSendRequest2",np_signed_out}, {"sceNpWebApiCreateExtdPushEventFilter",np_signed_out},
+    {"sceNpWebApiDeleteExtdPushEventFilter",ok_void}, {"sceNpWebApiRegisterExtdPushEventCallbackA",np_signed_out},
+    {"sceNpWebApiUnregisterExtdPushEventCallback",ok_void},
+    {"sceNpCreateRequest",lib_init_id}, {"sceNpGetAccountCountryA",np_signed_out},
+    {"sceNpRegisterStateCallbackA",np_register}, {"sceNpUnregisterStateCallbackA",ok_void},
+    {"sceNpAuthAbortRequest",ok_void}, {"sceNpTrophyGetGroupInfo",np_signed_out},
+    {"sceNpProfileDialogOpenA",profile_open}, {"sceGameLiveStreamingLaunchLiveViewerA",np_signed_out},
+    {"sceCoredumpRegisterCoredumpHandler",ok_void}, {"sceCoredumpUnregisterCoredumpHandler",ok_void},
+    {"sceCoredumpWriteUserData",ok_void},
+    {"sceNetGetMacAddress",net_mac}, {"sceNetGetSockInfo",net_unreachable}, {"sceNetGetpeername",net_unreachable},
+    {"sceNetResolverGetError",net_resolver_error}, {"sceNetCtlGetResult",netctl_result},
+    {"sceSaveDataDialogGetResult",save_result_ufc}, {"sceSaveDataDialogGetStatus",save_status},
+    {"sceCommonDialogIsUsed",ok_void},
+    {"sceMsgDialogClose",msg_close}, {"sceNpCommerceDialogClose",commerce_close}, {"sceInvitationDialogClose",invitation_close},
+    {"sceHttpsGetSslError",http_fail}, {"sceHttpsLoadCert",http_ok}, {"sceHttpsSetSslVersion",http_ok},
+    {"sceHttpGetLastErrno",http_errno}, {"sceHttpsUnloadCert",http_ok}, {"sceHttpSetCookieRecvCallback",http_ok},
+    {"sceHttpSetInflateGZIPEnabled",http_ok}, {"sceHttpSetRecvTimeOut",http_ok}, {"sceHttpSetRedirectCallback",http_ok},
+    {"sceHttpSetResolveRetry",http_ok}, {"sceHttpSetResolveTimeOut",http_ok}, {"sceHttpSetSendTimeOut",http_ok},
+    {"sceVoiceGetPortAttr",ok_void}, {"sceVoiceGetResourceInfo",ok_void}, {"sceVoiceResetPort",ok_void},
+    {"sceVoiceSetBitRate",ok_void}, {"sceVoiceSetThreadsParams",ok_void},
+    {"sceAudio3dInitialize",audio3d_unsupported}, {"sceAudio3dPortOpen",audio3d_unsupported},
+    {"sceAudio3dObjectReserve",audio3d_unsupported}, {"sceAudio3dObjectSetAttributes",audio3d_unsupported},
+    {"sceAudio3dObjectUnreserve",ok_void}, {"sceAudio3dPortAdvance",audio3d_unsupported},
+    {"sceAudio3dPortClose",ok_void}, {"sceAudio3dPortPush",audio3d_unsupported}, {"sceAudio3dTerminate",ok_void},
+    {"sceVideoRecordingSetInfo",ok_void},
     {"sceUserServiceInitialize",user_initialize}, {"sceUserServiceTerminate",user_terminate},
     {"sceUserServiceGetInitialUser",user_initial}, {"sceUserServiceGetLoginUserIdList",user_list},
     {"sceUserServiceGetUserName",user_name}, {"sceUserServiceGetEvent",user_event},

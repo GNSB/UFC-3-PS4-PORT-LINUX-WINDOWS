@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifndef _WIN32
+#include <string>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 #include <dlfcn.h>
 #endif
 #include <map>
@@ -38,8 +42,61 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/host_shaders/depth_to_r16ui_comp.h"
+#include <vk_mem_alloc.h>
 
 namespace Vulkan {
+
+namespace {
+// ufc3: BB_SKIP_SHADERS=hash[,hash...] (diagnostics): draws and dispatches of those guest shaders
+// are recorded empty, to find which pass produces a visual defect. BB_SKIP_FILE=<path>: the same
+// list read from a file, re-read every 0.5 s (change it while the game runs).
+std::vector<u64> ParseHashes(const char* at) {
+    std::vector<u64> out;
+    while (at && *at) {
+        while (*at == ',' || *at == ' ' || *at == '\n') ++at;
+        if (!*at) break;
+        char* end = nullptr;
+        const u64 v = std::strtoull(at, &end, 16);
+        if (end == at) break;
+        out.push_back(v);
+        at = end;
+    }
+    return out;
+}
+bool SkipShader(u64 hash) {
+    static const std::vector<u64> fixed = ParseHashes(std::getenv("BB_SKIP_SHADERS"));
+    static const char* file = std::getenv("BB_SKIP_FILE");
+    if (!file) {
+        return !fixed.empty() && std::ranges::find(fixed, hash) != fixed.end();
+    }
+    static std::mutex mutex;
+    static std::vector<u64> live;
+    static auto next_read = std::chrono::steady_clock::time_point{};
+    std::scoped_lock lk{mutex};
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_read) {
+        next_read = now + std::chrono::milliseconds(500);
+        std::string text;
+        if (FILE* f = std::fopen(file, "r")) {
+            char buf[4096];
+            const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+            buf[n] = 0;
+            text = buf;
+            std::fclose(f);
+        }
+        auto hashes = ParseHashes(text.c_str());
+        if (hashes != live) {
+            std::printf("Skip shaders: %zu from %s\n", hashes.size(), file);
+            live = std::move(hashes);
+        }
+    }
+    return std::ranges::find(live, hash) != live.end() ||
+           std::ranges::find(fixed, hash) != fixed.end();
+}
+} // namespace
+
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -1619,7 +1676,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
 
     const vk::Pipeline handle = pipeline->Handle();
     const u32 num_indices = regs.num_indices;
-    const u32 num_instances = regs.num_instances.NumInstances();
+    const auto* skip_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    // ufc3: BB_SKIP_SHADERS records the draw with no instances (all bookkeeping stays).
+    const u32 num_instances = SkipShader(vs_info.pgm_hash) ||
+                                      (skip_ps && SkipShader(skip_ps->pgm_hash))
+                                  ? 0u
+                                  : regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
     const auto* ps_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -1853,7 +1915,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
                             {buffer_infos.data(), buffer_infos.size()});
 
     const vk::Pipeline handle = pipeline->Handle();
-    const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+    const bool skip_cs = SkipShader(cs.pgm_hash); // ufc3: BB_SKIP_SHADERS -> empty dispatch
+    const u32 dim_x = skip_cs ? 0u : cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
+
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
     }
@@ -2840,6 +2904,102 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
     return entry;
 }
 
+namespace {
+// ufc3: guest shaders that read a depth image through an R16_UINT view (UFC 3's shadow and
+// light passes read their Z16 depth as raw bits). The host depth image (D16_UNORM, or
+// D32_SFLOAT_S8 for Z16+S8) cannot be viewed as R16_UINT, so each bind converts it into an
+// R16_UINT copy (round(depth * 65535), what the console's view returns) and binds that.
+struct DepthAsR16 {
+    struct Copy {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        vk::ImageView view{};
+        u32 width = 0, height = 0;
+    };
+    vk::UniqueDescriptorSetLayout set_layout;
+    vk::UniquePipelineLayout layout;
+    vk::UniquePipeline pipeline;
+    std::unordered_map<const void*, Copy> copies; // keyed by the guest image's VkImage
+};
+
+DepthAsR16& DepthAsR16State(const Instance& instance) {
+    static DepthAsR16 state = [&] {
+        const auto device = instance.GetDevice();
+        DepthAsR16 p;
+        const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
+            {.binding = 0, .descriptorType = vk::DescriptorType::eSampledImage,
+             .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+            {.binding = 1, .descriptorType = vk::DescriptorType::eStorageImage,
+             .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        }};
+        p.set_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                          .offset = 0, .size = 2 * sizeof(u32)};
+        p.layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1, .pSetLayouts = &*p.set_layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &range,
+        }));
+        const auto module = CompileSPV(DEPTH_TO_R16UI_COMP, device);
+        p.pipeline = Check(device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module,
+                              .pName = "main"},
+                    .layout = *p.layout,
+                }));
+        device.destroyShaderModule(module);
+        return p;
+    }();
+    return state;
+}
+
+const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, const void* key, u32 width,
+                                       u32 height) {
+    auto& state = DepthAsR16State(instance);
+    auto& copy = state.copies[key];
+    if (copy.image && (copy.width != width || copy.height != height)) {
+        instance.GetDevice().destroyImageView(copy.view);
+        vmaDestroyImage(instance.GetAllocator(), copy.image, copy.allocation);
+        copy = {};
+    }
+    if (!copy.image) {
+        const VkImageCreateInfo image_ci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R16_UINT,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        const VmaAllocationCreateInfo alloc_ci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(instance.GetAllocator(), &image_ci, &alloc_ci, &copy.image,
+                           &copy.allocation, nullptr) != VK_SUCCESS) {
+            state.copies.erase(key);
+            return nullptr;
+        }
+        copy.view = Check(instance.GetDevice().createImageView({
+            .image = copy.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR16Uint,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        copy.width = width;
+        copy.height = height;
+        std::printf("Depth as R16_UINT: %ux%u copy for a depth image read as raw Z16 bits\n",
+                    width, height);
+    }
+    return &copy;
+}
+} // namespace
+
 void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
                               Shader::Backend::Bindings& binding, u32& write_index,
                               bool& barrier, bool on_helper) {
@@ -3023,6 +3183,27 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
+            {   // ufc3: BB_FORCE_REFRESH=<guest address>: describe that image once and re-upload it
+                // from guest memory before every use (tests missed CPU writes vs. detiling).
+                static const VAddr watch = [] {
+                    const char* e = std::getenv("BB_FORCE_REFRESH");
+                    return e ? VAddr(std::strtoull(e, nullptr, 16)) : VAddr(0);
+                }();
+                if (watch && image.info.guest_address == watch) {
+                    static std::atomic<bool> told{false};
+                    if (!told.exchange(true)) {
+                        std::printf("Force refresh: image %#llx %ux%u layers %u levels %u fmt %s "
+                                    "tile_mode %u pitch %u guest_size %#llx flags %#x\n",
+                                    (unsigned long long)watch, image.info.size.width,
+                                    image.info.size.height, image.info.resources.layers,
+                                    image.info.resources.levels,
+                                    vk::to_string(image.info.pixel_format).c_str(),
+                                    u32(image.info.tile_mode), image.info.pitch,
+                                    (unsigned long long)image.info.guest_size, u32(image.flags));
+                    }
+                    texture_cache.InvalidateMemory(watch, image.info.guest_size);
+                }
+            }
             auto& image_view = texture_cache.FindTexture(
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
             const auto binding = image.binding;
@@ -3079,6 +3260,66 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
             vk::ImageView view = *image_view.image_view;
             vk::ImageLayout layout = image.backing->state.layout;
+            if (!is_storage && !on_helper && image.info.props.is_depth &&
+                desc.view_info.format == vk::Format::eR16Uint &&
+                desc.view_info.range.base.level == 0 && desc.view_info.range.base.layer == 0) {
+                const u32 width = image.info.size.width, height = image.info.size.height;
+                const auto* copy = DepthAsR16Copy(instance, image.GetImage(), width, height);
+                if (copy) {
+                    // The depth image was transited for reading above; the copy is rebuilt now.
+                    scheduler.EndRendering();
+                    runtime.FlushBarriers();
+                    auto& state = DepthAsR16State(instance);
+                    const vk::ImageView src_view = view;
+                    const vk::ImageLayout src_layout = layout;
+                    const vk::Image dst_image{copy->image};
+                    const vk::ImageView dst_view = copy->view;
+                    scheduler.RecordCrumb({.name = "depth as R16_UINT"},
+                                          [&state, src_view, src_layout, dst_image, dst_view, width,
+                                           height](vk::CommandBuffer cmdbuf) {
+                        const vk::ImageMemoryBarrier2 to_general{
+                            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                            .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                            .oldLayout = vk::ImageLayout::eUndefined,
+                            .newLayout = vk::ImageLayout::eGeneral,
+                            .image = dst_image,
+                            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                        };
+                        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1,
+                                                 .pImageMemoryBarriers = &to_general});
+                        const vk::DescriptorImageInfo src_info{{}, src_view, src_layout};
+                        const vk::DescriptorImageInfo dst_info{{}, dst_view, vk::ImageLayout::eGeneral};
+                        const std::array<vk::WriteDescriptorSet, 2> writes{{
+                            {.dstBinding = 0, .descriptorCount = 1,
+                             .descriptorType = vk::DescriptorType::eSampledImage,
+                             .pImageInfo = &src_info},
+                            {.dstBinding = 1, .descriptorCount = 1,
+                             .descriptorType = vk::DescriptorType::eStorageImage,
+                             .pImageInfo = &dst_info},
+                        }};
+                        const std::array<u32, 2> extent{width, height};
+                        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *state.pipeline);
+                        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *state.layout,
+                                                    0, writes);
+                        cmdbuf.pushConstants(*state.layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                             sizeof(extent), extent.data());
+                        cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+                        const vk::MemoryBarrier2 to_read{
+                            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                        };
+                        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_read});
+                    });
+                    view = dst_view;
+                    layout = vk::ImageLayout::eGeneral;
+                    set_ok = false;
+                    barrier = false;
+                }
+            }
             if (upscaler->Enabled()) {
                 // bbport: the display pass reads the upscaled frame (scaled presets).
                 upscaler->RedirectSampled(image_id, image_view.info, view, layout);
@@ -3807,13 +4048,13 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks, bool* step) {
     DrainDrawPipe();
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    buffer_cache.InvalidateMemory(addr, size, assume_locks, step);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
@@ -3860,13 +4101,20 @@ void Rasterizer::OnCpuWrite(VAddr addr, u64 size) {
     }
 }
 
-bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip) {
+bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip, bool* step) {
     DrainDrawPipe();
-    if (!InvalidateMemory(addr, 8, assume_locks)) {
+    if (!InvalidateMemory(addr, 8, assume_locks, step)) {
         return false;
+    }
+    if (step && *step) {
+        return true; // the page keeps its protection: no write window around the fault
     }
     buffer_cache.ExtendWriteFault(addr, guest_rip);
     return true;
+}
+
+void Rasterizer::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes) {
+    buffer_cache.NoteSteppedWrite(addr, std::move(bytes));
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {

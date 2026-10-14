@@ -253,6 +253,22 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     _exit(128 + sig);
 }
+static PlatformStepHandler step_handler;
+static struct sigaction previous_trap;
+static void step_trap(int sig, siginfo_t *info, void *context) {
+    if (step_handler && step_handler(context)) return;
+    if ((previous_trap.sa_flags & SA_SIGINFO) && previous_trap.sa_sigaction) { previous_trap.sa_sigaction(sig, info, context); return; }
+    if (!(previous_trap.sa_flags & SA_SIGINFO) && previous_trap.sa_handler != SIG_DFL && previous_trap.sa_handler != SIG_IGN && previous_trap.sa_handler) { previous_trap.sa_handler(sig); return; }
+    signal(SIGTRAP, SIG_DFL);
+    raise(SIGTRAP);
+}
+void platform_install_step_handler(PlatformStepHandler handler) {
+    if (step_handler) { step_handler = handler; return; }
+    step_handler = handler;
+    struct sigaction sa = {0}; sa.sa_sigaction = step_trap; sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTRAP, &sa, &previous_trap);
+}
 void platform_install_fault_handlers(PlatformGpuFault gpu, PlatformRecoverPoint recover, PlatformFaultExtra extra, const unsigned char *image, uint64_t image_size) {
     gpu_fault = gpu; recover_point = recover; fault_extra = extra; guest_image = image; guest_image_size = image_size;
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;

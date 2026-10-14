@@ -330,6 +330,33 @@ static ABI int32_t posix_setschedparam(GuestThread *t,int32_t policy,const Guest
     t->attr.policy=policy; t->attr.prio=param->priority; return 0;
 }
 
+/* UFC 3: stack address queries (the runtime allocates every stack itself, so a caller-provided
+ * address is ignored and its size kept), sce* scheduling parameters and cancel state. */
+static ABI int32_t attr_get_stack_full(ThreadAttr **slot,void **addr,uint64_t *size) {
+    if (!addr) return ERR(22);
+    *addr=NULL; return attr_get_stack(slot,size);
+}
+static ABI int32_t attr_get_stack_addr(ThreadAttr **slot,void **addr) {
+    if (!slot || !*slot || !addr) return ERR(22);
+    *addr=NULL; return 0;
+}
+static ABI int32_t attr_set_stack_full(ThreadAttr **slot,void *addr,uint64_t size) {
+    static _Atomic unsigned notes;
+    if (addr && atomic_fetch_add_explicit(&notes,1,memory_order_relaxed)<4)
+        printf("Runtime: scePthreadAttrSetstack address %p ignored, size %llu kept\n",addr,(unsigned long long)size);
+    return attr_set_stack(slot,size);
+}
+static ABI int32_t sce_getschedparam(GuestThread *t,int32_t *policy,GuestSchedParam *param) {
+    int32_t r=posix_getschedparam(t,policy,param); return r ? ERR(r) : 0;
+}
+static ABI int32_t sce_setschedparam(GuestThread *t,int32_t policy,const GuestSchedParam *param) {
+    int32_t r=posix_setschedparam(t,policy,param); return r ? ERR(r) : 0;
+}
+static ABI int32_t thread_setcancelstate(int state,int *old) {
+    if (old) *old=0; /* PTHREAD_CANCEL_ENABLE */
+    (void)state; return 0;
+}
+
 /* POSIX (libScePosix) variants return positive errno values. */
 static int32_t posix(int32_t r) { return r ? (int32_t)((uint32_t)r&0xffff) : 0; }
 static ABI int32_t posix_attr_init(ThreadAttr **a) { return posix(attr_init(a)); }
@@ -364,6 +391,9 @@ uintptr_t runtime_thread_resolve(const char *name) {
         {"FJrT5LuUBAU",thread_exit},
         {"How7B8Oet6k#libkernel",thread_getname}, {"EI-5-jlq2dE#libkernel",thread_getthreadid}, {"qBDmpCyGssE#libkernel",thread_cancel},
         {"FIs3-UQT9sg",posix_getschedparam}, {"Xs9hdiD7sAA",posix_setschedparam},
+        {"-quPa4SEJUw#libkernel",attr_get_stack_full}, {"Ru36fiTtJzA#libkernel",attr_get_stack_addr},
+        {"Bvn74vj6oLo#libkernel",attr_set_stack_full}, {"P41kTWUS3EI#libkernel",sce_getschedparam},
+        {"oIRFTjoILbg#libkernel",sce_setschedparam}, {"OAmWq+OHSjw#libkernel",thread_setcancelstate},
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (runtime_nid_equals(name,table[i].nid)) return (uintptr_t)table[i].fn;

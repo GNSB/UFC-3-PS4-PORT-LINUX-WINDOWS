@@ -32,6 +32,7 @@
 #include "core/memory.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/platform.h"
+#include "video_core/page_manager.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
@@ -103,6 +104,36 @@ Liverpool::~Liverpool() {
 void Liverpool::ProcessCommands() {
     // Process incoming commands with high priority
     while (num_commands) {
+        // ufc3: readbacks (SendInOrderCommand) go to the draw recording thread as an ordered
+        // task: it owns the caches while packets are in flight, and runs the task after the
+        // draws handed to it so far (the same set a drain would wait for); this thread goes on.
+        {
+            Common::UniqueFunction<void> ordered{};
+            {
+                std::scoped_lock lk{submit_mutex};
+                if (!inorder_queue.empty()) {
+                    ordered = std::move(inorder_queue.front());
+                    inorder_queue.pop();
+                    --num_commands;
+                }
+            }
+            if (ordered) {
+                if (!rasterizer) {
+                    ordered();
+                    continue;
+                }
+                auto* heap = new Common::UniqueFunction<void>(std::move(ordered));
+                rasterizer->RunInOrder(
+                    [](Vulkan::Rasterizer&, const u8* data) {
+                        Common::UniqueFunction<void>* task;
+                        std::memcpy(&task, data, sizeof(task));
+                        (*task)();
+                        delete task;
+                    },
+                    &heap, sizeof(heap), BbToggle::PipelinedTasks, false);
+                continue;
+            }
+        }
         // bbport: commands touch the caches and record into the scheduler (readbacks:
         // DownloadMemory copies and Finish()es), so the draw recording thread must be idle.
         // Drained per command: draining only when the first check saw one let a command that
@@ -114,6 +145,9 @@ void Liverpool::ProcessCommands() {
         Common::UniqueFunction<void> callback{};
         {
             std::scoped_lock lk{submit_mutex};
+            if (command_queue.empty()) {
+                continue; // an ordered command was counted and taken above
+            }
             callback = std::move(command_queue.front());
             command_queue.pop();
             --num_commands;
@@ -179,8 +213,20 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
             }
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+            // bbport: a signal flush requested on the way to idle can find the recording's
+            // signals not yet visible (BB_GUEST_IN_PLACE loading screens froze with a tick
+            // recorded, never submitted, and the signal thread waiting on it): asked again
+            // every millisecond while idle.
+            while (!stoken.stop_requested() &&
+                   !submit_cv.wait_for(lk, std::chrono::milliseconds(1), [this] {
+                       return num_commands || num_submits || submit_done;
+                   })) {
+                if (rasterizer && rasterizer->PipeSignals()) {
+                    lk.unlock();
+                    rasterizer->RequestSignalFlush();
+                    lk.lock();
+                }
+            }
             BbStats::gpu_idle_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - idle_start).count(),
@@ -2295,6 +2341,8 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    // ufc3 (BB_WRITE_WINDOW): the CPU's writes for this submission reach VRAM before it runs.
+    VideoCore::PageManager::CloseWriteWindows();
 
     // bbport: one copy per submission, alive until it is decoded (CopyCmdBuffers' shared buffer
     // is reset at sceGnmSubmitDone, while this thread may still be decoding earlier frames).
@@ -2417,6 +2465,7 @@ void Liverpool::SignalGpuIdle(u64 generation) {
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     BbStats::asc_submits.fetch_add(1, std::memory_order_relaxed);
+    VideoCore::PageManager::CloseWriteWindows();
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;

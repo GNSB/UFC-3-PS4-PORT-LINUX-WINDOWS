@@ -51,7 +51,9 @@ static ABI int32_t sem_create(uint32_t *out,const char *name,uint32_t attr,
     if (next_id==UINT32_MAX) { pthread_mutex_unlock(&lock); free(s); return ERR(28); }
     s->id=next_id++; s->attr=attr; s->count=s->initial=initial; s->maximum=maximum;
     s->next=registry; registry=s; *out=s->id; ++created;
-    printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
+    /* UFC 3 creates semaphores all the time (thousands per minute); the first ones are enough. */
+    if (s->id<=64 || getenv("BB_SEMA_LOG")) printf("Runtime: semaphore id=%u, attr=%u, initial=%d, max=%d\n",s->id,attr,initial,maximum);
+    else if (s->id==65) printf("Runtime: further semaphore creations are not logged (BB_SEMA_LOG=1 logs them)\n");
     pthread_mutex_unlock(&lock);
     return 0;
 }

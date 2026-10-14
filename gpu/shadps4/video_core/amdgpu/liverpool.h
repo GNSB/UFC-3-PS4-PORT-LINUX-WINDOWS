@@ -168,6 +168,23 @@ public:
         }
     }
 
+    /// ufc3 (BB_READBACK_INORDER): a readback request, run by the draw recording thread in order
+    /// with the draws already handed to it instead of after a drain of the command thread
+    /// (~400 drains/s in fights, a quarter of that thread's time). Waits for it.
+    void SendInOrderCommand(auto&& func) {
+        std::binary_semaphore sem{0};
+        {
+            std::scoped_lock lk{submit_mutex};
+            inorder_queue.emplace([&sem, &func] {
+                func();
+                sem.release();
+            });
+            ++num_commands;
+            submit_cv.notify_one();
+        }
+        sem.acquire();
+    }
+
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
@@ -340,6 +357,7 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::queue<Common::UniqueFunction<void>> inorder_queue{}; ///< SendInOrderCommand
     std::thread::id gpu_id;
     u32 gpu_tid{};
     s32 curr_qid{-1};

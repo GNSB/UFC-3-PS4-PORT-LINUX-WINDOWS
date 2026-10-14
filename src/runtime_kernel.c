@@ -367,6 +367,29 @@ static int condattr_marker;
 static ABI int32_t condattr_init(void **attr) { if (!attr) return ERR(22); *attr=&condattr_marker; return 0; }
 static ABI int32_t condattr_destroy(void **attr) { if (!attr || !*attr) return ERR(22); *attr=NULL; return 0; }
 
+/* UFC 3: what is left of libkernel. Modules: every PRX the game needs is linked offline, so a
+ * dynamic load reports not found (the game falls back). msync: memory is not file-backed. Page
+ * table statistics: plenty free. sigreturn is never reached through a signal of ours. */
+static ABI int32_t load_start_module(const char *path,uint64_t argc,const void *argv,uint32_t flags,const void *opt,int32_t *result) {
+    (void)argc; (void)argv; (void)flags; (void)opt; if (result) *result=0;
+    printf("Runtime: sceKernelLoadStartModule(%s) -> not found (modules are linked offline)\n",path ? path : "(null)");
+    return (int32_t)0x80020002; /* ENOENT */
+}
+static ABI int32_t stop_unload_module(int32_t handle,uint64_t argc,const void *argv,uint32_t flags,const void *opt,int32_t *result) {
+    (void)handle; (void)argc; (void)argv; (void)flags; (void)opt; if (result) *result=0; return 0;
+}
+static ABI int32_t guest_msync(void *addr,uint64_t len,int flags) { (void)addr; (void)len; (void)flags; return 0; }
+static ABI int32_t page_table_stats(int32_t *cpu_total,int32_t *cpu_free,int32_t *gpu_total,int32_t *gpu_free) {
+    if (cpu_total) *cpu_total=0x100000;
+    if (cpu_free) *cpu_free=0xc0000;
+    if (gpu_total) *gpu_total=0x100000;
+    if (gpu_free) *gpu_free=0xc0000;
+    return 0;
+}
+static ABI int32_t guest_sigreturn(void) { return 0; }
+/* POSIX sockets: no network (EHOSTUNREACH as -1 with errno set by the guest's errno slot). */
+static ABI int32_t posix_no_socket(void) { return -1; }
+
 static const RuntimeExport exports[]={
     {"sceKernelIsNeoMode",is_neo_mode}, {"sceKernelGetCpumode",get_cpumode}, {"sceKernelGetCurrentCpu",get_current_cpu},
     {"sceRandomGetRandomNumber",random_number},
@@ -407,6 +430,9 @@ static const RuntimeExport exports[]={
     {"scePthreadSetspecific",key_set}, {"scePthreadGetspecific",key_get},
     {"pthread_key_create",posix_key_create}, {"pthread_key_delete",posix_key_delete},
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
+    {"sceKernelLoadStartModule",load_start_module}, {"sceKernelStopUnloadModule",stop_unload_module},
+    {"msync",guest_msync}, {"sceKernelGetPageTableStats",page_table_stats}, {"sigreturn",guest_sigreturn},
+    {"socket",posix_no_socket}, {"sendto",posix_no_socket}, {"recvfrom",posix_no_socket}, {"setsockopt",posix_no_socket},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 

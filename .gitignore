@@ -37,3 +37,8 @@ gpu/shim/bbport_gnm_table.inc
 # Alternate builds set aside (out.arch, out.nix: see packaging/appimage.sh)
 /out.*/
 *.kate-swp
+
+# UFC 3: local build log, shader dumps taken from the game, the working diff (git has it)
+/build.log
+/patches/shaders/
+/docs/ufc3/ufc3-changes.diff

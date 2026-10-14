@@ -227,13 +227,31 @@ void Swapchain::FindPresentMode() {
         present_mode = vk::PresentModeKHR::eMailbox;
     }
 
-    if (std::ranges::find(modes, present_mode) == modes.cend()) {
-        // FIFO is guaranteed to be supported by the Vulkan spec.
-        constexpr auto fallback = vk::PresentModeKHR::eFifo;
+    const auto supported = [&](vk::PresentModeKHR m) {
+        return std::ranges::find(modes, m) != modes.cend();
+    };
+    if (!supported(present_mode)) {
+        // bbport: an unsynchronised request keeps an unsynchronised mode when the driver has
+        // the other one (laptops through Optimus may offer only one of them); FIFO, which the
+        // spec guarantees, is the last resort and caps at the display's refresh rate.
+        const auto requested = present_mode;
+        vk::PresentModeKHR fallback = vk::PresentModeKHR::eFifo;
+        if (requested == vk::PresentModeKHR::eMailbox && supported(vk::PresentModeKHR::eImmediate)) {
+            fallback = vk::PresentModeKHR::eImmediate;
+        } else if (requested == vk::PresentModeKHR::eImmediate &&
+                   supported(vk::PresentModeKHR::eMailbox)) {
+            fallback = vk::PresentModeKHR::eMailbox;
+        }
         LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
-                    vk::to_string(present_mode), vk::to_string(fallback));
+                    vk::to_string(requested), vk::to_string(fallback));
         present_mode = fallback;
     }
+    std::string offered;
+    for (const auto m : modes) {
+        offered += (offered.empty() ? "" : ", ") + vk::to_string(m);
+    }
+    std::printf("Swapchain: present mode %s (requested %s; the driver offers %s)\n",
+                vk::to_string(present_mode).c_str(), requested_mode.c_str(), offered.c_str());
 }
 
 void Swapchain::SetSurfaceProperties() {

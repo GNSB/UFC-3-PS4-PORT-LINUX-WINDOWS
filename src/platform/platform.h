@@ -189,6 +189,10 @@ typedef bb_fault_jmp_buf *(*PlatformRecoverPoint)(void);
 typedef void (*PlatformFaultExtra)(void *context);
 void platform_install_fault_handlers(PlatformGpuFault gpu, PlatformRecoverPoint recover,
                                      PlatformFaultExtra extra, const unsigned char *image, uint64_t image_size);
+/* ufc3 (BB_WRITE_STEP): the handler of single-step traps (Linux SIGTRAP, Windows
+ * EXCEPTION_SINGLE_STEP); it returns nonzero for its own steps, others go on as before. */
+typedef int (*PlatformStepHandler)(void *context);
+void platform_install_step_handler(PlatformStepHandler handler);
 /* Watchdog: after `seconds` (0: never) dumps every thread's RIP and rbp chain and exits 142. */
 void platform_watchdog_start(unsigned seconds, const unsigned char *image);
 /* Runs the guest's main entry: on Linux on a fresh low-address stack, on Windows on the process

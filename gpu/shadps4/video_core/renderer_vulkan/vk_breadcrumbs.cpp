@@ -10,6 +10,7 @@
 #include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 
@@ -47,6 +48,13 @@ VmaAllocation marker_allocation{};
 volatile u32* markers = nullptr;
 volatile u32* args = nullptr;
 std::atomic<u32> next_args_slot{0};
+// ufc3: GPUs without VK_AMD_buffer_marker (NVIDIA) write a timestamp per mark instead, into a
+// ring of TsRing queries per stream; the report finds where the run of written timestamps ends.
+constexpr u32 TsRing = 1u << 16;
+bool timestamp_mode = false;
+vk::Device ts_device{};
+vk::QueryPool ts_pool{};
+u32 LastMarker(u32 s);
 /// What each argument slot was last used for.
 struct ArgsNote {
     u64 id;
@@ -61,9 +69,21 @@ void Init(const Instance& instance) {
         return;
     }
     if (!instance.IsBufferMarkerSupported()) {
-        std::printf("GPU breadcrumbs: VK_AMD_buffer_marker unavailable, GPU hangs will not be "
-                    "located\n");
-        return;
+        ts_device = instance.GetDevice();
+        const vk::QueryPoolCreateInfo pool_ci = {
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = MaxStreams * TsRing,
+        };
+        auto [result, pool] = ts_device.createQueryPool(pool_ci);
+        if (result != vk::Result::eSuccess) {
+            std::printf("GPU breadcrumbs: no buffer markers or timestamp queries, GPU hangs will "
+                        "not be located\n");
+            return;
+        }
+        ts_pool = pool;
+        ts_device.resetQueryPool(ts_pool, 0, MaxStreams * TsRing);
+        timestamp_mode = true;
+        std::printf("GPU breadcrumbs: VK_AMD_buffer_marker unavailable, using timestamp queries\n");
     }
     const VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -85,6 +105,7 @@ void Init(const Instance& instance) {
         return;
     }
     marker_buffer = vk::Buffer{buffer};
+    // (timestamp mode keeps the buffer for indirect dispatch arguments)
     markers = static_cast<volatile u32*>(info.pMappedData);
     for (u32 i = 0; i < (ArgsOffset + ArgSlots * 16) / sizeof(u32); ++i) {
         markers[i] = 0;
@@ -252,8 +273,15 @@ void Mark(vk::CommandBuffer cmdbuf, u32 stream, u32 id, bool after) {
     if (!enabled || stream >= MaxStreams) {
         return;
     }
+    const u32 value = id * 2 + (after ? 1 : 0);
+    if (timestamp_mode) {
+        // Reused slots are not reset between laps: a debugging aid, the driver overwrites them.
+        cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, ts_pool,
+                              stream * TsRing + value % TsRing);
+        return;
+    }
     cmdbuf.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, marker_buffer,
-                                stream * StreamStride, id * 2 + (after ? 1 : 0));
+                                stream * StreamStride, value);
 }
 
 u32 ArgsSlot() {
@@ -293,7 +321,7 @@ void Report(const char* title, const char* where) {
     for (u32 s = 0; s < count; ++s) {
         const Stream& stream = streams[s];
         const u64 last = stream.next.load() - 1;
-        const u32 marker = markers[s * StreamStride / sizeof(u32)];
+        const u32 marker = timestamp_mode ? LastMarker(s) : markers[s * StreamStride / sizeof(u32)];
         std::printf("  stream %u (%s): %llu commands noted", s, stream.name,
                     (unsigned long long)last);
         if (last == 0) {
@@ -398,4 +426,33 @@ void PrintProgress() {
     std::printf("\n");
 }
 
+} // namespace Vulkan::Breadcrumbs
+
+namespace Vulkan::Breadcrumbs {
+namespace {
+/// Timestamp mode: the last mark value of stream `s` the GPU wrote. Marks are written in order,
+/// so their timestamps never decrease; walking forward from half a ring back, the first mark
+/// that is unwritten or older than the one before is the first the GPU did not reach.
+u32 LastMarker(u32 s) {
+    const u64 last_id = streams[s].next.load() - 1;
+    const u64 last_value = last_id * 2 + 1;
+    const u64 first_value = last_value > TsRing / 2 ? last_value - TsRing / 2 : 2;
+    std::vector<u64> data(u64(TsRing) * 2);
+    (void)ts_device.getQueryPoolResults(ts_pool, s * TsRing, TsRing, data.size() * sizeof(u64),
+                                        data.data(), 2 * sizeof(u64),
+                                        vk::QueryResultFlagBits::e64 |
+                                            vk::QueryResultFlagBits::eWithAvailability);
+    u64 prev = 0, reached = first_value - 1;
+    for (u64 v = first_value; v <= last_value; ++v) {
+        const u64 slot = v % TsRing;
+        const u64 ts = data[slot * 2], available = data[slot * 2 + 1];
+        if (!available || ts < prev) {
+            break;
+        }
+        prev = ts;
+        reached = v;
+    }
+    return u32(reached);
+}
+} // namespace
 } // namespace Vulkan::Breadcrumbs
