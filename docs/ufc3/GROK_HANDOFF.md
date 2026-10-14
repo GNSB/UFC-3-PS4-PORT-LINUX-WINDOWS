@@ -779,3 +779,25 @@ Route, on the model the user confirmed (run81, lights and fighters, 90–100):
   (uncapped): fights 137-196 FPS, GPU ticks ~0-3 %; screenshots look right.
   Risk: a CPU read of the GPU bytes of an open page sees stale data until the next submit.
 - Remaining readbacks: +0x4219b8 "near GPU" (~120/s, writes within 16 B of GPU bytes).
+
+## 18. Launcher controls, 2K/4K window, windowed swapchain crash, online notes (2026-10-14 16:10)
+
+- Controls: UFC3.exe "Controls..." window edits bbport.ini key.<input>= / pad.<input>= (read by
+  runtime_pad.c load_bindings): press-a-key capture (VK -> SDL scancode names), gamepad button
+  dropdown (SDL names a/b/x/y/leftshoulder/.../lefttrigger), Defaults = runtime_pad.c defaults.
+- 2K/4K: UFC 3 renders 1080p even in PS4 Pro mode with a 4K video out (run109: no target above
+  1920x1080). BB_WINDOW_SIZE=WxH (shim/window.cpp) makes the window/swapchain larger; the presenter
+  scales the game's frame with FSR 1.0 + RCAS. Launcher "Display resolution" (Same / 1080p /
+  1440p / 4K). Fullscreen = the monitor's size anyway.
+- Windowed crash after the first match (user report, Omen): Swapchain::Destroy did
+  vkDeviceWaitIdle while the recording threads submit (BB_ASYNC_SUBMIT) - not externally
+  synchronized, NVIDIA crash (also run90). Now: graphics/present queue waitIdle under
+  Scheduler::submit_mutex; Presenter recreates outside that lock; ErrorSurfaceLost recreates
+  instead of asserting. Linux run110: windowed 2560x1440, 6 resizes, no crash. Not yet confirmed
+  on the user's Windows crash (no log of it).
+- Online: servers closed 2025-02-17. The game uses EA Blaze (Redirector, Authentication via PSN
+  ticket, GameManager matchmaking CCS PEERONLY/HOSTEDFALLBACK, UltimateTeam, Stats...) and DirtySDK
+  ProtoSSL/ProtoTunnel/CommUDP for the peer link. The runtime stubs the network today.
+  Paths: (1) now: local 2-player + Steam Remote Play Together / Parsec; (2) long: a Blaze emulator
+  in the PocketRelay style (redirector + minimal Blaze components + ProtoSSL cert patch + real
+  sockets in the runtime + PSN ticket stub).

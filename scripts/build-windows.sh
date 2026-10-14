@@ -53,7 +53,7 @@ if [[ $stage == all || $stage == --runtime || $stage == --tests ]]; then
     for exe in "$root"/bin/*.exe; do
         "$LLVM_MINGW_ROOT/bin/llvm-readobj" --file-headers "$exe" | grep -q 'IMAGE_FILE_MACHINE_AMD64' || { echo "build-windows: $exe is not an AMD64 PE" >&2; exit 1; }
     done
-    version=$(git describe --tags --match 'v*' --always 2>/dev/null || echo unknown)
+    version=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
     git update-index -q --refresh 2>/dev/null || true
     git diff-index --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null || version="$version-dirty"
     printf '%s\n' "$version" > "$root/bin/VERSION"

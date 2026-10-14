@@ -76,8 +76,10 @@ static ABI int32_t user_name(int32_t id,char *name,uint64_t size) {
     char player[16];
     const char *value=getenv("BB_USER_NAME") ? getenv("BB_USER_NAME") : default_user_name();
     if (id!=USER_ID) { snprintf(player,sizeof player,"Player %d",id); value=player; }
-    if (strlen(value)+1>size) return (int32_t)0x8096000a; /* BUFFER_TOO_SHORT */
-    strcpy(name,value); return 0;
+    /* ufc3: a long BB_USER_NAME (launcher "Player name") is cut to the PS4's 16 bytes. */
+    size_t n=strlen(value); if (n>16) n=16;
+    if (n+1>size) return (int32_t)0x8096000a; /* BUFFER_TOO_SHORT */
+    memcpy(name,value,n); name[n]=0; return 0;
 }
 static ABI int32_t user_event(int32_t *event) {
     if (!event) return USER_INVALID_ARGUMENT;

@@ -51,7 +51,7 @@ and saves.
 
 ## Windows
 
-1. Download or build the zip (`dist/UFC3Native-windows-x86_64.zip`, see *Building*) and extract it.
+1. Download the zip from [**Releases**](../../releases) (or build it, see *Building*) and extract it.
 2. Open **`UFC3.exe`**. Pick the `CUSA06534` folder (the base game; an update next to it is
    detected automatically) and press **Play**.
 3. On first launch the game is prepared (a few seconds) in `%LOCALAPPDATA%\UFC3Native`. Each
@@ -61,7 +61,10 @@ and saves.
 
 | Setting | Values | Notes |
 |---|---|---|
-| Resolution | 720p / 1080p | Internal render resolution. |
+| Player name | text (16 ASCII characters) | The name the game shows. |
+| Controls... | per PS4 input | Keyboard key (click, then press it) and gamepad button. Saved to `bbport.ini`. |
+| Game resolution | 720p / 1080p | What the game renders. |
+| Display resolution | Same / 1080p / 1440p (2K) / 4K | Window size; the game's 1080p frame is scaled to it (use FSR 1.0 + sharpening). Fullscreen uses the monitor's size. |
 | FPS limit | 60 / 120 / 144 / 240 / **Unlimited** | The game never goes above 240. |
 | Present mode | Mailbox / VSync (FIFO) / **Immediate** | On NVIDIA, Mailbox stops at 2× the monitor's refresh rate; Immediate reaches 240 (may tear). |
 | Upscaling | Off / AMD FSR 1.0 | For an internal resolution below the monitor's. |
@@ -92,6 +95,14 @@ BB_ALLOW_DIRTY=1 bash scripts/package-windows.sh
 # -> dist/UFC3Native-windows-x86_64.zip  (UFC3.exe, bin/, embedded Python, scripts/)
 ```
 
+### Publishing a release
+
+Write the notes in `docs/ufc3/releases/<version>.md`, commit, then:
+
+```bash
+bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, creates the GitHub release
+```
+
 ## Key environment variables
 
 | Variable | UFC 3 default | What it does |
@@ -104,6 +115,8 @@ BB_ALLOW_DIRTY=1 bash scripts/package-windows.sh
 | `BB_WRITE_WINDOW` | 1 | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). |
 | `BB_GPU_WRITE_TWINS` | 0 | Incompatible with precise readbacks (deadlock). |
 | `BB_INTERNAL_WIDTH/HEIGHT`, `BB_FSR1`, `BB_RCAS` | from the launcher | Internal resolution and upscaling. |
+| `BB_WINDOW_SIZE` | from the launcher | Window size (`2560x1440`, `3840x2160`…); the game's frame is scaled to it. |
+| `BB_USER_NAME` | `Player 1` | The PS4 user name the game shows (16 bytes). |
 | `BB_FRAME_STATS` | 1 in `run.sh` | Periodic statistics in the log (FPS, µs per draw, readbacks, write sites…). |
 
 ## How it works

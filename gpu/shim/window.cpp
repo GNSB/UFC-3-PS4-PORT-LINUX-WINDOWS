@@ -68,6 +68,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     const SDL_DisplayID display = ChooseDisplay();
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+    // ufc3 (BB_WINDOW_SIZE=WxH): the window, and so the presented image, larger than the game's
+    // output (1440p, 4K): the presenter scales the game's frame to it (FSR 1.0 with BB_FSR1=1).
+    // Fullscreen takes the monitor's size anyway.
+    if (const char* size = std::getenv("BB_WINDOW_SIZE")) {
+        int w = 0, h = 0;
+        if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 7680 && h <= 4320) {
+            std::printf("Window: %dx%d (BB_WINDOW_SIZE), the game's output %dx%d scaled to it\n", w, h,
+                        width_, height_);
+            width_ = w;
+            height_ = h;
+        }
+    }
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);

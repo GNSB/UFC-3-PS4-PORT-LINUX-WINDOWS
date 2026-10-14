@@ -42,16 +42,20 @@ static wchar_t python[PATHW], game_exe[PATHW], caps_exe[PATHW];
 
 /* ---- settings (<data>\sacredfire.ini) ---- */
 typedef struct {
-    wchar_t game[PATHW], gamepad[128];
+    wchar_t game[PATHW], gamepad[128], player[32];
     int neo, fullscreen, clear_cache, validation, frame_stats, menu_trace;
     /* UFC 3, as the GoW3R launcher's Video panel: the PS4 output size, the frame-rate cap,
      * the swapchain present mode; show_fps mirrors bbport.ini. */
     int resolution, fps_mode, present_mode, show_fps, upscaler, sharpness;
+    /* The window (presented image) size: the game's 1080p frame scaled to 1440p / 4K. */
+    int display;
 } Settings;
 static Settings settings = {.resolution = 1, .fps_mode = 4, .present_mode = 2, .upscaler = 0, .sharpness = 2};
 /* Choices of the Video panel (index = the saved value). */
 static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080"};
 static const wchar_t *const resolution_w[] = {L"1280", L"1920"}, *const resolution_h[] = {L"720", L"1080"};
+static const wchar_t *const display_names[] = {L"Same as the game", L"1920x1080 (Full HD)", L"2560x1440 (2K)", L"3840x2160 (4K)"};
+static const wchar_t *const display_sizes[] = {NULL, L"1920x1080", L"2560x1440", L"3840x2160"};
 static const wchar_t *const fps_names[] = {L"60 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
 static const wchar_t *const fps_limits[] = {L"60", L"120", L"144", L"240", L"0"};
 /* Immediate is the default on Windows: NVIDIA's Mailbox there paced the menu at twice the
@@ -71,7 +75,7 @@ static const wchar_t *const managed_env[] = {
     L"BB_FULLSCREEN", L"BB_VK_VALIDATION", L"BB_FRAME_STATS", L"BB_MENU_TRACE", L"BB_GAMEPAD", L"BB_NEO",
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
     L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
-    L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
+    L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
 static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
@@ -128,6 +132,7 @@ static void settings_load(void) {
         *eq = 0; const wchar_t *value = eq + 1;
         if (!wcscmp(line, L"game")) wcsncpy(settings.game, value, PATHW - 1);
         else if (!wcscmp(line, L"gamepad")) wcsncpy(settings.gamepad, value, 127);
+        else if (!wcscmp(line, L"player")) wcsncpy(settings.player, value, 16);
         else if (!wcscmp(line, L"neo")) settings.neo = _wtoi(value);
         else if (!wcscmp(line, L"fullscreen")) settings.fullscreen = _wtoi(value);
         else if (!wcscmp(line, L"clear_cache")) settings.clear_cache = _wtoi(value);
@@ -139,6 +144,7 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"present_mode")) settings.present_mode = clampi(_wtoi(value), COUNT(present_names));
         else if (!wcscmp(line, L"upscaler")) settings.upscaler = clampi(_wtoi(value), COUNT(upscaler_names));
         else if (!wcscmp(line, L"sharpness")) settings.sharpness = clampi(_wtoi(value), COUNT(sharpness_names));
+        else if (!wcscmp(line, L"display")) settings.display = clampi(_wtoi(value), COUNT(display_names));
     }
     fclose(f);
 }
@@ -146,11 +152,12 @@ static void settings_save(void) {
     wchar_t path[PATHW]; settings_path(path);
     FILE *f = _wfopen(path, L"w, ccs=UTF-8");
     if (!f) return;
+    fwprintf(f, L"player=%ls\n", settings.player);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
-                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\n",
+                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
              settings.frame_stats, settings.menu_trace, settings.resolution, settings.fps_mode, settings.present_mode,
-             settings.upscaler, settings.sharpness);
+             settings.upscaler, settings.sharpness, settings.display);
     fclose(f);
 }
 /* bbport.ini: "key=value" lines (UTF-8), shared with the in-game menu. */
@@ -420,6 +427,7 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_FRAME_STATS", settings.frame_stats ? L"1" : NULL);
     game_env(L"BB_MENU_TRACE", settings.menu_trace ? L"1" : NULL);
     game_env(L"BB_GAMEPAD", settings.gamepad[0] ? settings.gamepad : NULL);
+    game_env(L"BB_USER_NAME", settings.player[0] ? settings.player : NULL); /* the PS4 user name the game shows */
     /* The fight scene renders black without precise readbacks of linear images (shadPS4 issue
      * #4375, UFC 4, same engine); precise readbacks deadlock against the GPU write twins, so
      * those stay off. The game asks for flip rate 1 (30 Hz); its simulation follows the real
@@ -435,6 +443,7 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
     game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);
     game_env(L"BB_INTERNAL_HEIGHT", resolution_h[settings.resolution]);
+    game_env(L"BB_WINDOW_SIZE", display_sizes[settings.display]);
     game_env(L"BB_FSR1", settings.upscaler == 1 ? L"1" : L"0");
     game_env(L"BB_RCAS", settings.sharpness ? L"1" : L"0");
     game_env(L"BB_RCAS_ATTENUATION", sharpness_attenuation[settings.sharpness]);
@@ -444,8 +453,9 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     logw(L"UFC 3: output %lsx%ls, frame limit %ls (0: none), present mode %ls, fullscreen %ls\n",
          env_or(L"BB_INTERNAL_WIDTH", L"?"), env_or(L"BB_INTERNAL_HEIGHT", L"?"), env_or(L"BB_FPS_LIMIT", L"?"),
          env_or(L"BB_PRESENT_MODE", L"?"), env_or(L"BB_FULLSCREEN", L"0"));
-    logw(L"UFC 3: FSR 1.0 %ls, RCAS %ls (attenuation %ls), readbacks %ls (2 = precise)\n",
-         env_or(L"BB_FSR1", L"0"), env_or(L"BB_RCAS", L"?"), env_or(L"BB_RCAS_ATTENUATION", L"?"), env_or(L"BB_READBACKS", L"?"));
+    logw(L"UFC 3: player name \"%ls\"\n", env_or(L"BB_USER_NAME", L"Player 1"));
+    logw(L"UFC 3: window %ls, FSR 1.0 %ls, RCAS %ls (attenuation %ls), readbacks %ls (2 = precise)\n",
+         env_or(L"BB_WINDOW_SIZE", L"= output"), env_or(L"BB_FSR1", L"0"), env_or(L"BB_RCAS", L"?"), env_or(L"BB_RCAS_ATTENUATION", L"?"), env_or(L"BB_READBACKS", L"?"));
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
         wchar_t cache[PATHW]; join(cache, PATHW, env_or(L"BB_USER_DIR", user_dir), L"cache\\CUSA06534");
         if (exists(cache)) {
@@ -650,7 +660,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_GAMEPAD, ID_RESCAN, ID_RESOLUTION, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -679,9 +689,214 @@ static void fill_gamepads(void) {
     }
     SendMessageW(combo, CB_SETCURSEL, selected, 0);
 }
+
+/* ---- Controls: key.<input>= / pad.<input>= lines of bbport.ini (runtime_pad.c reads them) ---- */
+enum { CTL_INPUTS = 25 };
+static const char *const ctl_inputs[CTL_INPUTS] = {
+    "cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3", "options", "touchpad",
+    "touchpad_right", "up", "down", "left", "right", "move_up", "move_down", "move_left", "move_right",
+    "look_up", "look_down", "look_left", "look_right"};
+static const wchar_t *const ctl_labels[CTL_INPUTS] = {
+    L"Cross (X)", L"Circle", L"Square", L"Triangle", L"L1", L"R1", L"L2", L"R2", L"L3 (left stick click)",
+    L"R3 (right stick click)", L"Options", L"Touchpad (left half)", L"Touchpad (right half)", L"D-pad up",
+    L"D-pad down", L"D-pad left", L"D-pad right", L"Left stick up", L"Left stick down", L"Left stick left",
+    L"Left stick right", L"Right stick up", L"Right stick down", L"Right stick left", L"Right stick right"};
+/* The runtime's defaults (runtime_pad.c bind_defaults), as SDL names. */
+static const char *const ctl_default_keys[CTL_INPUTS] = {
+    "Space", "Left Shift", "E", "Q", "1", "3", "R", "F", "Z", "C", "Return", "Tab", "Backspace",
+    "I", "K", "J", "L", "W", "S", "A", "D", "Up", "Down", "Left", "Right"};
+static const char *const ctl_default_pads[CTL_INPUTS] = {
+    "a", "b", "x", "y", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger", "leftstick",
+    "rightstick", "start", "back,touchpad", "", "dpup", "dpdown", "dpleft", "dpright"};
+/* Gamepad buttons (SDL names) and what they are on Xbox / PlayStation pads. */
+static const char *const ctl_pad_names[] = {
+    "", "a", "b", "x", "y", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger", "leftstick",
+    "rightstick", "start", "back", "guide", "touchpad", "dpup", "dpdown", "dpleft", "dpright", "misc1",
+    "paddle1", "paddle2", "paddle3", "paddle4"};
+static const wchar_t *const ctl_pad_labels[] = {
+    L"(none)", L"A / Cross", L"B / Circle", L"X / Square", L"Y / Triangle", L"LB / L1", L"RB / R1",
+    L"LT / L2", L"RT / R2", L"Left stick click", L"Right stick click", L"Start / Options", L"Back / Share",
+    L"Guide / PS", L"Touchpad click", L"D-pad up", L"D-pad down", L"D-pad left", L"D-pad right",
+    L"Misc (Share / Capture)", L"Paddle 1", L"Paddle 2", L"Paddle 3", L"Paddle 4"};
+static char ctl_keys[CTL_INPUTS][64], ctl_pads[CTL_INPUTS][64];
+static HWND ctl_window, ctl_key_buttons[CTL_INPUTS], ctl_pad_combos[CTL_INPUTS];
+static int ctl_capture = -1; /* the row waiting for a key */
+enum { ID_CTL_KEY = 2000, ID_CTL_PAD = 2100, ID_CTL_SAVE = 2200, ID_CTL_DEFAULTS, ID_CTL_CANCEL };
+
+static void ctl_show_key(int row) {
+    wchar_t text[96];
+    if (ctl_capture == row) wcscpy(text, L"Press a key... (Esc: cancel, Delete: none)");
+    else if (!ctl_keys[row][0]) wcscpy(text, L"(none)");
+    else { MultiByteToWideChar(CP_UTF8, 0, ctl_keys[row], -1, text, 96); }
+    SetWindowTextW(ctl_key_buttons[row], text);
+}
+static void ctl_show_pad(int row) {
+    if (row >= 17) return;
+    int selected = 0;
+    char first[64]; snprintf(first, sizeof(first), "%s", ctl_pads[row]);
+    char *comma = strchr(first, ','); if (comma) *comma = 0;
+    for (int i = 0; i < COUNT(ctl_pad_names); ++i) if (!_stricmp(first, ctl_pad_names[i])) selected = i;
+    SendMessageW(ctl_pad_combos[row], CB_SETCURSEL, selected, 0);
+}
+static void ctl_load(int defaults) {
+    for (int i = 0; i < CTL_INPUTS; ++i) {
+        char key[64];
+        snprintf(key, sizeof(key), "key.%s", ctl_inputs[i]);
+        const char *k = defaults ? NULL : ini_value(key);
+        snprintf(ctl_keys[i], sizeof(ctl_keys[i]), "%s", k ? k : ctl_default_keys[i]);
+        snprintf(key, sizeof(key), "pad.%s", ctl_inputs[i]);
+        const char *p = (defaults || i >= 17) ? NULL : ini_value(key);
+        snprintf(ctl_pads[i], sizeof(ctl_pads[i]), "%s", p ? p : (i < 17 ? ctl_default_pads[i] : ""));
+    }
+}
+static void ctl_save(void) {
+    for (int i = 0; i < CTL_INPUTS; ++i) {
+        char key[64];
+        snprintf(key, sizeof(key), "key.%s", ctl_inputs[i]); ini_set(key, ctl_keys[i]);
+        if (i < 17) { snprintf(key, sizeof(key), "pad.%s", ctl_inputs[i]); ini_set(key, ctl_pads[i]); }
+    }
+    logw(L"Controls saved to bbport.ini\n");
+}
+/* A Windows key press as SDL's scancode name (SDL_GetScancodeFromName in runtime_pad.c). */
+static int vk_to_sdl_name(WPARAM vk, LPARAM lparam, char *out, size_t n) {
+    const int extended = (lparam >> 24) & 1, scan = (lparam >> 16) & 0xff;
+    if (vk >= 'A' && vk <= 'Z') { snprintf(out, n, "%c", (int)vk); return 1; }
+    if (vk >= '0' && vk <= '9') { snprintf(out, n, "%c", (int)vk); return 1; }
+    if (vk >= VK_F1 && vk <= VK_F12) { snprintf(out, n, "F%d", (int)(vk - VK_F1 + 1)); return 1; }
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) { snprintf(out, n, "Keypad %d", (int)(vk - VK_NUMPAD0)); return 1; }
+    const char *name = NULL;
+    switch (vk) {
+    case VK_SPACE: name = "Space"; break;
+    case VK_RETURN: name = extended ? "Keypad Enter" : "Return"; break;
+    case VK_TAB: name = "Tab"; break;
+    case VK_BACK: name = "Backspace"; break;
+    case VK_SHIFT: name = scan == 0x36 ? "Right Shift" : "Left Shift"; break;
+    case VK_CONTROL: name = extended ? "Right Ctrl" : "Left Ctrl"; break;
+    case VK_MENU: name = extended ? "Right Alt" : "Left Alt"; break;
+    case VK_UP: name = "Up"; break;
+    case VK_DOWN: name = "Down"; break;
+    case VK_LEFT: name = "Left"; break;
+    case VK_RIGHT: name = "Right"; break;
+    case VK_HOME: name = "Home"; break;
+    case VK_END: name = "End"; break;
+    case VK_PRIOR: name = "PageUp"; break;
+    case VK_NEXT: name = "PageDown"; break;
+    case VK_INSERT: name = "Insert"; break;
+    case VK_CAPITAL: name = "CapsLock"; break;
+    case VK_OEM_COMMA: name = ","; break;
+    case VK_OEM_PERIOD: name = "."; break;
+    case VK_OEM_MINUS: name = "-"; break;
+    case VK_OEM_PLUS: name = "="; break;
+    case VK_OEM_1: name = ";"; break;
+    case VK_OEM_2: name = "/"; break;
+    case VK_OEM_3: name = "`"; break;
+    case VK_OEM_4: name = "["; break;
+    case VK_OEM_5: name = "\\"; break;
+    case VK_OEM_6: name = "]"; break;
+    case VK_OEM_7: name = "'"; break;
+    case VK_MULTIPLY: name = "Keypad *"; break;
+    case VK_ADD: name = "Keypad +"; break;
+    case VK_SUBTRACT: name = "Keypad -"; break;
+    case VK_DIVIDE: name = "Keypad /"; break;
+    case VK_DECIMAL: name = "Keypad ."; break;
+    }
+    if (!name) return 0;
+    snprintf(out, n, "%s", name);
+    return 1;
+}
+/* Called from the message loop: the key for the row waiting for one. */
+static int ctl_capture_key(const MSG *msg) {
+    if (ctl_capture < 0 || (msg->message != WM_KEYDOWN && msg->message != WM_SYSKEYDOWN)) return 0;
+    const int row = ctl_capture;
+    if (msg->wParam == VK_ESCAPE) { ctl_capture = -1; ctl_show_key(row); return 1; }
+    if (msg->wParam == VK_DELETE) { ctl_keys[row][0] = 0; ctl_capture = -1; ctl_show_key(row); return 1; }
+    char name[64];
+    if (!vk_to_sdl_name(msg->wParam, msg->lParam, name, sizeof(name))) return 1; /* not bindable: keep waiting */
+    for (int i = 0; i < CTL_INPUTS; ++i) /* one input per key: the old owner is cleared */
+        if (i != row && !_stricmp(ctl_keys[i], name)) { ctl_keys[i][0] = 0; ctl_show_key(i); }
+    snprintf(ctl_keys[row], sizeof(ctl_keys[row]), "%s", name);
+    ctl_capture = -1;
+    ctl_show_key(row);
+    return 1;
+}
+static HWND ctl_make(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
+    HWND h_wnd = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, sx(x), sx(y), sx(w), sx(h), ctl_window,
+                                 (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+    SendMessageW(h_wnd, WM_SETFONT, (WPARAM)ui_font, TRUE);
+    return h_wnd;
+}
+static void ctl_refresh(void) { for (int i = 0; i < CTL_INPUTS; ++i) { ctl_show_key(i); ctl_show_pad(i); } }
+static LRESULT CALLBACK ctl_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_COMMAND: {
+        const int id = LOWORD(wparam);
+        if (id >= ID_CTL_KEY && id < ID_CTL_KEY + CTL_INPUTS) {
+            const int previous = ctl_capture;
+            ctl_capture = id - ID_CTL_KEY;
+            if (previous >= 0) ctl_show_key(previous);
+            ctl_show_key(ctl_capture);
+        } else if (id >= ID_CTL_PAD && id < ID_CTL_PAD + 17 && HIWORD(wparam) == CBN_SELCHANGE) {
+            const int row = id - ID_CTL_PAD;
+            const int sel = (int)SendMessageW(ctl_pad_combos[row], CB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < COUNT(ctl_pad_names)) snprintf(ctl_pads[row], sizeof(ctl_pads[row]), "%s", ctl_pad_names[sel]);
+        } else if (id == ID_CTL_DEFAULTS) { ctl_capture = -1; ctl_load(1); ctl_refresh(); }
+        else if (id == ID_CTL_SAVE) { ctl_capture = -1; ctl_save(); DestroyWindow(window); }
+        else if (id == ID_CTL_CANCEL) { ctl_capture = -1; DestroyWindow(window); }
+        return 0;
+    }
+    case WM_CLOSE: ctl_capture = -1; DestroyWindow(window); return 0;
+    case WM_DESTROY: ctl_window = NULL; EnableWindow(main_window, TRUE); SetForegroundWindow(main_window); return 0;
+    }
+    return DefWindowProcW(window, message, wparam, lparam);
+}
+static void controls_open(void) {
+    if (ctl_window) { SetForegroundWindow(ctl_window); return; }
+    static int registered;
+    if (!registered) {
+        WNDCLASSW wc = {.lpfnWndProc = ctl_proc, .hInstance = GetModuleHandleW(NULL), .hCursor = LoadCursorW(NULL, IDC_ARROW),
+                        .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"UFC3NativeControls"};
+        RegisterClassW(&wc);
+        registered = 1;
+    }
+    ctl_load(0);
+    const int rows_h = 26, top = 40, client_w = 640, client_h = top + CTL_INPUTS * rows_h + 56;
+    RECT r = {0, 0, sx(client_w), sx(client_h)};
+    AdjustWindowRect(&r, WS_CAPTION | WS_SYSMENU, FALSE);
+    ctl_window = CreateWindowExW(WS_EX_DLGMODALFRAME, L"UFC3NativeControls", L"Controls", WS_CAPTION | WS_SYSMENU | WS_POPUP,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, main_window, NULL,
+                                 GetModuleHandleW(NULL), NULL);
+    if (!ctl_window) return;
+    ctl_make(L"STATIC", L"Keyboard: click a key box, then press the key. Gamepad: pick a button. The keyboard and a "
+                        L"gamepad work together.", 0, 12, 8, 616, 30, 0);
+    for (int i = 0; i < CTL_INPUTS; ++i) {
+        const int y = top + i * rows_h;
+        ctl_make(L"STATIC", ctl_labels[i], SS_CENTERIMAGE, 12, y, 180, 22, 0);
+        ctl_key_buttons[i] = ctl_make(L"BUTTON", L"", BS_PUSHBUTTON, 196, y, 230, 22, ID_CTL_KEY + i);
+        if (i < 17) {
+            ctl_pad_combos[i] = ctl_make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 436, y, 192, 300, ID_CTL_PAD + i);
+            for (int k = 0; k < COUNT(ctl_pad_labels); ++k) SendMessageW(ctl_pad_combos[i], CB_ADDSTRING, 0, (LPARAM)ctl_pad_labels[k]);
+        } else ctl_make(L"STATIC", L"(gamepad: the stick itself)", SS_CENTERIMAGE, 436, y, 192, 22, 0);
+    }
+    const int by = top + CTL_INPUTS * rows_h + 14;
+    ctl_make(L"BUTTON", L"Defaults", BS_PUSHBUTTON, 12, by, 110, 30, ID_CTL_DEFAULTS);
+    ctl_make(L"BUTTON", L"Save", BS_DEFPUSHBUTTON, 400, by, 110, 30, ID_CTL_SAVE);
+    ctl_make(L"BUTTON", L"Cancel", BS_PUSHBUTTON, 518, by, 110, 30, ID_CTL_CANCEL);
+    ctl_refresh();
+    EnableWindow(main_window, FALSE);
+    ShowWindow(ctl_window, SW_SHOW);
+}
+
 /* The window into the settings; patch switches go to bbport.ini when they changed. */
 static void read_controls(void) {
     GetWindowTextW(control(ID_GAME), settings.game, PATHW); trimw(settings.game);
+    {
+        /* The PS4 allows 16 characters; the game reads them as bytes: printable ASCII only. */
+        wchar_t name[64]; GetWindowTextW(control(ID_PLAYER), name, 64); trimw(name);
+        int k = 0;
+        for (int i = 0; name[i] && k < 16; ++i) if (name[i] >= 0x20 && name[i] < 0x7f) settings.player[k++] = name[i];
+        settings.player[k] = 0;
+        SetWindowTextW(control(ID_PLAYER), settings.player);
+    }
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
     settings.fullscreen = checked(ID_FULLSCREEN); settings.clear_cache = checked(ID_CLEAR);
@@ -691,6 +906,7 @@ static void read_controls(void) {
     settings.present_mode = clampi((int)SendMessageW(control(ID_PRESENT), CB_GETCURSEL, 0, 0), COUNT(present_names));
     settings.upscaler = clampi((int)SendMessageW(control(ID_UPSCALER), CB_GETCURSEL, 0, 0), COUNT(upscaler_names));
     settings.sharpness = clampi((int)SendMessageW(control(ID_SHARPNESS), CB_GETCURSEL, 0, 0), COUNT(sharpness_names));
+    settings.display = clampi((int)SendMessageW(control(ID_DISPLAY), CB_GETCURSEL, 0, 0), COUNT(display_names));
     const int show_fps = checked(ID_SHOWFPS);
     ini_set("show_fps", show_fps ? "1" : "0"); /* written always: the game's own default is off */
     settings.show_fps = show_fps;
@@ -749,6 +965,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         const int id = LOWORD(wparam);
         if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(folder)) SetWindowTextW(control(ID_GAME), folder); }
         else if (id == ID_RESCAN) { gamepads_refresh(); fill_gamepads(); logw(L"Controllers: %d found\n", gamepad_count); }
+        else if (id == ID_CONTROLS && !running) controls_open();
         else if (id == ID_PLAY && !running) {
             read_controls();
             open_log_file(NULL);
@@ -820,7 +1037,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
     /* The client area is 760x640 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(728);
+    const int client_w = sx(760), client_h = sx(794);
     main_window = CreateWindowExW(0, wc.lpszClassName, L"EA SPORTS UFC 3 - native PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
@@ -839,25 +1056,31 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"STATIC", L"EA SPORTS UFC 3 (CUSA06534): the game folder (CUSA06534-patch beside it is merged automatically):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"EDIT", settings.game, WS_BORDER | ES_AUTOHSCROLL, 12, y, 640, 24, ID_GAME);
     make(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 660, y, 88, 24, ID_BROWSE); y += 34;
+    make(L"STATIC", L"Player name (shown in the game; 16 letters, no accents):", 0, 12, y + 4, 330, 18, 0);
+    make(L"EDIT", settings.player[0] ? settings.player : L"Player 1", WS_BORDER | ES_AUTOHSCROLL, 344, y, 200, 24, ID_PLAYER);
+    SendMessageW(control(ID_PLAYER), EM_SETLIMITTEXT, 16, 0); y += 34;
     make(L"STATIC", L"Controller for player 1 (in-game menu: L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 640, 200, ID_GAMEPAD);
-    make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 660, y, 88, 24, ID_RESCAN); y += 34;
-    make(L"BUTTON", L"Video", BS_GROUPBOX, 12, y, 360, 184, 0);
-    make(L"STATIC", L"Output resolution", 0, 24, y + 24, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 520, 200, ID_GAMEPAD);
+    make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 540, y, 88, 24, ID_RESCAN);
+    make(L"BUTTON", L"Controls...", BS_PUSHBUTTON, 636, y, 112, 24, ID_CONTROLS); y += 34;
+    make(L"BUTTON", L"Video", BS_GROUPBOX, 12, y, 360, 216, 0);
+    make(L"STATIC", L"Game resolution", 0, 24, y + 24, 130, 20, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 20, 200, 200, ID_RESOLUTION);
-    make(L"STATIC", L"Present mode", 0, 24, y + 56, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 52, 200, 200, ID_PRESENT);
-    make(L"STATIC", L"Upscaling", 0, 24, y + 88, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 84, 200, 200, ID_UPSCALER);
-    make(L"STATIC", L"Sharpening (RCAS)", 0, 24, y + 120, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 116, 200, 200, ID_SHARPNESS);
-    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 152, 330, 20, ID_FULLSCREEN);
-    make(L"BUTTON", L"Frame rate", BS_GROUPBOX, 388, y, 360, 184, 0);
+    make(L"STATIC", L"Display resolution", 0, 24, y + 56, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 52, 200, 200, ID_DISPLAY);
+    make(L"STATIC", L"Present mode", 0, 24, y + 88, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 84, 200, 200, ID_PRESENT);
+    make(L"STATIC", L"Upscaling", 0, 24, y + 120, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 116, 200, 200, ID_UPSCALER);
+    make(L"STATIC", L"Sharpening (RCAS)", 0, 24, y + 152, 130, 20, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 148, 200, 200, ID_SHARPNESS);
+    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 184, 330, 20, ID_FULLSCREEN);
+    make(L"BUTTON", L"Frame rate", BS_GROUPBOX, 388, y, 360, 216, 0);
     make(L"STATIC", L"FPS limit", 0, 400, y + 24, 130, 20, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 536, y + 20, 200, 200, ID_FPS);
     make(L"BUTTON", L"Show the FPS counter", BS_AUTOCHECKBOX, 400, y + 56, 330, 20, ID_SHOWFPS);
     make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 88, 330, 20, ID_CLEAR);
-    make(L"STATIC", L"FSR 1.0 works when the screen is larger than the output\r\n(e.g. output 720p on a 1080p screen, fullscreen).", 0, 400, y + 120, 340, 40, 0); y += 194;
+    make(L"STATIC", L"2K / 4K: the game draws 1080p; pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
     make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
     make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
@@ -867,11 +1090,12 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 728 - y - 12, ID_LOG);
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 794 - y - 12, ID_LOG);
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
     {
         const struct { int id, count, selected; const wchar_t *const *names; } combos[] = {
             {ID_RESOLUTION, COUNT(resolution_names), settings.resolution, resolution_names},
+            {ID_DISPLAY, COUNT(display_names), settings.display, display_names},
             {ID_FPS, COUNT(fps_names), settings.fps_mode, fps_names},
             {ID_PRESENT, COUNT(present_names), settings.present_mode, present_names},
             {ID_UPSCALER, COUNT(upscaler_names), settings.upscaler, upscaler_names},
@@ -892,6 +1116,8 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     ShowWindow(main_window, SW_SHOW);
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (ctl_capture_key(&msg)) continue;
+        if (ctl_window && IsDialogMessageW(ctl_window, &msg)) continue;
         if (!IsDialogMessageW(main_window, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     return 0;

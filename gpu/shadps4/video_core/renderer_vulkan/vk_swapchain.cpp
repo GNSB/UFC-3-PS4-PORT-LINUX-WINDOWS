@@ -9,6 +9,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -106,13 +107,7 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
-    if (result != vk::Result::eSuccess) {
-        LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
-                    vk::to_string(result));
-    }
-
-    needs_hdr = hdr;
+    needs_hdr = hdr; // Recreate -> Destroy waits for the queues (under the submit lock)
     Recreate(width, height);
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
                                                  : surface_format.format);
@@ -154,6 +149,12 @@ bool Swapchain::Present() {
 
     auto result = instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
+        needs_recreation = true;
+    } else if (result == vk::Result::eErrorSurfaceLostKHR) {
+        // ufc3: the window changed under the swapchain (Windows: mode or monitor change):
+        // a new swapchain instead of a crash.
+        LOG_WARNING(Render_Vulkan, "Swapchain presentation: {}, recreating",
+                    vk::to_string(result));
         needs_recreation = true;
     } else {
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
@@ -289,10 +290,21 @@ void Swapchain::SetSurfaceProperties() {
 
 void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
-    const auto wait_result = device.waitIdle();
-    if (wait_result != vk::Result::eSuccess) {
-        LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
-                    vk::to_string(wait_result));
+    // ufc3: vkDeviceWaitIdle needs every queue externally synchronized, but the recording
+    // threads submit on their own (BB_ASYNC_SUBMIT): resizing, moving or minimizing a window
+    // crashed the NVIDIA driver here. The swapchain's images are used by the graphics and
+    // present queues only: those are waited for, with submissions held off meanwhile.
+    {
+        std::scoped_lock lk{Scheduler::submit_mutex};
+        auto wait_result = instance.GetGraphicsQueue().waitIdle();
+        if (wait_result == vk::Result::eSuccess &&
+            instance.GetPresentQueue() != instance.GetGraphicsQueue()) {
+            wait_result = instance.GetPresentQueue().waitIdle();
+        }
+        if (wait_result != vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "Failed to wait for the queues to become idle: {}",
+                        vk::to_string(wait_result));
+        }
     }
 
     for (auto& image_view : images_view) {

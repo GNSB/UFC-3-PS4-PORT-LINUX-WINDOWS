@@ -16,7 +16,7 @@ tc=${LLVM_MINGW_ROOT:-$root/toolchain/${toolchain_tar%.tar.xz}}
 readobj=$tc/bin/llvm-readobj
 [[ -f $root/bin/sacredfire-game.exe && -f $root/bin/SacredFire.exe && -f $root/bin/VERSION ]] || { echo 'Build first: scripts/build-windows.sh' >&2; exit 1; }
 built_from=$(cat "$root/bin/VERSION")
-checkout=$(git describe --tags --match 'v*' --always 2>/dev/null || echo unknown)
+checkout=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
 git update-index -q --refresh 2>/dev/null || true
 git diff-index --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null || checkout="$checkout-dirty"
 if [[ -z ${BB_ALLOW_DIRTY:-} ]]; then
@@ -76,7 +76,9 @@ pth=$(ls "$stage"/python/python*._pth | head -1)
 printf 'python%s.zip\n.\n..\\scripts\n..\\tools\n' "$(basename "$pth" | sed 's/python\([0-9]*\)\._pth/\1/')" > "$pth"
 mkdir -p "$stage/scripts"; cp scripts/*.py "$stage/scripts/"
 cp tools/gen_import_names.py "$stage/tools/"
-cp -r patches "$stage/patches"
+# Community patches only: not the disabled CTR file, not shader dumps taken from the game.
+mkdir -p "$stage/patches"
+find patches -maxdepth 1 -type f -name '*.xml' -exec cp {} "$stage/patches/" \;
 cp "$root/downloads/aerolib.inl" "$stage/share/aerolib.inl"
 cp LICENSE "$stage/LICENSE"; cp "$root/bin/VERSION" "$stage/VERSION"
 cp packaging/windows/README-Windows.md "$stage/README-Windows.md"

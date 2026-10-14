@@ -716,11 +716,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     scheduler.Flush(info);
 
     // Present to swapchain.
+    bool presented;
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
-        }
+        presented = swapchain.Present();
+    }
+    if (!presented) {
+        // Outside the submit lock: Destroy takes it to wait for the queues.
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     free_frame();
