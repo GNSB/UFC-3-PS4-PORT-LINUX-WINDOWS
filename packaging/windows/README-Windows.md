@@ -40,7 +40,7 @@ your own dump of the game and its 1.14 update.
 ## Problems
 
 Send the newest log from `%LOCALAPPDATA%\UFC3Native\logs` (the launcher's **Open logs folder**)
-with a short description. Known issue: noise on the octagon floor.
+with a short description.
 
 If the launcher's log says a program "could not start" (Windows error 0xC0000022, access
 denied): allow the file in your antivirus (Windows Security > Protection history), extract the

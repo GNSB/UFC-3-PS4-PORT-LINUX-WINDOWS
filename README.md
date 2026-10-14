@@ -30,7 +30,7 @@ and saves.
 
 - Tested on NVIDIA (Linux and Windows). The AMD code paths are SacredFire's (developed on AMD /
   Steam Deck), but **UFC 3 has not been tested on an AMD GPU yet**.
-- Known issues: noise / gray blocks on the octagon floor; moving the window to another monitor *during startup* can crash the NVIDIA driver
+- Known issues: moving the window to another monitor *during startup* can crash the NVIDIA driver
   (`Swapchain::Destroy`).
 
 ## Requirements
