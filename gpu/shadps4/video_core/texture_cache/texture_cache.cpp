@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <unordered_map>
 #include <unordered_set>
 #include <xxhash.h>
 
@@ -92,6 +93,55 @@ void LogT6a(char kind, VAddr address, const char* format, Args... args) {
     }
     std::printf(format, args...);
 }
+
+// UFC-13: diagnostics only; never download tiled images as linear pixels. Called on the
+// GPU thread. Group by layout rather than address so per-frame allocations cannot flood logs.
+void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_readback,
+                const u8* pixels = nullptr, u32 bytes = 0) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_T4_TRACE");
+        return env && env[0] == '1';
+    }();
+    const auto& info = image.info;
+    if (!enabled || info.size.width < 64 || info.size.height < 64 || info.props.is_depth ||
+        info.props.is_block || info.props.is_volume) {
+        return;
+    }
+    static std::unordered_map<std::string, u32> counts;
+    const auto layout = fmt::format("{} {}x{} pitch={} fmt={} tile={} tiled={}", event,
+                                    info.size.width, info.size.height, info.pitch,
+                                    vk::to_string(info.pixel_format), u32(info.tile_mode),
+                                    bool(info.props.is_tiled));
+    auto it = counts.find(layout);
+    if (it == counts.end()) {
+        if (counts.size() >= 512) {
+            return;
+        }
+        it = counts.emplace(layout, 0).first;
+    }
+    if (it->second >= 32) {
+        return;
+    }
+    ++it->second;
+    std::string content;
+    if (pixels && bytes) {
+        // This is the completed host staging copy, never a read of protected guest pages.
+        u32 nonzero = 0;
+        for (u32 i = 0; i < bytes; ++i) {
+            nonzero += pixels[i] != 0;
+        }
+        content = fmt::format(" host_bytes={} nonzero={} hash={:#x}", bytes, nonzero,
+                              XXH3_64bits(pixels, bytes));
+    }
+    std::printf("[T4] tick=%llu %s addr=%#llx guest_bytes=%u mips=%u layers=%u "
+                "samples=%u flags=%#x linear_eligible=%d%s\n",
+                static_cast<unsigned long long>(tick), layout.c_str(),
+                static_cast<unsigned long long>(info.guest_address), info.guest_size,
+                info.resources.levels, info.resources.layers, info.num_samples, u32(image.flags),
+                linear_readback && (!info.props.is_tiled || info.size.width <= 8) &&
+                    info.guest_address != 0,
+                content.c_str());
+}
 } // Anonymous namespace
 
 std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
@@ -158,6 +208,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         const auto [arena, offset] =
             buffer_cache.ObtainBuffer(image.info.guest_address, download_size, true);
         if (buffer_cache.IsInPlace(image.info.guest_address, download_size)) {
+            LogT4Image(image, "download-in-place", scheduler.CurrentTick(), readback_linear_images);
             image_copy.bufferOffset = offset;
             runtime.DownloadImage(&image, arena, std::span{&image_copy, 1});
             return;
@@ -184,12 +235,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
+        LogT4Image(image, "download-host", scheduler.CurrentTick(), readback_linear_images,
+                   download.mapped, download_size);
         BbFreeCheck::Check(image.info.guest_address, download_size, download.mapped,
                            BbFreeCheck::ImageDownload);
         BbClobber::NoteWrite(image.info.guest_address, 0, u32(download_size),
                              BbClobber::ImageDownload);
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        const bool written = Core::Memory::Instance()->TryWriteBacking(
+            std::bit_cast<u8*>(image.info.guest_address), download.mapped, download_size);
+        LogT4Image(image, written ? "guest-written" : "guest-write-failed",
+                   scheduler.CurrentTick(), readback_linear_images);
         if (!WriteTracking()) {
             buffer_cache.InvalidateMemory(image.info.guest_address, download_size);
         }
@@ -964,6 +1019,8 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     if (refresh) {
         UpdateImage(image_id);
     }
+    LogT4Image(image, desc.type == BindingType::Storage ? "storage" : "sampled",
+               scheduler.CurrentTick(), readback_linear_images);
     if (memo && !BbToggle::Disabled(BbToggle::TextureViewMemo)) {
         if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
             return slot_image_views[memo->view_id];
@@ -993,6 +1050,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    LogT4Image(image, "render-target", scheduler.CurrentTick(), readback_linear_images);
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
