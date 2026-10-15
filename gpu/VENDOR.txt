@@ -57,3 +57,12 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   (BB_T7_TRACE_AFTER, 0: never) every draw of two frames rendering to or sampling their colour or
   depth target, in order. Pending: why the torso alpha is low here (alpha scale, mask, second UV
   set) and what draws the dark layer under it.
+  Fifth pass: the user's A/B shows the 23682-index draw is the long hair (BB_ALPHA_TO_MASK_DRAWS=
+  23682 fixes it) and that the torso goes dark even with no draw emulated (=_DRAWS=1), which =0
+  does not do. The baked-albedo guard is gone (it excluded every long hairstyle: all sample a
+  run-time 8_8_8_8 sRGB colour map). Every gate, _SKIP and _DRAWS included, is now decided before
+  the stages compile: the fourth pass compiled and bound the dither variant of a draw it then left
+  out, and went through the stage selection twice. The [T7] trace is off by default
+  (BB_T7_TRACE_AFTER unset or 0; its frames skip the prepared pipelines), and the "[T7] draw"
+  constant-buffer dwords are read on the GPU thread only. A draw left out now takes exactly the
+  BB_ALPHA_TO_MASK=0 path. Cache versions unchanged.

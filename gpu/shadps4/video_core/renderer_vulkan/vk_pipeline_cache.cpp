@@ -528,8 +528,9 @@ namespace {
 /// [T7] trace (UFC-7): once per session, every draw of two frames that renders to the colour or
 /// depth target of the DB_ALPHA_TO_MASK draws or samples them, in order: what is drawn under and
 /// over the hair and torso, and what reads the target afterwards. Armed on the
-/// BB_T7_TRACE_AFTER-th frame (default 120, 0: never) with such draws. GPU thread, except
-/// NoteAlphaToMaskDraw (draw-preparation workers too).
+/// BB_T7_TRACE_AFTER-th frame with such draws (unset or 0: never; it changes the frames it
+/// traces, which skip the prepared pipelines). GPU thread, except NoteAlphaToMaskDraw
+/// (draw-preparation workers too).
 struct AlphaToMaskTrace {
     std::mutex mutex;
     u64 color = 0, depth = 0;
@@ -545,7 +546,7 @@ constexpr u32 TraceMaxLines = 800;
 u32 TraceAfterFrames() {
     static const u32 after = [] {
         const char* env = std::getenv("BB_T7_TRACE_AFTER");
-        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 120u;
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
     }();
     return after;
 }
@@ -899,7 +900,7 @@ static bool AlphaToMaskSkipped(u64 ps_hash) {
 
 /// bbport: BB_ALPHA_TO_MASK_DRAWS=<indices>,...: per-draw A/B without recompiling. Positive
 /// entries: only draws with that index count are emulated; negative ones (-23682): those are left
-/// out. Setting it also drops the baked-albedo guard below, so the list alone decides.
+/// out.
 struct AlphaToMaskDrawList {
     std::unordered_set<u32> only, except;
     bool set = false;
@@ -926,34 +927,6 @@ static bool AlphaToMaskDrawWanted(u32 num_indices) {
     const auto& list = AlphaToMaskDraws();
     return !list.except.contains(num_indices) &&
            (list.only.empty() || list.only.contains(num_indices));
-}
-
-/// UFC-7 baked-albedo guard (default; BB_ALPHA_TO_MASK=all or BB_ALPHA_TO_MASK_DRAWS turn it
-/// off). UFC 3 Create Fighter draws two meshes with the hair pixel shader 39d6a7df and
-/// DB_ALPHA_TO_MASK (alpha = material constant x red of an alpha mask, second UV set): the head
-/// hair, whose colour map is a block-compressed asset, and the torso (23682 indices), whose colour
-/// map is the fighter's skin baked at run time into a 1024x1024 8_8_8_8 sRGB texture. With that
-/// draw at full coverage (emulation off) the torso is normal skin with chest hair; dithered by its
-/// alpha the torso shows what is under it, a dark sleeveless shape ending at the clavicle. Why
-/// its alpha is low here and not on the console is open (see VENDOR.txt): until then draws that
-/// sample a run-time colour map (2D 8_8_8_8 sRGB) keep full coverage.
-static bool AlphaToMaskGuarded() {
-    static const bool guarded = [] {
-        const char* env = std::getenv("BB_ALPHA_TO_MASK");
-        return !(env && std::string_view{env} == "all") && !AlphaToMaskDraws().set;
-    }();
-    return guarded;
-}
-static bool SamplesBakedAlbedo(const Shader::Info& fs) {
-    for (const auto& image : fs.images) {
-        const auto tsharp = image.GetSharp(fs);
-        if (tsharp.GetType() == AmdGpu::ImageType::Color2D &&
-            AmdGpu::DataFormat(tsharp.data_format) == AmdGpu::DataFormat::Format8_8_8_8 &&
-            AmdGpu::NumberFormat(tsharp.num_format) == AmdGpu::NumberFormat::Srgb) {
-            return true;
-        }
-    }
-    return false;
 }
 
 /// Alpha to mask takes the coverage from the alpha of the MRT0 export: off when that export
@@ -1042,7 +1015,9 @@ static void LogAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
         buffers += fmt::format(" b{}={:#x}+{}", i, vsharp.base_address, vsharp.GetSize());
         // 39d6a7df: MRT0 alpha = b2 dword 24 x red of t4 (second UV set); dwords 20-24 of each
         // small constant buffer, to compare the alpha scale of the hair and torso draws.
-        if (vsharp.base_address != 0 && vsharp.GetSize() >= 25 * 4 && vsharp.GetSize() <= 4096) {
+        // GPU thread only: ahead of it a worker may find that memory already reused.
+        if (!sel.worker && vsharp.base_address != 0 && vsharp.GetSize() >= 25 * 4 &&
+            vsharp.GetSize() <= 4096) {
             const auto* f = reinterpret_cast<const float*>(vsharp.base_address);
             buffers += fmt::format(" [20..24] {} {} {} {} {}", f[20], f[21], f[22], f[23], f[24]);
         }
@@ -1146,18 +1121,31 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     // the fork. Decided before the stages are compiled, from the samples of the bound targets.
     // The register is context state that stays set across draws; the hardware ignores it when
     // the pixel shader's DB_SHADER_CONTROL sets ALPHA_TO_MASK_DISABLE or MRT0 exports no alpha.
-    // Without these gates draws whose MRT0 alpha is not coverage (UFC 3: the fighter's torso in
-    // Create Fighter came out black) were dithered away.
+    // Every gate (BB_ALPHA_TO_MASK_SKIP, _DRAWS included) is decided here, before the stages
+    // compile: a draw left out never selects the dither variant, so it goes through exactly the
+    // path of BB_ALPHA_TO_MASK=0. (UFC-7: the fourth pass compiled and bound the variant first
+    // and only then dropped it; with no draw emulated the result already differed from =0.)
     const u32 alpha_to_mask = regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC];
     const bool alpha_to_mask_set = AlphaToMaskEnabled() && (alpha_to_mask & 1);
     bool alpha_to_mask_on = alpha_to_mask_set;
     const char* alpha_to_mask_mode = "none";
-    if (alpha_to_mask_set && regs.depth_shader_control.alpha_to_mask_disable) {
-        alpha_to_mask_mode = "off (DB_SHADER_CONTROL)";
-        alpha_to_mask_on = false;
-    } else if (alpha_to_mask_set && !ExportHasAlpha(regs.color_export_format.GetFormat(0))) {
-        alpha_to_mask_mode = "off (MRT0 export without alpha)";
-        alpha_to_mask_on = false;
+    if (alpha_to_mask_set) {
+        if (regs.depth_shader_control.alpha_to_mask_disable) {
+            alpha_to_mask_mode = "off (DB_SHADER_CONTROL)";
+            alpha_to_mask_on = false;
+        } else if (!ExportHasAlpha(regs.color_export_format.GetFormat(0))) {
+            alpha_to_mask_mode = "off (MRT0 export without alpha)";
+            alpha_to_mask_on = false;
+        } else if (!regs.ps_program.Address<u32*>()) {
+            alpha_to_mask_mode = "off (no pixel shader)";
+            alpha_to_mask_on = false;
+        } else if (AlphaToMaskSkipped(AmdGpu::GetParams(regs.ps_program).hash)) {
+            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_SKIP)";
+            alpha_to_mask_on = false;
+        } else if (!AlphaToMaskDrawWanted(regs.num_indices)) {
+            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_DRAWS)";
+            alpha_to_mask_on = false;
+        }
     }
     const bool alpha_to_coverage = AlphaToCoverageWanted() && bound_samples > 1;
     sel.alpha_to_mask = alpha_to_mask_on && !alpha_to_coverage ? (alpha_to_mask & 0x1FF01) : 0;
@@ -1167,24 +1155,17 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         return false;
     }
     if (alpha_to_mask_on) {
+        // A pixel shader without an MRT0 export has nothing to take coverage from (the variant's
+        // code is the plain one then; only its specialization differs, so select the plain one).
         const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
-        if (!fs || !(fs->mrt_mask & 1)) {
+        if (fs && !(fs->mrt_mask & 1)) {
             alpha_to_mask_mode = "off (no MRT0 export)";
             alpha_to_mask_on = false;
-        } else if (AlphaToMaskSkipped(fs->pgm_hash)) {
-            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_SKIP)";
-            alpha_to_mask_on = false;
-        } else if (!AlphaToMaskDrawWanted(regs.num_indices)) {
-            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_DRAWS)";
-            alpha_to_mask_on = false;
-        } else if (AlphaToMaskGuarded() && SamplesBakedAlbedo(*fs)) {
-            alpha_to_mask_mode = "off (baked albedo)";
-            alpha_to_mask_on = false;
-        }
-        if (!alpha_to_mask_on && sel.alpha_to_mask != 0) {
-            sel.alpha_to_mask = 0;
-            if (!RefreshGraphicsStages(sel)) {
-                return false;
+            if (sel.alpha_to_mask != 0) {
+                sel.alpha_to_mask = 0;
+                if (!RefreshGraphicsStages(sel)) {
+                    return false;
+                }
             }
         }
     }
