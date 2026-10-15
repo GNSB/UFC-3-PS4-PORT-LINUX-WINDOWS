@@ -238,6 +238,8 @@ struct HwFragmentRuntimeInfo {
     bool clip_distance_emulation{false};
     /// bbport: writes the object motion vector to MotionVectors::Output.
     bool motion_vectors{false};
+    /// DB_ALPHA_TO_MASK (enable, dither offsets, rounding) when alpha to coverage is emulated.
+    u32 alpha_to_mask{};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -247,7 +249,7 @@ struct HwFragmentRuntimeInfo {
                front_face_all_bits == other.front_face_all_bits &&
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
-               motion_vectors == other.motion_vectors &&
+               motion_vectors == other.motion_vectors && alpha_to_mask == other.alpha_to_mask &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

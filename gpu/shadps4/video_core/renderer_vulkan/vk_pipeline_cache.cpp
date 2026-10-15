@@ -223,6 +223,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
             info.hw.fs.color_buffers[i] = sel.graphics_key.color_buffers[i];
         }
+        // DB_ALPHA_TO_MASK: with one sample the hardware turns MRT0 alpha into a 2x2 dither
+        // pattern (games resolve it with TAA, e.g. hair cards). Emulated in the shader.
+        info.hw.fs.alpha_to_mask = sel.alpha_to_mask;
         // Lowered user clip planes ride the same emulation path as guest-exported distances, so
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
         // locations in sync with the shifted vertex outputs.
@@ -716,6 +719,37 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
+/// [T7] each fragment shader drawn with DB_ALPHA_TO_MASK once, to see whether UFC 3 uses it.
+static void LogAlphaToMask(const PipelineSelection& sel, u32 reg, u32 samples) {
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    const u64 hash = fs ? fs->pgm_hash : 0;
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged;
+    {
+        std::scoped_lock lock{log_mutex};
+        if (!logged.insert(hash).second) {
+            return;
+        }
+    }
+    const char* mode = sel.graphics_key.alpha_to_coverage ? "alphaToCoverage"
+                       : sel.alpha_to_mask                ? "shader dither"
+                                                          : "none";
+    LOG_INFO(Render_Vulkan,
+             "[T7] DB_ALPHA_TO_MASK ps {:016x}: reg {:#07x} (offsets {}{}{}{}, round {}), "
+             "samples {} -> {}",
+             hash, reg, (reg >> 8) & 3, (reg >> 10) & 3, (reg >> 12) & 3, (reg >> 14) & 3,
+             (reg >> 16) & 1, samples, mode);
+}
+
+/// bbport: BB_ALPHA_TO_MASK=0 turns off the DB_ALPHA_TO_MASK emulation (69ab1996).
+static bool AlphaToMaskEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
 bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     std::memset(&sel.graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = (*sel.regs);
@@ -760,6 +794,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
     sel.motion = false;
 
+    u32 bound_samples = key.depth_samples;
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
@@ -767,6 +802,8 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             // No attachment bound or writing to it is disabled.
             continue;
         }
+
+        bound_samples = std::max<u32>(bound_samples, col_buf.NumSamples());
 
         // Fill color target information
         auto& color_buffer = key.color_buffers[cb];
@@ -784,6 +821,13 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             bc.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcColor &&
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
     }
+
+    // DB_ALPHA_TO_MASK (69ab1996): multisampled targets use Vulkan alpha to coverage, single
+    // sample targets a dither discard in the fragment shader. Decided before the stages are
+    // compiled, from the samples of the bound targets.
+    const u32 alpha_to_mask = regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC];
+    const bool alpha_to_mask_on = AlphaToMaskEnabled() && (alpha_to_mask & 1);
+    sel.alpha_to_mask = alpha_to_mask_on && bound_samples <= 1 ? (alpha_to_mask & 0x1FF01) : 0;
 
     // Compile and bind shader stages
     if (!RefreshGraphicsStages(sel)) {
@@ -892,6 +936,11 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             key.color_samples.fill(key.depth_samples);
             key.num_samples = key.depth_samples;
         }
+    }
+
+    key.alpha_to_coverage = alpha_to_mask_on && bound_samples > 1 && key.num_samples > 1;
+    if (alpha_to_mask_on) {
+        LogAlphaToMask(sel, alpha_to_mask, bound_samples);
     }
 
     return true;

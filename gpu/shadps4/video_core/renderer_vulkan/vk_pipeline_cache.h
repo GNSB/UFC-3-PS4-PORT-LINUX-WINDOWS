@@ -94,6 +94,8 @@ struct PipelineSelection {
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     bool motion = false;
+    /// bbport: DB_ALPHA_TO_MASK emulated in the fragment shader (single sample targets), else 0.
+    u32 alpha_to_mask = 0;
     DrawIndirectParams draw_indirect_params{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
 };

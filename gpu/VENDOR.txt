@@ -27,3 +27,11 @@ Backported video_core fixes (UFC-5):
   host format (x1 for a real D16 with BB_Z16S8_AS_D16=1).
   72251298 (mancelli's fork) depth read as a color format: only the Z32 -> R32_UINT case and
   freeing copies with their image, on top of ufc3's DepthAsR16 (per-layer 2D views, AMD 0003).
+
+Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
+  69ab1996 (mancelli's fork) DB_ALPHA_TO_MASK emulated: alphaToCoverageEnable on multisampled
+  targets (new pipeline key bit), 2x2 dither discard of MRT0 in the fragment shader with one
+  sample. ufc3: the switch is BB_ALPHA_TO_MASK=0 (not SHADPS4_ALPHA_TO_MASK); the mode is chosen
+  from the samples of the bound targets before the stages compile (the fork reads the key's
+  num_samples there, which is still the depth samples); "[T7]" log once per pixel shader.
+  Cache versions: ShaderBinaryVersion 11, ShaderMetaVersion 10, PipelineKeyVersion 7.
