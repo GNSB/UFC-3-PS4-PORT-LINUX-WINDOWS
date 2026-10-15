@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "bbport_toggles.h"
+#include <atomic>
 #include <ranges>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -183,8 +184,35 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
+    auto image_format_properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    // ufc3 on AMD (RX 9070, AMD proprietary driver): BC5 with storage usage + block texel view is
+    // reported unsupported (NVIDIA accepts it). Creating it anyway is undefined: the floor's
+    // two-channel textures came out as noise. A compressed image is never a storage target, so
+    // drop storage first, then block texel views, until the driver accepts the combination.
+    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
+        info.props.is_block) {
+        vk::PhysicalDeviceImageFormatInfo2 retry = format_info;
+        retry.usage &= ~vk::ImageUsageFlagBits::eStorage;
+        auto props = instance.GetPhysicalDevice().getImageFormatProperties2(retry);
+        if (props.result == vk::Result::eErrorFormatNotSupported &&
+            (retry.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible)) {
+            retry.flags &= ~vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+            props = instance.GetPhysicalDevice().getImageFormatProperties2(retry);
+        }
+        if (props.result == vk::Result::eSuccess) {
+            static std::atomic<int> notes{0};
+            if (notes.fetch_add(1, std::memory_order_relaxed) < 4) {
+                LOG_WARNING(Render_Vulkan, "image format {}: created without {} (flags {}, usage {})",
+                            vk::to_string(supported_format),
+                            (retry.flags != flags) ? "storage and block texel views" : "storage",
+                            vk::to_string(retry.flags), vk::to_string(retry.usage));
+            }
+            usage_flags = retry.usage;
+            flags = retry.flags;
+            image_format_properties = props;
+        }
+    }
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
