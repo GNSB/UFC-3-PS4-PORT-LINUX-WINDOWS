@@ -980,6 +980,21 @@ bool Instance::IsFormatSupported(const vk::Format format,
 
 vk::Format Instance::GetSupportedFormat(const vk::Format format,
                                         const vk::FormatFeatureFlags2 flags) const {
+    // ufc3, BB_Z16S8_AS_D16=1: Z16+S8 is D16_UNORM everywhere, also where the driver supports
+    // D16_UNORM_S8_UINT. The AMD driver (RX 9070) supports it for some feature sets and not for
+    // others, so images became D16S8 while pipelines were built for D16 (validation:
+    // VUID-vkCmdDraw-dynamicRenderingUnusedAttachments-08914): the spot-light shadow map was
+    // drawn with a mismatched pipeline and the octagon floor that reads it showed grain. NVIDIA
+    // has no D16S8, so it always took the D16 path below.
+    if (format == vk::Format::eD16UnormS8Uint) {
+        static const bool z16s8_as_d16 = [] {
+            const char* e = std::getenv("BB_Z16S8_AS_D16");
+            return e && e[0] == '1';
+        }();
+        if (z16s8_as_d16 && IsFormatSupported(vk::Format::eD16Unorm, flags)) {
+            return vk::Format::eD16Unorm;
+        }
+    }
     if (!IsFormatSupported(format, flags)) [[unlikely]] {
         switch (format) {
         case vk::Format::eD16UnormS8Uint:

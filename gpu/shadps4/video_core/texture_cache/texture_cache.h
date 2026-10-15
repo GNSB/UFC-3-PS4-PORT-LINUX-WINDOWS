@@ -377,6 +377,15 @@ private:
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
 
+    /// Backport of mancelli's 01b32f45 (ufc3 T6a): tiles all mips of the image into the buffer
+    /// cache copy of its guest memory, on the GPU (the range becomes GPU modified, so image
+    /// uploads read it from there).
+    void TileImageToBuffer(Image& image);
+
+    /// Writes a storage image back through TileImageToBuffer and marks the block-compressed
+    /// images over it to reupload from there. Called with the cache mutex held.
+    void WriteBackImage(ImageId image_id);
+
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     /// Removes the image and any views/surface metas that reference it.

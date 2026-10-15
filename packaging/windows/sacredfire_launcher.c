@@ -2,7 +2,7 @@
  * which cannot be produced from Linux for the bundled Python; this one is built by the cross
  * toolchain with no dependency beyond Windows). GPL-2.0-or-later.
  *
- * Window: the game folder (picker; the game check decides), the controller for port 1, the
+ * Window: the game folder (picker; the game check decides), the game language, the controller for port 1, the
  * game patches (written to bbport.ini as the in-game menu does), PS4 Pro mode, fullscreen,
  * the developer switches (frame statistics, Vulkan validation, clear the shader cache, menu
  * trace), Play/Stop, the log of the run, and buttons for the logs and data folders. Settings
@@ -50,15 +50,23 @@ typedef struct {
     /* The window (presented image) size: the game's 1080p frame scaled to 1440p / 4K. */
     int display;
     int skip_movies; /* the EA intro and the first-start video replaced by a short black clip */
+    int language;    /* index into languages[] */
 } Settings;
-static Settings settings = {.resolution = 1, .fps_mode = 4, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
+static Settings settings = {.resolution = 1, .fps_mode = 5, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
 /* Choices of the Video panel (index = the saved value). */
 static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080"};
 static const wchar_t *const resolution_w[] = {L"1280", L"1920"}, *const resolution_h[] = {L"720", L"1080"};
 static const wchar_t *const display_names[] = {L"Same as the game", L"1920x1080 (Full HD)", L"2560x1440 (2K)", L"3840x2160 (4K)"};
 static const wchar_t *const display_sizes[] = {NULL, L"1920x1080", L"2560x1440", L"3840x2160"};
-static const wchar_t *const fps_names[] = {L"60 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
-static const wchar_t *const fps_limits[] = {L"60", L"120", L"144", L"240", L"0"};
+static const wchar_t *const fps_names[] = {L"60 FPS", L"90 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
+static const wchar_t *const fps_limits[] = {L"60", L"90", L"120", L"144", L"240", L"0"};
+/* sacredfire.ini before 90 FPS stored the index into {60, 120, 144, 240, unlimited}; the limit
+ * itself is saved now (fps_limit=), and an old fps_mode index is mapped onto the new list. */
+static const int legacy_fps_index[] = {0, 2, 3, 4, 5};
+static int fps_index_of(const wchar_t *limit) {
+    for (int i = 0; i < (int)(sizeof(fps_limits) / sizeof(fps_limits[0])); ++i) if (!wcscmp(fps_limits[i], limit)) return i;
+    return -1;
+}
 /* Immediate is the default on Windows: NVIDIA's Mailbox there paced the menu at twice the
  * display refresh (120 on a 60 Hz laptop panel, Omen 16 in discrete mode; Immediate 240). */
 static const wchar_t *const present_names[] = {L"Mailbox (capped at 2x refresh on NVIDIA)", L"VSync (FIFO)", L"Immediate (uncapped, may tear)"};
@@ -69,14 +77,27 @@ static const wchar_t *const upscaler_names[] = {L"Off (bilinear)", L"AMD FSR 1.0
 static const wchar_t *const sharpness_names[] = {L"Off", L"Low", L"Medium", L"High"};
 static const wchar_t *const sharpness_attenuation[] = {L"2000", L"1000", L"500", L"200"};
 #define COUNT(a) (int)(sizeof(a) / sizeof((a)[0]))
+/* The PS4 system language (BB_LANGUAGE, the system parameter the game reads): the languages
+ * whose text the game ships (samplegame\data\kettle\loc: eng_us, fre_fr, ger_de, ita_it,
+ * spa_es, spa_mx, por_br, pol_pl, rus_ru, jpn_jp, chi_hk), and Portuguese (Portugal), which it
+ * has no text of. The first is the default; the id is saved (language=). */
+static const wchar_t *const language_names[] = {
+    L"English (US)", L"French", L"German", L"Italian", L"Spanish (Spain)", L"Spanish (Latin America)",
+    L"Portuguese (Brazil)", L"Portuguese (Portugal)", L"Polish", L"Russian", L"Japanese", L"Chinese (Traditional)"};
+static const wchar_t *const language_ids[] = {L"1", L"2", L"4", L"5", L"3", L"20", L"17", L"7", L"16", L"8", L"0", L"10"};
+static int language_index_of(const wchar_t *id) {
+    for (int i = 0; i < COUNT(language_ids); ++i) if (!wcscmp(language_ids[i], id)) return i;
+    return -1;
+}
 /* Variables the launcher sets for the game: their values from the environment the launcher was
  * started with (a value there wins over the window), captured once, because Play sets them in
  * this process and a second Play must not take the first one's values for the user's. */
 static const wchar_t *const managed_env[] = {
     L"BB_FULLSCREEN", L"BB_VK_VALIDATION", L"BB_FRAME_STATS", L"BB_MENU_TRACE", L"BB_GAMEPAD", L"BB_NEO",
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
-    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
+    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
     L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
+    L"BB_LANGUAGE",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
 static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
@@ -141,12 +162,14 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"frame_stats")) settings.frame_stats = _wtoi(value);
         else if (!wcscmp(line, L"menu_trace")) settings.menu_trace = _wtoi(value);
         else if (!wcscmp(line, L"resolution")) settings.resolution = clampi(_wtoi(value), COUNT(resolution_names));
-        else if (!wcscmp(line, L"fps_mode")) settings.fps_mode = clampi(_wtoi(value), COUNT(fps_names));
+        else if (!wcscmp(line, L"fps_mode")) settings.fps_mode = legacy_fps_index[clampi(_wtoi(value), 5)];
+        else if (!wcscmp(line, L"fps_limit")) { const int i = fps_index_of(value); if (i >= 0) settings.fps_mode = i; }
         else if (!wcscmp(line, L"present_mode")) settings.present_mode = clampi(_wtoi(value), COUNT(present_names));
         else if (!wcscmp(line, L"upscaler")) settings.upscaler = clampi(_wtoi(value), COUNT(upscaler_names));
         else if (!wcscmp(line, L"sharpness")) settings.sharpness = clampi(_wtoi(value), COUNT(sharpness_names));
         else if (!wcscmp(line, L"skip_movies")) settings.skip_movies = _wtoi(value);
         else if (!wcscmp(line, L"display")) settings.display = clampi(_wtoi(value), COUNT(display_names));
+        else if (!wcscmp(line, L"language")) { const int i = language_index_of(value); if (i >= 0) settings.language = i; }
     }
     fclose(f);
 }
@@ -156,10 +179,10 @@ static void settings_save(void) {
     if (!f) return;
     fwprintf(f, L"player=%ls\n", settings.player);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
-                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\n",
+                L"resolution=%d\nfps_limit=%ls\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\nlanguage=%ls\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
-             settings.frame_stats, settings.menu_trace, settings.resolution, settings.fps_mode, settings.present_mode,
-             settings.upscaler, settings.sharpness, settings.display, settings.skip_movies);
+             settings.frame_stats, settings.menu_trace, settings.resolution, fps_limits[settings.fps_mode], settings.present_mode,
+             settings.upscaler, settings.sharpness, settings.display, settings.skip_movies, language_ids[settings.language]);
     fclose(f);
 }
 /* bbport.ini: "key=value" lines (UTF-8), shared with the in-game menu. */
@@ -442,17 +465,27 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_MENU_TRACE", settings.menu_trace ? L"1" : NULL);
     game_env(L"BB_GAMEPAD", settings.gamepad[0] ? settings.gamepad : NULL);
     game_env(L"BB_USER_NAME", settings.player[0] ? settings.player : NULL); /* the PS4 user name the game shows */
+    game_env(L"BB_LANGUAGE", language_ids[settings.language]); /* a BB_LANGUAGE set before the launcher (a .bat) wins */
     /* The fight scene renders black without precise readbacks of linear images (shadPS4 issue
      * #4375, UFC 4, same engine); precise readbacks deadlock against the GPU write twins, so
      * those stay off. The game asks for flip rate 1 (30 Hz); its simulation follows the real
      * frame time, so flip rate 0 with a 480 Hz virtual vblank and the present thread's cap set
      * the rate. Z16+S8 shadow data uploaded from memory is kept as D16 (stencil dropped). */
-    game_env(L"BB_NEO", L"0");
+    /* PS4 Pro mode: the game renders its scene at 1080p instead of 900p (CMask reads are
+     * answered as uncompressed by the runtime). */
+    game_env(L"BB_NEO", settings.neo ? L"1" : L"0");
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
+    /* Write windows on by default on both platforms for performance: RTX 4070 fights go from
+     * 105-113 to 140-190 FPS. Windows crashes after a fight (RX 9070, RTX 4090) remain under
+     * investigation. Set BB_WRITE_WINDOW=0 before starting the launcher to disable them. */
     game_env(L"BB_WRITE_WINDOW", L"1");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
-    game_env(L"BB_PREUPLOAD", L"1"); game_env(L"BB_COPY_GPU_BUFFERS", L"1");
+    /* Created fighters' skin is compressed by the game on the CPU into texture memory: with the
+     * background pre-upload or the single-stepped writes on, those textures came out black or
+     * garbled (career, fighter creation); with both off they draw correctly in fights. */
+    game_env(L"BB_PREUPLOAD", L"0"); game_env(L"BB_WRITE_STEP", L"0");
+    game_env(L"BB_COPY_GPU_BUFFERS", L"1");
     game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
     game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);
@@ -472,7 +505,7 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     logw(L"UFC 3: output %lsx%ls, frame limit %ls (0: none), present mode %ls, fullscreen %ls\n",
          env_or(L"BB_INTERNAL_WIDTH", L"?"), env_or(L"BB_INTERNAL_HEIGHT", L"?"), env_or(L"BB_FPS_LIMIT", L"?"),
          env_or(L"BB_PRESENT_MODE", L"?"), env_or(L"BB_FULLSCREEN", L"0"));
-    logw(L"UFC 3: player name \"%ls\"\n", env_or(L"BB_USER_NAME", L"Player 1"));
+    logw(L"UFC 3: player name \"%ls\", language %ls (BB_LANGUAGE)\n", env_or(L"BB_USER_NAME", L"Player 1"), env_or(L"BB_LANGUAGE", L"1"));
     logw(L"UFC 3: window %ls, FSR 1.0 %ls, RCAS %ls (attenuation %ls), readbacks %ls (2 = precise)\n",
          env_or(L"BB_WINDOW_SIZE", L"= output"), env_or(L"BB_FSR1", L"0"), env_or(L"BB_RCAS", L"?"), env_or(L"BB_RCAS_ATTENUATION", L"?"), env_or(L"BB_READBACKS", L"?"));
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
@@ -679,7 +712,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -918,7 +951,7 @@ static void read_controls(void) {
     }
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
-    settings.fullscreen = checked(ID_FULLSCREEN); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
+    settings.fullscreen = checked(ID_FULLSCREEN); settings.neo = checked(ID_NEO); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
     settings.validation = checked(ID_VALIDATION); settings.frame_stats = checked(ID_STATS); settings.menu_trace = checked(ID_TRACE);
     settings.resolution = clampi((int)SendMessageW(control(ID_RESOLUTION), CB_GETCURSEL, 0, 0), COUNT(resolution_names));
     settings.fps_mode = clampi((int)SendMessageW(control(ID_FPS), CB_GETCURSEL, 0, 0), COUNT(fps_names));
@@ -926,6 +959,7 @@ static void read_controls(void) {
     settings.upscaler = clampi((int)SendMessageW(control(ID_UPSCALER), CB_GETCURSEL, 0, 0), COUNT(upscaler_names));
     settings.sharpness = clampi((int)SendMessageW(control(ID_SHARPNESS), CB_GETCURSEL, 0, 0), COUNT(sharpness_names));
     settings.display = clampi((int)SendMessageW(control(ID_DISPLAY), CB_GETCURSEL, 0, 0), COUNT(display_names));
+    settings.language = clampi((int)SendMessageW(control(ID_LANGUAGE), CB_GETCURSEL, 0, 0), COUNT(language_names));
     const int show_fps = checked(ID_SHOWFPS);
     ini_set("show_fps", show_fps ? "1" : "0"); /* written always: the game's own default is off */
     settings.show_fps = show_fps;
@@ -1078,6 +1112,8 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"STATIC", L"Player name (shown in the game; 16 letters, no accents):", 0, 12, y + 4, 330, 18, 0);
     make(L"EDIT", settings.player[0] ? settings.player : L"Player 1", WS_BORDER | ES_AUTOHSCROLL, 344, y, 200, 24, ID_PLAYER);
     SendMessageW(control(ID_PLAYER), EM_SETLIMITTEXT, 16, 0); y += 34;
+    make(L"STATIC", L"Game language (the game's text and menus):", 0, 12, y + 4, 330, 18, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 344, y, 200, 300, ID_LANGUAGE); y += 34;
     make(L"STATIC", L"Controller for player 1 (in-game menu: L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 520, 200, ID_GAMEPAD);
     make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 540, y, 88, 24, ID_RESCAN);
@@ -1093,14 +1129,15 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 116, 200, 200, ID_UPSCALER);
     make(L"STATIC", L"Sharpening (RCAS)", 0, 24, y + 152, 130, 20, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 148, 200, 200, ID_SHARPNESS);
-    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 184, 330, 20, ID_FULLSCREEN);
+    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 184, 120, 20, ID_FULLSCREEN);
+    make(L"BUTTON", L"PS4 Pro mode (sharper)", BS_AUTOCHECKBOX, 160, y + 184, 200, 20, ID_NEO);
     make(L"BUTTON", L"Frame rate", BS_GROUPBOX, 388, y, 360, 216, 0);
     make(L"STATIC", L"FPS limit", 0, 400, y + 24, 130, 20, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 536, y + 20, 200, 200, ID_FPS);
     make(L"BUTTON", L"Show the FPS counter", BS_AUTOCHECKBOX, 400, y + 56, 330, 20, ID_SHOWFPS);
     make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 88, 330, 20, ID_CLEAR);
     make(L"BUTTON", L"Skip the intro videos (EA logo, first start)", BS_AUTOCHECKBOX, 400, y + 188, 340, 20, ID_SKIPMOVIES);
-    make(L"STATIC", L"2K / 4K: the game draws 1080p; pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
+    make(L"STATIC", L"2K / 4K: the game draws 900p (1080p in PS4 Pro mode); pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
     make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
     make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
@@ -1120,13 +1157,14 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
             {ID_PRESENT, COUNT(present_names), settings.present_mode, present_names},
             {ID_UPSCALER, COUNT(upscaler_names), settings.upscaler, upscaler_names},
             {ID_SHARPNESS, COUNT(sharpness_names), settings.sharpness, sharpness_names},
+            {ID_LANGUAGE, COUNT(language_names), settings.language, language_names},
         };
         for (int c = 0; c < COUNT(combos); ++c) {
             for (int i = 0; i < combos[c].count; ++i) SendMessageW(control(combos[c].id), CB_ADDSTRING, 0, (LPARAM)combos[c].names[i]);
             SendMessageW(control(combos[c].id), CB_SETCURSEL, combos[c].selected, 0);
         }
     }
-    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
+    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_NEO, settings.neo); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads();
     set_running(0);

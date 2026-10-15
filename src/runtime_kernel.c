@@ -338,7 +338,10 @@ static ABI int32_t utc_to_localtime(int64_t utc,int64_t *local,GuestTimezone *tz
     if (dst) *dst=is_dst;
     return 0;
 }
-static ABI int32_t localtime_to_utc(int64_t local,int64_t *utc,GuestTimezone *tz,int32_t *dst) {
+/* Unlike UtcToLocaltime, this import has five arguments. libc's mktime passes
+ * tm_isdst (often 0xffffffff) in RSI, and the output pointer in RDX. */
+static ABI int32_t localtime_to_utc(int64_t local,int64_t dst_hint,int64_t *utc,GuestTimezone *tz,int32_t *dst) {
+    (void)dst_hint; /* Retain the host-zone policy; the hint is a value, never a pointer. */
     if (!utc) return ERR(22);
     const long offset=platform_utc_offset((time_t)local); const int is_dst=platform_is_dst((time_t)local);
     *utc=local-offset;
