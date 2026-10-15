@@ -25,6 +25,11 @@ your own dump of the game and its 1.14 update.
 ### Launcher settings
 
 - **Player name** — the name the game shows (16 characters, ASCII).
+- **Game language** — the PS4 system language the game reads (its text and menus): English (US),
+  French, German, Italian, Spanish (Spain), Spanish (Latin America), Portuguese (Brazil),
+  Portuguese (Portugal), Polish, Russian, Japanese, Chinese (Traditional). The game ships no
+  European Portuguese text: for Portuguese pick **Portuguese (Brazil)**. A `BB_LANGUAGE` set
+  before the launcher (e.g. `set BB_LANGUAGE=17` in a `.bat`) wins over this choice.
 - **Controls...** — keyboard keys (click, then press the key) and gamepad buttons for every PS4
   input. The keyboard and a gamepad work together.
 - **Game resolution** — 720p / 1080p, what the game renders.

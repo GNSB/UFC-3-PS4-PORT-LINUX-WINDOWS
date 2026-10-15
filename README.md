@@ -120,6 +120,7 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
 | `BB_WINDOW_SIZE` | from the launcher | Window size (`2560x1440`, `3840x2160`…); the game's frame is scaled to it. |
 | `BB_SKIP_MOVIES` | 1 | The EA intro and the first-start video play a short black clip (`share/skip_movie.mkv`). |
 | `BB_USER_NAME` | `Player 1` | The PS4 user name the game shows (16 bytes). |
+| `BB_LANGUAGE` | 1 (launcher: "Game language") | The PS4 system language: 1 English (US), 2 French, 3 Spanish (Spain), 4 German, 5 Italian, 0 Japanese, 7 Portuguese (Portugal; the game has no text for it), 8 Russian, 10 Chinese (Traditional), 16 Polish, 17 Portuguese (Brazil), 20 Spanish (Latin America). |
 | `BB_FRAME_STATS` | 1 in `run.sh` | Periodic statistics in the log (FPS, µs per draw, readbacks, write sites…). |
 
 ## How it works
