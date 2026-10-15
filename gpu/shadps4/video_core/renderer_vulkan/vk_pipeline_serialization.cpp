@@ -13,8 +13,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u; // ufc3: subgroup fences around LDS stores (8: sacredfire GS ring slot fold, 1D images as 2D)
-static constexpr u32 ShaderMetaVersion = 8u; // sacredfire: GS runtime info compared in full
+static constexpr u32 ShaderBinaryVersion = 10u; // ufc3: UFC-4 recompiler backports, NaN handling (9: subgroup fences around LDS stores; 8: sacredfire GS ring slot fold, 1D images as 2D)
+static constexpr u32 ShaderMetaVersion = 9u; // ufc3: RuntimeInfo::Properties bit-packed with dx10_clamp (#5257)
 static constexpr u32 PipelineKeyVersion = 6u; // sacredfire: GS permutations re-indexed
 } // namespace Serialization
 
