@@ -475,10 +475,10 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
      * answered as uncompressed by the runtime). */
     game_env(L"BB_NEO", settings.neo ? L"1" : L"0");
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
-    /* Write windows off: with them on, an RX 9070 run faulted in the guest allocator (free-list
-     * next = 0x64, "RNA:Material:Buffer") after the first fight; with BB_WRITE_WINDOW=0 it played
-     * several fights and exited cleanly. Set BB_WRITE_WINDOW=1 before the launcher to turn it back on. */
-    game_env(L"BB_WRITE_WINDOW", L"0");
+    /* Write windows on by default on both platforms for performance: RTX 4070 fights go from
+     * 105-113 to 140-190 FPS. Windows crashes after a fight (RX 9070, RTX 4090) remain under
+     * investigation. Set BB_WRITE_WINDOW=0 before starting the launcher to disable them. */
+    game_env(L"BB_WRITE_WINDOW", L"1");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
     /* Created fighters' skin is compressed by the game on the CPU into texture memory: with the

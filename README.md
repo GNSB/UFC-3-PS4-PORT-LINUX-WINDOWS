@@ -112,7 +112,7 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
 | `BB_VBLANK_HZ` / `BB_FLIP_RATE` | 480 / 0 | The game asks for 30 Hz; with flip rate 0 and a high virtual vblank it runs at the real rate (the simulation follows real frame time). |
 | `BB_READBACKS` / `BB_READBACK_LINEAR` | 2 / 1 | Precise reads of GPU-written memory (without them the fight renders black, as UFC 4 does in shadPS4). |
 | `BB_WRITE_STEP` | 0 | CPU writes next to a few GPU-written bytes are single-stepped instead of waiting for the GPU. Off: created/career fighters' skin came out black or garbled. |
-| `BB_WRITE_WINDOW` | 1 on Linux (`run.sh`), 0 on Windows (launcher) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). Off on Windows: the game crashed after a fight there (RX 9070, RTX 4090); Linux RTX 4070 sessions of 20 minutes completed without a crash. |
+| `BB_WRITE_WINDOW` | 1 on Linux (`run.sh`) and Windows (launcher) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). Enabled for performance (RTX 4070 fights: 105–113 to roughly 140–190 FPS). Windows crashes after a fight (RX 9070, RTX 4090) remain under investigation; see *Performance* for logging and the `BB_WRITE_WINDOW=0` workaround. |
 | `BB_PREUPLOAD` | 0 | Background upload of rewritten game memory into VRAM (1, 2 = all of it). Off for the same skin textures as `BB_WRITE_STEP`. |
 | `BB_LDS_ORDER` | 1 | Subgroup memory barriers around shared-memory (LDS) stores in translated shaders, which the GCN code expects (octagon floor grain on AMD). `0` turns them off; clear the shader cache when changing it. |
 | `BB_GPU_WRITE_TWINS` | 0 | Incompatible with precise readbacks (deadlock). |
@@ -160,10 +160,15 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
    readbacks 380 → 120 per second and fights from **105–113 to roughly 140–190 FPS**
    on an RTX 4070 (the detailed run recorded 137–196 FPS uncapped).
    Known risk: if the game read the GPU bytes of an open page, it would see the previous
-   submission's data. **On by default on Linux** (`run.sh`; 20-minute sessions without a crash
-   on an RTX 4070), **off on Windows** (launcher): there the game crashed after a fight with it
-   on (the guest heap's free list corrupted, guest fault at `0x1262a2a`; RX 9070 and RTX 4090),
-   still unresolved. `BB_WRITE_WINDOW=1` turns it on for Windows (at that risk), `=0` off on Linux.
+   submission's data. **`BB_WRITE_WINDOW=1` by default on Linux** (`run.sh`) **and Windows**
+   (launcher) for performance; 20-minute Linux sessions on an RTX 4070 completed without a crash.
+   Windows crashes after a fight remain under investigation (the guest heap's free list corrupted,
+   guest fault at `0x1262a2a`; RX 9070 and RTX 4090). If this happens, enable **Frame statistics**
+   in the launcher and send us the session's `.log` from
+   `C:\Users\<user>\AppData\Local\UFC3Native\logs` (**Open logs folder**); logs are saved
+   automatically. To avoid the crash, set `BB_WRITE_WINDOW=0` before starting the launcher,
+   for example from a `.bat` with `set BB_WRITE_WINDOW=0`. This override disables it on either
+   platform.
 
 The full technical write-up (diagnostics, failed experiments, measurements) is in
 [`docs/ufc3/GROK_HANDOFF.md`](docs/ufc3/GROK_HANDOFF.md), [`docs/ufc3/HANDOFF.md`](docs/ufc3/HANDOFF.md)
