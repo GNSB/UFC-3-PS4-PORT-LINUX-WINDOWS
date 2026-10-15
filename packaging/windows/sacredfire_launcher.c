@@ -51,14 +51,21 @@ typedef struct {
     int display;
     int skip_movies; /* the EA intro and the first-start video replaced by a short black clip */
 } Settings;
-static Settings settings = {.resolution = 1, .fps_mode = 4, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
+static Settings settings = {.resolution = 1, .fps_mode = 5, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
 /* Choices of the Video panel (index = the saved value). */
 static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080"};
 static const wchar_t *const resolution_w[] = {L"1280", L"1920"}, *const resolution_h[] = {L"720", L"1080"};
 static const wchar_t *const display_names[] = {L"Same as the game", L"1920x1080 (Full HD)", L"2560x1440 (2K)", L"3840x2160 (4K)"};
 static const wchar_t *const display_sizes[] = {NULL, L"1920x1080", L"2560x1440", L"3840x2160"};
-static const wchar_t *const fps_names[] = {L"60 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
-static const wchar_t *const fps_limits[] = {L"60", L"120", L"144", L"240", L"0"};
+static const wchar_t *const fps_names[] = {L"60 FPS", L"90 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
+static const wchar_t *const fps_limits[] = {L"60", L"90", L"120", L"144", L"240", L"0"};
+/* sacredfire.ini before 90 FPS stored the index into {60, 120, 144, 240, unlimited}; the limit
+ * itself is saved now (fps_limit=), and an old fps_mode index is mapped onto the new list. */
+static const int legacy_fps_index[] = {0, 2, 3, 4, 5};
+static int fps_index_of(const wchar_t *limit) {
+    for (int i = 0; i < (int)(sizeof(fps_limits) / sizeof(fps_limits[0])); ++i) if (!wcscmp(fps_limits[i], limit)) return i;
+    return -1;
+}
 /* Immediate is the default on Windows: NVIDIA's Mailbox there paced the menu at twice the
  * display refresh (120 on a 60 Hz laptop panel, Omen 16 in discrete mode; Immediate 240). */
 static const wchar_t *const present_names[] = {L"Mailbox (capped at 2x refresh on NVIDIA)", L"VSync (FIFO)", L"Immediate (uncapped, may tear)"};
@@ -141,7 +148,8 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"frame_stats")) settings.frame_stats = _wtoi(value);
         else if (!wcscmp(line, L"menu_trace")) settings.menu_trace = _wtoi(value);
         else if (!wcscmp(line, L"resolution")) settings.resolution = clampi(_wtoi(value), COUNT(resolution_names));
-        else if (!wcscmp(line, L"fps_mode")) settings.fps_mode = clampi(_wtoi(value), COUNT(fps_names));
+        else if (!wcscmp(line, L"fps_mode")) settings.fps_mode = legacy_fps_index[clampi(_wtoi(value), 5)];
+        else if (!wcscmp(line, L"fps_limit")) { const int i = fps_index_of(value); if (i >= 0) settings.fps_mode = i; }
         else if (!wcscmp(line, L"present_mode")) settings.present_mode = clampi(_wtoi(value), COUNT(present_names));
         else if (!wcscmp(line, L"upscaler")) settings.upscaler = clampi(_wtoi(value), COUNT(upscaler_names));
         else if (!wcscmp(line, L"sharpness")) settings.sharpness = clampi(_wtoi(value), COUNT(sharpness_names));
@@ -156,9 +164,9 @@ static void settings_save(void) {
     if (!f) return;
     fwprintf(f, L"player=%ls\n", settings.player);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
-                L"resolution=%d\nfps_mode=%d\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\n",
+                L"resolution=%d\nfps_limit=%ls\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
-             settings.frame_stats, settings.menu_trace, settings.resolution, settings.fps_mode, settings.present_mode,
+             settings.frame_stats, settings.menu_trace, settings.resolution, fps_limits[settings.fps_mode], settings.present_mode,
              settings.upscaler, settings.sharpness, settings.display, settings.skip_movies);
     fclose(f);
 }
