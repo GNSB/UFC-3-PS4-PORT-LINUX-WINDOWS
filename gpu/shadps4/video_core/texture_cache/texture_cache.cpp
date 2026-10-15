@@ -94,16 +94,27 @@ void LogT6a(char kind, VAddr address, const char* format, Args... args) {
     std::printf(format, args...);
 }
 
-// UFC-13: diagnostics only; never download tiled images as linear pixels. Called on the
-// GPU thread. Group by layout rather than address so per-frame allocations cannot flood logs.
-void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_readback,
-                const u8* pixels = nullptr, u32 bytes = 0) {
+bool T4TraceEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_T4_TRACE");
         return env && env[0] == '1';
     }();
+    return enabled;
+}
+
+bool T4Portrait(const ImageInfo& info) {
+    return (info.size.width == 864 && info.size.height == 1360) ||
+           (info.size.width == 652 && info.size.height == 1080) ||
+           (info.size.width == 600 && info.size.height == 1080) ||
+           (info.size.width == 1000 && info.size.height == 1200);
+}
+
+// UFC-13: diagnostics only; never write tiled images back as linear pixels. Called on the
+// GPU thread. Group by layout rather than address so per-frame allocations cannot flood logs.
+void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_readback,
+                const u8* pixels = nullptr, u32 bytes = 0) {
     const auto& info = image.info;
-    if (!enabled || info.size.width < 64 || info.size.height < 64 || info.props.is_depth ||
+    if (!T4TraceEnabled() || info.size.width < 64 || info.size.height < 64 || info.props.is_depth ||
         info.props.is_block || info.props.is_volume) {
         return;
     }
@@ -132,6 +143,23 @@ void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_rea
         }
         content = fmt::format(" host_bytes={} nonzero={} hash={:#x}", bytes, nonzero,
                               XXH3_64bits(pixels, bytes));
+        if (info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+            info.pixel_format == vk::Format::eR8G8B8A8Srgb) {
+            // Visible level-0 pixels only: padding can contain nonzero staging bytes.
+            std::array<u32, 4> channel_nonzero{};
+            for (u32 y = 0; y < info.size.height; ++y) {
+                for (u32 x = 0; x < info.size.width; ++x) {
+                    const u64 offset = (u64(y) * info.pitch + x) * 4;
+                    if (offset + 4 <= bytes) {
+                        for (u32 c = 0; c < 4; ++c) {
+                            channel_nonzero[c] += pixels[offset + c] != 0;
+                        }
+                    }
+                }
+            }
+            content += fmt::format(" rgba_nonzero={},{},{},{}", channel_nonzero[0],
+                                   channel_nonzero[1], channel_nonzero[2], channel_nonzero[3]);
+        }
     }
     std::printf("[T4] tick=%llu %s addr=%#llx guest_bytes=%u mips=%u layers=%u "
                 "samples=%u flags=%#x linear_eligible=%d%s\n",
@@ -143,6 +171,46 @@ void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_rea
                 content.c_str());
 }
 } // Anonymous namespace
+
+void TextureCache::TraceT4Pixels(Image& image, const char* event) {
+    // Explicit, bounded diagnostic waits, separate from normal BB_T4_TRACE logging. This
+    // reads the Vulkan image into host staging; it never changes guest/buffer-cache bytes.
+    static const bool pixels_enabled = [] {
+        const char* env = std::getenv("BB_T4_TRACE_PIXELS");
+        return env && env[0] == '1';
+    }();
+    const auto& info = image.info;
+    if (!T4TraceEnabled() || !pixels_enabled || info.props.is_depth || info.props.is_block ||
+        info.size.depth != 1 || info.resources.layers != 1 || info.num_samples != 1 ||
+        info.pixel_format != vk::Format::eR8G8B8A8Unorm) {
+        return;
+    }
+    static std::unordered_set<std::string> seen;
+    static std::unordered_map<std::string, u32> counts;
+    const auto layout = fmt::format("{} {}x{}", event, info.size.width, info.size.height);
+    const auto key = fmt::format("{} {:#x} {}", layout, info.guest_address, info.guest_size);
+    if (seen.size() >= 16 || counts[layout] >= 2 || !seen.insert(key).second) {
+        return;
+    }
+    ++counts[layout];
+    const u64 size = u64(info.pitch) * info.size.height * 4;
+    if (size > 8_MB) {
+        return;
+    }
+    const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
+    const vk::BufferImageCopy copy{
+        .bufferOffset = download.offset,
+        .bufferRowLength = info.pitch,
+        .bufferImageHeight = info.size.height,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {info.size.width, info.size.height, 1},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+    scheduler.Finish();
+    download.Invalidate();
+    LogT4Image(image, event, scheduler.CurrentTick(), readback_linear_images,
+               download.mapped, static_cast<u32>(size));
+}
 
 std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
     std::unique_lock lock{mutex, std::try_to_lock}; // the caller may hold it already
@@ -506,6 +574,24 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
         if (image_info.BlockDim() != cache_image.info.BlockDim() ||
             lhs_block_size != rhs_block_size) {
+            static u32 alias_trace_count = 0;
+            if (T4TraceEnabled() && T4Portrait(image_info) &&
+                cache_image.info.size == Extent3D{1024, 2048, 1} &&
+                cache_image.SafeToDownload() && alias_trace_count < 64) {
+                ++alias_trace_count;
+                std::printf("[T4] tick=%llu alias-rejected-blockdim addr=%#llx "
+                            "cached=%ux%u pitch=%u tile=%u mips=%u write_tick=%llu "
+                            "requested=%ux%u pitch=%u tile=%u mips=%u binding=%u\n",
+                            static_cast<unsigned long long>(scheduler.CurrentTick()),
+                            static_cast<unsigned long long>(image_info.guest_address),
+                            cache_image.info.size.width, cache_image.info.size.height,
+                            cache_image.info.pitch, u32(cache_image.info.tile_mode),
+                            cache_image.info.resources.levels,
+                            static_cast<unsigned long long>(cache_image.gpu_write_tick),
+                            image_info.size.width, image_info.size.height, image_info.pitch,
+                            u32(image_info.tile_mode), image_info.resources.levels, u32(binding));
+                TraceT4Pixels(cache_image, "alias-before-reject-host");
+            }
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -1018,6 +1104,26 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     }
     if (refresh) {
         UpdateImage(image_id);
+    }
+    if (T4TraceEnabled() && T4Portrait(desc.info)) {
+        static u32 view_count = 0;
+        if (view_count++ < 256) {
+            const auto& view = desc.view_info;
+            std::printf("[T4] tick=%llu view addr=%#llx requested=%ux%u "
+                        "resolved=%ux%u view_fmt=%s mip=%u+%u layer=%u+%u swizzle=%u,%u,%u,%u\n",
+                        static_cast<unsigned long long>(scheduler.CurrentTick()),
+                        static_cast<unsigned long long>(image.info.guest_address),
+                        desc.info.size.width, desc.info.size.height,
+                        image.info.size.width, image.info.size.height,
+                        vk::to_string(view.format).c_str(), view.range.base.level,
+                        view.range.extent.levels, view.range.base.layer, view.range.extent.layers,
+                        u32(view.mapping.r), u32(view.mapping.g),
+                        u32(view.mapping.b), u32(view.mapping.a));
+        }
+        if (desc.type == BindingType::Texture && image.info.props.is_tiled &&
+            False(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Dirty))) {
+            TraceT4Pixels(image, "alias-upload-host");
+        }
     }
     LogT4Image(image, desc.type == BindingType::Storage ? "storage" : "sampled",
                scheduler.CurrentTick(), readback_linear_images);

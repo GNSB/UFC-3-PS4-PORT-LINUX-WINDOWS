@@ -1,3 +1,174 @@
+# UFC-13 / T4: segunda pasada (15 oct 2026)
+
+## Resultado
+
+**No hay un fix seguro confirmado.** La descarga final sí existe; el fallo está
+presente en los píxeles host antes de escribir el archivo. Se acota una hipótesis
+concreta de pérdida del render target al cambiar su descripción a textura con
+mips. No se cambia la política de coherencia ni se habilita memcpy de imágenes
+tiled a memoria guest. Se conserva el merge `8dcae5d`.
+
+Fuente: `logs/20261015_201651.log` del worktree, build reportado
+`ufc3-v0.1.2-55-g8dcae5d`, más sus CSV y los captures disponibles. Las referencias
+siguientes son números de línea de ese log (12082 líneas al inspeccionarlo).
+
+## Captures decodificados y comparación
+
+Se decodificaron los **100 SPG** de `cap_10000`, `cap_20001` … `cap_20004`, sin
+modificar los originales. Se recorre el PNG hasta IEND tras la cabecera de 12
+bytes y se abre después el JPEG; se comparan los píxeles de ambas imágenes.
+El informe completo con dimensiones, extremos, número de píxeles alfa no cero
+y SHA-256 de cada plano está en `UFC-13-SPG-20261015.csv`. Reproducción:
+
+```sh
+python tools/ufc13_spg_report.py user/temp0/createplayer > /tmp/ufc13-spg.csv
+```
+
+- Todos los medium (652×1080), win/win_wfa (600×1080) y tott/belt (1000×1200)
+  tienen **RGB negro y alfa cero**, en los cinco directorios. No es solamente
+  un JPEG negro o una transparencia inferida del tamaño comprimido.
+- Los large (864×1360) son negros con alfa cero excepto `cap_20002`, que contiene
+  bloques corruptos y 116146 píxeles alfa no cero. `cap_20004/left_large.spg`
+  vuelve a ser negro/transparente (20219 bytes).
+- La inspección visual del color de `cap_20004/front.spg` (45861 bytes) y
+  `left_small.spg` (157565 bytes) muestra bloques/ruido, no un retrato reconocible.
+  Tener alfa o bytes no cero no equivale a haber renderizado un peleador válido.
+- Frente al diagnóstico anterior, medium/win/tott mantienen las dimensiones,
+  tamaños y contenido nulo descritos allí; los large de `cap_20002` mantienen
+  el tamaño 286429 y corrupción. No queda una copia independiente de los
+  archivos anteriores para certificar identidad binaria entre sesiones.
+- Las escrituras tempranas de `cap_10000` … `cap_20003` (L1333–1743) son anteriores
+  al lote de render/exportación observado. No deben atribuirse a ese lote.
+  `cap_20004` se crea en L5801 y sus SPG se escriben en L5807–5978.
+
+## Cadena de imágenes observada
+
+Todas las superficies de esta tabla son RGBA8 UNORM (`R8G8B8A8Unorm`), una capa,
+una muestra. Las fuentes tiled son RT y/o storage; los destinos lineales son
+storage. Los enlaces entre bindings son candidatos por orden y dimensiones:
+la traza previa no enumera recursos por dispatch ni enlaza el buffer de entrada
+del encoder con el destino GPU. No se afirma una correspondencia de direcciones
+con cada nombre left/right/belt individual.
+
+| Dimensión / evento | Dirección guest | Pitch / tile | Evidencia |
+| --- | --- | --- | --- |
+| RT inicial large 900×1416 | `0x1030368000` | 1024 / 14 tiled | RT tick 31539; sampled 31547 |
+| RT padded 1024×2048 | `0x102f8b8000` | 1024 / 14 tiled | RT L5262 tick 31547; una mip, flags 0x48 |
+| Textura large 864×1360 sobre esa dirección | `0x102f8b8000` | 1024 / 14 tiled | L5263: 11 mips, flags 0x40; luego storage 0x48 |
+| Export large 864×1360 | `0x1083d8c800` | 864 / 8 lineal | L5290 storage tick 31549; L5291 download-host tick 31550: **0/4700160 bytes no cero**; L5292 guest-written |
+| RT medium 652×1080 | `0x107a2b0000` | 768 / 14 tiled | L5308 tick 31603; sampled L5309 |
+| RT padded → textura medium | `0x102f2b0000` | 1024 / 14 tiled | L5310 RT 1024×2048; L5311 textura 652×1080, 2 mips y flags 0x40; crece a 11 mips |
+| Export medium 652×1080 | `0x1083ad8a00` | 656 / 8 lineal | L5333 tick 31606: 13530/2833920 bytes no cero; L5334 guest-written |
+| RT inicial win 500×900 | `0x103e7e8000` | 512 / 14 tiled | L5711 RT tick 32729; sampled L5712–5713 |
+| RT padded → textura win | `0x1034890000` | 1024 / 14 tiled | L5714 RT 1024×2048; L5715 textura 600×1080, 2 mips y flags 0x40; crece a 11 mips |
+| Export win 600×1080 | `0x1083f86c00` | 608 / 8 lineal | L5736 storage tick 32736; L5737 tick 32737: **0/2626560 bytes no cero**; L5738 guest-written |
+| Segundo export 600×1080 | `0x1083f86c00` | 608 / 8 lineal | L5793 tick 33121: 48 bytes no cero; L5794 guest-written; fuente candidata `0x1034558000` |
+
+`UFC-13-READBACKS-20261015.csv` detalla los **20 exports** entre L5291 y L5793,
+incluyendo pequeños, front, tott y demás medium. Todos tienen `guest-written`
+inmediatamente después del `download-host`; no hay un `guest-write-failed`
+en ese lote. Los tiled tienen `linear_eligible=0`, pero el juego ya produce
+explícitamente un destino lineal que **sí** se descarga. No hace falta descargar
+todo RT tiled para que funcione esta ruta.
+
+La descarga y escritura guest de large (L5291–5292) preceden al primer write SPG
+nuevo (L5807); la de win (L5737–5738) precede al write de `win.spg` (L5951).
+Esto no fecha la primera lectura del CPU que alimenta el encoder: esa lectura
+no está instrumentada. No permite excluir toda carrera CPU, pero una descarga
+más temprana del mismo destino tampoco puede recuperar contenido que ya está
+en cero en staging. El hash original incluye padding; los 13530 bytes del medium
+no demuestran alfa ni color visibles válidos.
+
+## Causa acotada y límite de la evidencia
+
+La transición RT padded → textura con mips es el primer punto sospechoso concreto.
+En `TextureCache::ResolveOverlap`, para la misma dirección, la comparación
+`BlockDim()` incluye pitch y altura; 1024×2048 y 600×1080/652×1080/864×1360 no
+coinciden. Se retorna sin expandir ni copiar el contenido GPU. `FindImage` puede
+crear otra imagen y `RefreshImage` cargarla desde memoria/buffer cache. La traza
+muestra el RT GPU-modified (flags 0x48) seguido de una imagen sampled solamente
+Registered (0x40) en la misma dirección, exactamente antes de generar mips.
+
+**Hipótesis principal:** el RT contiene el retrato, pero el alias carga datos
+viejos/vacíos al cambiar dimensiones. Todavía no se sabe si el RT anterior
+contenía un peleador visible: un binding RT no prueba draws ni canales válidos.
+Tampoco se conoce el swizzle/vista efectiva en la traza anterior. No se confirma
+un bug de shader, alfa, vista ni un modelo que nunca se dibuja.
+
+Un `CopyImage` rectangular o ampliar automáticamente el RT con nuevas dimensiones
+no es seguro sin comprobar el layout: los mips/pow2/pitch describen memoria tiled,
+y los formatos/tile modes iguales no garantizan que coincida toda esa memoria.
+La infraestructura `TileImageToBuffer` permite preservar el layout guest dentro
+del GPU, pero habría que acotar cuándo esas descripciones son alias reales y
+cuándo son reutilización de un pool. No se generaliza esa política con este log.
+
+## Qué se puede afirmar del post-fight
+
+El juego consume los captures vacíos: por ejemplo `left_wfa.spg` en L6000 y
+`right_wfa.spg` en L8163, L9120, L9745 y L11657. `win.spg` se lee en L6238,
+L10276, L10846 y L11421, pero en esos lugares se recorre el directorio entero;
+esas lecturas pueden ser empaquetado del save y no uso visual del menú.
+Hay escritura/lectura de `NISPOSTFIGHTCELEB_94.jpg`, pero no un marcador inequívoco
+de POST FIGHT MENU. **No se puede asignar una imagen/draw al modelo del jugador
+del post-fight ni asegurar que use win.spg.** La ausencia del jugador comunicada
+por el usuario sigue pendiente de correlacionar con draws concretos.
+
+Los `.readbacks.csv` registran coherencia de buffers/faults, no los planos
+completos de estas imágenes; `.frames.csv` agrega draws/dispatches. No identifican
+qué draw corresponde a cada peleador. Se usan las trazas de imagen para afirmar
+la descarga; los CSV no cubren esa atribución por personaje.
+
+## Instrumentación nueva y UNA prueba siguiente
+
+Se agregan trazas detrás de `BB_T4_TRACE=1`:
+
+- `rgba_nonzero=R,G,B,A`: píxeles visibles por canal para RGBA8, excluyendo padding;
+  el conteo/hash original de todos los bytes sigue presente.
+- `alias-rejected-blockdim`: descripción vieja/nueva, dirección, binding y tick
+  de la última escritura GPU del RT padded (máximo 64 mensajes).
+- `view`: dimensiones solicitadas/resueltas, formato, rango mip/capa y swizzle
+  de las texturas de retrato (máximo 256 mensajes).
+
+Además, **sólo con `BB_T4_TRACE_PIXELS=1` junto a `BB_T4_TRACE=1`**, se copia a
+staging host el nivel 0 del RT al rechazar el alias (`alias-before-reject-host`)
+y de la textura recién cargada (`alias-upload-host`). Son probes RGBA8 de una
+capa/muestra, máximo 8 MiB cada uno, 16 probes en total y dos por evento/dimensión.
+No hay writeback guest ni retiling. Estos probes hacen `scheduler.Finish()`;
+pueden cambiar tiempos, por lo que sirven para localizar pérdida de contenido,
+no para descartar una carrera por observar que desaparece con instrumentación.
+Con ambos flags apagados no se hacen estas copias ni esperas.
+
+**Una prueba:** iniciar el comando habitual con
+`BB_T4_TRACE=1 BB_T4_TRACE_PIXELS=1 BB_SAVE_LOG=1`, crear **un solo peleador nuevo**
+y guardar hasta que se genere un `cap_*` nuevo; cerrar normalmente. No hace falta
+jugar otra pelea para esta prueba. Entregar el log y ese capture nuevo. Comparar,
+para el mismo domicilio del RT/alias, `alias-before-reject-host` con
+`alias-upload-host` y el export lineal posterior:
+
+- RT con canales no cero → alias vacío aporta evidencia de pérdida en la
+  transición del caché; antes de fijarla hay que comprobar que esos píxeles
+  pertenecen a la región visible del retrato y no sólo al padding del RT.
+- RT ya vacío sitúa el fallo antes de esa transición.
+- Alfa/color presentes en ambos, pero ausentes en export, sitúan el fallo en la
+  conversión posterior; los `view` indican qué rango/swizzle se solicitó.
+
+Estos conteos no sustituyen una captura visual para demostrar que el contenido
+es un peleador correcto, pero distinguen el punto donde se vuelve cero.
+
+## Validación de la segunda pasada
+
+`ufc3-build` completó con código 0, incluida una segunda compilación de la
+versión final de las trazas. Generó `out/sacredfire`, versión
+`ufc3-v0.1.2-55-g8dcae5d-dirty`. El análisis offline decodificó 100/100 SPG y
+`git diff --check` no encontró errores. El build emitió los avisos existentes
+de CMake y ODR de fsr-vulkan; no falló.
+No se ejecutó el juego, no se tocó online, `vk_pipeline_cache.*` ni
+`shader_recompiler/**`, y no se usó `git add` ni `git commit`.
+
+---
+
+## Primera pasada (archivo histórico)
+
 # UFC-13 / T4: captures de career y jugador ausente
 
 ## Resultado de la investigación (15 oct 2026)
