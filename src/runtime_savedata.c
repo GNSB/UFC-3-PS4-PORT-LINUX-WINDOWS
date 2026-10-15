@@ -120,7 +120,17 @@ static ABI int32_t save_terminate(void) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     initialized=0; return 0;
 }
+static int32_t mount_impl(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result);
+/* ufc3: every failed save-data call is logged (career saves failed with no trace). */
+static int32_t logged(const char *what, const char *name, int32_t r) {
+    if (r) printf("Runtime: %s%s%s failed: 0x%08X\n", what, name ? " " : "", name ? name : "", (uint32_t)r);
+    return r;
+}
 static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
+    char name[40]; snprintf(name,sizeof(name),"'%.32s' mode 0x%x",dir ? dir->data : "?",mode);
+    return logged("save mount",name,mount_impl(user,title,dir,mode,result));
+}
+static int32_t mount_impl(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (user<0) return ERR_INVALID_USER;
     if (!dir || !result || !valid_name(dir->data,sizeof(dir->data))) return ERR_PARAMETER;
@@ -192,6 +202,13 @@ static ABI int32_t save_mount_info(const MountPoint *point, MountInfo *info) {
 /* No backups, icons or transfer data exist: the queries find nothing; an unmount with backup is
  * a plain unmount. */
 static ABI int32_t save_not_found(void) { return initialized ? ERR_NOT_FOUND : ERR_NOT_INITIALIZED; }
+#define NOT_FOUND_LOGGED(tag, fname) \
+    static ABI int32_t tag(void) { return logged(fname, NULL, save_not_found()); }
+NOT_FOUND_LOGGED(save_load_icon, "sceSaveDataLoadIcon")
+NOT_FOUND_LOGGED(save_event_result, "sceSaveDataGetEventResult")
+NOT_FOUND_LOGGED(save_transferring, "sceSaveDataTransferringMount")
+NOT_FOUND_LOGGED(save_check_backup, "sceSaveDataCheckBackupData")
+NOT_FOUND_LOGGED(save_restore_backup, "sceSaveDataRestoreBackupData")
 static ABI int32_t save_umount_backup(const MountPoint *point) { return save_umount(point); }
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {
     if (!initialized) return ERR_NOT_INITIALIZED;
@@ -332,18 +349,28 @@ static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write)
 static ABI int32_t memory_get(int32_t user, void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io(buffer,size,offset,0); }
 static ABI int32_t memory_set(int32_t user, void *buffer, uint64_t size, int64_t offset) { (void)user; return memory_io(buffer,size,offset,1); }
 
+/* ufc3: logged entry points (failures only). */
+static ABI int32_t l_umount(const MountPoint *p) { return logged("sceSaveDataUmount",p?p->data:NULL,save_umount(p)); }
+static ABI int32_t l_set_param(const MountPoint *p, uint32_t t, const void *b, uint64_t n) { return logged("sceSaveDataSetParam",p?p->data:NULL,save_set_param(p,t,b,n)); }
+static ABI int32_t l_icon(const MountPoint *p, const Icon *i) { return logged("sceSaveDataSaveIcon",p?p->data:NULL,save_icon(p,i)); }
+static ABI int32_t l_delete(const Delete *d) { return logged("sceSaveDataDelete",d&&d->dir?d->dir->data:NULL,save_delete(d)); }
+static ABI int32_t l_search(const SearchCond *c, SearchResult *r) { return logged("sceSaveDataDirNameSearch",NULL,save_search(c,r)); }
+static ABI int32_t l_mount_info(const MountPoint *p, MountInfo *i) { return logged("sceSaveDataGetMountInfo",p?p->data:NULL,save_mount_info(p,i)); }
+static ABI int32_t l_memory_setup(int32_t u, uint64_t n, const Param *pa) { return logged("sceSaveDataSetupSaveDataMemory",NULL,memory_setup(u,n,pa)); }
+static ABI int32_t l_memory_get(int32_t u, void *b, uint64_t n, int64_t o) { return logged("sceSaveDataGetSaveDataMemory",NULL,memory_get(u,b,n,o)); }
+static ABI int32_t l_memory_set(int32_t u, void *b, uint64_t n, int64_t o) { return logged("sceSaveDataSetSaveDataMemory",NULL,memory_set(u,b,n,o)); }
 static const RuntimeExport exports[]={
     {"sceSaveDataInitialize",save_initialize}, {"sceSaveDataInitialize2",save_initialize},
     {"sceSaveDataInitialize3",save_initialize}, {"sceSaveDataTerminate",save_terminate},
-    {"sceSaveDataMount",save_mount}, {"sceSaveDataMount2",save_mount2}, {"sceSaveDataUmount",save_umount},
-    {"sceSaveDataSetParam",save_set_param}, {"sceSaveDataSaveIcon",save_icon}, {"sceSaveDataDelete",save_delete},
-    {"sceSaveDataDirNameSearch",save_search},
-    {"sceSaveDataGetMountInfo",save_mount_info}, {"sceSaveDataUmountWithBackup",save_umount_backup},
-    {"sceSaveDataLoadIcon",save_not_found}, {"sceSaveDataGetEventResult",save_not_found},
-    {"sceSaveDataTransferringMount",save_not_found}, {"sceSaveDataCheckBackupData",save_not_found},
-    {"sceSaveDataRestoreBackupData",save_not_found},
-    {"sceSaveDataSetupSaveDataMemory",memory_setup}, {"sceSaveDataGetSaveDataMemory",memory_get},
-    {"sceSaveDataSetSaveDataMemory",memory_set},
+    {"sceSaveDataMount",save_mount}, {"sceSaveDataMount2",save_mount2}, {"sceSaveDataUmount",l_umount},
+    {"sceSaveDataSetParam",l_set_param}, {"sceSaveDataSaveIcon",l_icon}, {"sceSaveDataDelete",l_delete},
+    {"sceSaveDataDirNameSearch",l_search},
+    {"sceSaveDataGetMountInfo",l_mount_info}, {"sceSaveDataUmountWithBackup",save_umount_backup},
+    {"sceSaveDataLoadIcon",save_load_icon}, {"sceSaveDataGetEventResult",save_event_result},
+    {"sceSaveDataTransferringMount",save_transferring}, {"sceSaveDataCheckBackupData",save_check_backup},
+    {"sceSaveDataRestoreBackupData",save_restore_backup},
+    {"sceSaveDataSetupSaveDataMemory",l_memory_setup}, {"sceSaveDataGetSaveDataMemory",l_memory_get},
+    {"sceSaveDataSetSaveDataMemory",l_memory_set},
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
