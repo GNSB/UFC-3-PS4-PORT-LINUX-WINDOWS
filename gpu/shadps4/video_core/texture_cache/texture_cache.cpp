@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_set>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -64,6 +67,32 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 }
 
 TextureCache::~TextureCache() = default;
+
+namespace {
+// Backport of mancelli's 01b32f45 (ufc3 T6a). Games compress textures on the GPU by writing BC
+// blocks through an uncompressed storage view (e.g. R32G32B32A32_UINT) of the compressed
+// texture's memory. SHADPS4_BC_MODE (default 3): bit 0 = a compressed view of an uncompressed
+// image goes through memory (else the old host image copy), bit 1 = storage images over memory
+// a compressed image is created on are written back first.
+u32 BcMode() {
+    static const u32 mode = [] {
+        const char* env = std::getenv("SHADPS4_BC_MODE");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 0)) : 3u;
+    }();
+    return mode;
+}
+
+// ufc3 T6a: "[T6a]" lines, once per address and kind (at most 200), called with the cache mutex
+// held. They show whether the game compresses textures on the GPU (Create Fighter skin tone).
+template <typename... Args>
+void LogT6a(char kind, VAddr address, const char* format, Args... args) {
+    static std::unordered_set<u64> seen;
+    if (seen.size() >= 200 || !seen.insert(address ^ (u64(kind) << 56)).second) {
+        return;
+    }
+    std::printf(format, args...);
+}
+} // Anonymous namespace
 
 std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
     std::unique_lock lock{mutex, std::try_to_lock}; // the caller may hold it already
@@ -179,6 +208,66 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
+}
+
+void TextureCache::TileImageToBuffer(Image& image) {
+    // Stays on the GPU: a CPU write back would have to wait for the GPU and take the memory
+    // manager lock, which guest threads hold while waiting for the GPU thread (unmap flushes).
+    const VAddr address = image.info.guest_address;
+    const u32 size = image.info.guest_size;
+
+    boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+    for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
+        const auto& mip_info = image.info.mips_layout[mip];
+        copies.push_back({
+            .bufferOffset = mip_info.offset,
+            .bufferRowLength = mip_info.pitch,
+            .bufferImageHeight = mip_info.height,
+            .imageSubresource{
+                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                .mipLevel = mip,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {std::max(image.info.size.width >> mip, 1u),
+                            std::max(image.info.size.height >> mip, 1u),
+                            std::max(image.info.size.depth >> mip, 1u)},
+        });
+    }
+    scheduler.EndRendering();
+    const auto [arena, arena_offset] = buffer_cache.ObtainBuffer(address, size, true);
+    tile_manager.TileImage(image, copies, arena, arena_offset);
+
+    // Image uploads detile from this buffer without checking for earlier writes to it.
+    // bbport: recorded through Record() (threaded recording); the tiler writes from a compute
+    // shader, or with a copy for linear images.
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        const vk::MemoryBarrier2 tiled_barrier = {
+            .srcStageMask =
+                vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask =
+                vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1u,
+            .pMemoryBarriers = &tiled_barrier,
+        });
+    });
+}
+
+void TextureCache::WriteBackImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    TileImageToBuffer(image);
+    image.flags |= ImageFlagBits::WrittenBack;
+    ForEachImageInRegion(image.info.guest_address, image.info.guest_size,
+                         [&](ImageId other_id, Image& other) {
+                             if (other_id != image_id && other.info.props.is_block) {
+                                 other.flags |= ImageFlagBits::GpuDirty;
+                             }
+                         });
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -375,7 +464,34 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
-            return {ExpandImage(image_info, cache_image_id), -1, -1};
+            const bool gpu_written = cache_image.SafeToDownload();
+            LogT6a('B', image_info.guest_address,
+                   "[T6a] BC view %s over %s image %#llx %ux%u mips %u (%s%s%s): %s\n",
+                   vk::to_string(image_info.pixel_format).c_str(),
+                   vk::to_string(cache_image.info.pixel_format).c_str(),
+                   (unsigned long long)cache_image.info.guest_address,
+                   cache_image.info.size.width, cache_image.info.size.height,
+                   cache_image.info.resources.levels,
+                   gpu_written ? "GPU-written" : "not GPU-written",
+                   cache_image.usage.storage ? ", storage" : "",
+                   cache_image.usage.render_target ? ", render target" : "",
+                   (BcMode() & 1) == 0 ? "host copy (SHADPS4_BC_MODE)"
+                   : gpu_written       ? "through memory"
+                                       : "reupload from memory");
+            if ((BcMode() & 1) == 0) {
+                return {ExpandImage(image_info, cache_image_id), -1, -1};
+            }
+            // Backport of 01b32f45: always go through memory, it is correct for any layout. The
+            // image is tiled into the buffer cache copy of guest memory and the BC image uploads
+            // from there.
+            if (gpu_written) {
+                TileImageToBuffer(cache_image);
+            }
+            if (cache_image.binding.is_bound || cache_image.binding.is_target) {
+                cache_image.binding.needs_rebind = 1u;
+            }
+            FreeImage(cache_image_id);
+            return {merged_image_id, -1, -1};
         }
 
         if (image_info.guest_size == cache_image.info.guest_size &&
@@ -398,6 +514,41 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             cache_image.info.resources.layers == 1 &&
             (image_info.props.is_pow2 != cache_image.info.props.is_pow2 ||
              image_info.type == cache_image.info.type);
+
+        // Backport of 01b32f45: a compatible format (e.g. UNORM over SRGB) that needs more
+        // mips/layers than the cached image: the guest renders level 0 first and then generates
+        // the rest through another view. Expand and keep the GPU-written contents instead of
+        // dropping the cached image (which would re-upload stale guest memory).
+        if (image_info.pixel_format != cache_image.info.pixel_format &&
+            image_info.type == cache_image.info.type && image_info.size == cache_image.info.size &&
+            image_info.resources > cache_image.info.resources &&
+            IsVulkanFormatCompatible(cache_image.info.pixel_format, image_info.pixel_format)) {
+            LogT6a('E', image_info.guest_address,
+                   "[T6a] expand %#llx %ux%u %s (mips %u) for %s view with mips %u\n",
+                   (unsigned long long)cache_image.info.guest_address,
+                   cache_image.info.size.width, cache_image.info.size.height,
+                   vk::to_string(cache_image.info.pixel_format).c_str(),
+                   cache_image.info.resources.levels,
+                   vk::to_string(image_info.pixel_format).c_str(), image_info.resources.levels);
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
+        // ufc3 T6a: the other order, an uncompressed storage view over a cached BC image (the GPU
+        // writes compressed blocks into the BC image itself).
+        if (binding == BindingType::Storage && cache_image.info.props.is_block &&
+            !image_info.props.is_block) {
+            LogT6a('S', image_info.guest_address,
+                   "[T6a] storage %s view over BC %s image %#llx %ux%u mips %u: %s\n",
+                   vk::to_string(image_info.pixel_format).c_str(),
+                   vk::to_string(cache_image.info.pixel_format).c_str(),
+                   (unsigned long long)cache_image.info.guest_address,
+                   cache_image.info.size.width, cache_image.info.size.height,
+                   cache_image.info.resources.levels,
+                   IsVulkanFormatCompatible(cache_image.info.pixel_format,
+                                            image_info.pixel_format)
+                       ? "view of the BC image"
+                       : "incompatible, separate image");
+        }
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
@@ -709,6 +860,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        if (info.props.is_block && (BcMode() & 2) != 0) {
+            // Backport of 01b32f45: the texture may have been compressed on the GPU into memory
+            // that a storage image still holds; write it back so the upload picks up the data.
+            ImageIds storage_aliases;
+            ForEachImageInRegion(
+                info.guest_address, info.guest_size, [&](ImageId other_id, Image& other) {
+                    if (!other.info.props.is_block && other.usage.storage &&
+                        other.SafeToDownload() && False(other.flags & ImageFlagBits::WrittenBack)) {
+                        storage_aliases.push_back(other_id);
+                    }
+                });
+            for (const ImageId alias_id : storage_aliases) {
+                const Image& alias = slot_images[alias_id];
+                LogT6a('W', alias.info.guest_address,
+                       "[T6a] write back storage %s %#llx %ux%u before BC %s %#llx %ux%u\n",
+                       vk::to_string(alias.info.pixel_format).c_str(),
+                       (unsigned long long)alias.info.guest_address, alias.info.size.width,
+                       alias.info.size.height, vk::to_string(info.pixel_format).c_str(),
+                       (unsigned long long)info.guest_address, info.size.width, info.size.height);
+                WriteBackImage(alias_id);
+            }
+        }
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -779,6 +952,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     WatchImage(image, refresh ? "texture (refresh)" : "texture (no refresh)");
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
+        image.flags &= ~ImageFlagBits::WrittenBack;
         image.gpu_write_tick = scheduler.CurrentTick();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -810,6 +984,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     Image& image = slot_images[image_id];
     WatchImage(image, "render target");
     image.flags |= ImageFlagBits::GpuModified;
+    image.flags &= ~ImageFlagBits::WrittenBack;
     image.gpu_write_tick = scheduler.CurrentTick();
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};

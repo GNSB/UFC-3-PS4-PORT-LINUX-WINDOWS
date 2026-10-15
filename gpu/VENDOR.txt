@@ -28,6 +28,15 @@ Backported video_core fixes (UFC-5):
   72251298 (mancelli's fork) depth read as a color format: only the Z32 -> R32_UINT case and
   freeing copies with their image, on top of ufc3's DepthAsR16 (per-layer 2D views, AMD 0003).
 
+Backported for UFC-6 (T6a of docs/ufc3/MANCELLI-BACKPORT.md, created fighter skin):
+  01b32f45 (mancelli's fork) parts 1, 2 and 4: a BC view of an uncompressed image goes through
+  memory (TileImageToBuffer into the buffer cache, the BC image uploads from there); storage
+  aliases are written back before a BC image is created over them; a compatible-format view with
+  more mips/layers expands the cached image. SHADPS4_BC_MODE (default 3) as in the fork. Not taken:
+  part 3 (flush of GPU images before CPU writes, page_manager: T6b) and the write back after
+  dispatches (StorageImageSync, which ufc3 does not have). Barrier recorded through Record()
+  (threaded recording); "[T6a]" lines in stdout, once per address.
+
 Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   69ab1996 (mancelli's fork) DB_ALPHA_TO_MASK emulated: alphaToCoverageEnable on multisampled
   targets (new pipeline key bit), 2x2 dither discard of MRT0 in the fragment shader with one
