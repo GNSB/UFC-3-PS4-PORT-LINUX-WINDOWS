@@ -455,7 +455,9 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
      * those stay off. The game asks for flip rate 1 (30 Hz); its simulation follows the real
      * frame time, so flip rate 0 with a 480 Hz virtual vblank and the present thread's cap set
      * the rate. Z16+S8 shadow data uploaded from memory is kept as D16 (stencil dropped). */
-    game_env(L"BB_NEO", L"0");
+    /* PS4 Pro mode: the game renders its scene at 1080p instead of 900p (CMask reads are
+     * answered as uncompressed by the runtime). */
+    game_env(L"BB_NEO", settings.neo ? L"1" : L"0");
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
     /* Write windows off: with them on, an RX 9070 run faulted in the guest allocator (free-list
      * next = 0x64, "RNA:Material:Buffer") after the first fight; with BB_WRITE_WINDOW=0 it played
@@ -690,7 +692,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -929,7 +931,7 @@ static void read_controls(void) {
     }
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
-    settings.fullscreen = checked(ID_FULLSCREEN); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
+    settings.fullscreen = checked(ID_FULLSCREEN); settings.neo = checked(ID_NEO); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
     settings.validation = checked(ID_VALIDATION); settings.frame_stats = checked(ID_STATS); settings.menu_trace = checked(ID_TRACE);
     settings.resolution = clampi((int)SendMessageW(control(ID_RESOLUTION), CB_GETCURSEL, 0, 0), COUNT(resolution_names));
     settings.fps_mode = clampi((int)SendMessageW(control(ID_FPS), CB_GETCURSEL, 0, 0), COUNT(fps_names));
@@ -1104,14 +1106,15 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 116, 200, 200, ID_UPSCALER);
     make(L"STATIC", L"Sharpening (RCAS)", 0, 24, y + 152, 130, 20, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 148, 200, 200, ID_SHARPNESS);
-    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 184, 330, 20, ID_FULLSCREEN);
+    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 184, 120, 20, ID_FULLSCREEN);
+    make(L"BUTTON", L"PS4 Pro mode (sharper)", BS_AUTOCHECKBOX, 160, y + 184, 200, 20, ID_NEO);
     make(L"BUTTON", L"Frame rate", BS_GROUPBOX, 388, y, 360, 216, 0);
     make(L"STATIC", L"FPS limit", 0, 400, y + 24, 130, 20, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 536, y + 20, 200, 200, ID_FPS);
     make(L"BUTTON", L"Show the FPS counter", BS_AUTOCHECKBOX, 400, y + 56, 330, 20, ID_SHOWFPS);
     make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 88, 330, 20, ID_CLEAR);
     make(L"BUTTON", L"Skip the intro videos (EA logo, first start)", BS_AUTOCHECKBOX, 400, y + 188, 340, 20, ID_SKIPMOVIES);
-    make(L"STATIC", L"2K / 4K: the game draws 1080p; pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
+    make(L"STATIC", L"2K / 4K: the game draws 900p (1080p in PS4 Pro mode); pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
     make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
     make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
@@ -1137,7 +1140,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
             SendMessageW(control(combos[c].id), CB_SETCURSEL, combos[c].selected, 0);
         }
     }
-    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
+    set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_NEO, settings.neo); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads();
     set_running(0);
