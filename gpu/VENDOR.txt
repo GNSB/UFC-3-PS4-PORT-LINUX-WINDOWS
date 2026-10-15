@@ -11,3 +11,4 @@ Backported from upstream after b4e7ae7 (2026-10-02), recompiler correctness fixe
 Backported for UFC-4 (recompiler batch T1 of docs/ufc3/MANCELLI-BACKPORT.md), one line per commit:
   c49529087 NaN handling: legacy variants, unordered v_cmp_n*, DX10_CLAMP, NaN-aware med3 (#5257);
     externals/sirit gains OpNClamp (GLSLstd450NClamp) in gpu/third_party/sirit (in-tree, no submodule).
+  5dedb48f (mancelli) RuntimeInfo::Properties::num_allocated_vgprs gets 9 bits (fixes #5257 truncating 256 to 0).
