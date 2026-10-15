@@ -2917,6 +2917,13 @@ struct DepthAsR16 {
         VmaAllocation allocation = VK_NULL_HANDLE;
         vk::ImageView view{};
         u32 width = 0, height = 0;
+        // The depth layer read by the conversion, as its own 2D view. The guest's view of an
+        // array image is a 2D-array view, which the shader's texture2D must not be given (AMD
+        // returned garbage for it: the floor grain persisted on an RX 9070 after the per-layer
+        // fix; NVIDIA tolerated it).
+        vk::ImageView src_view{};
+        vk::Format src_format = vk::Format::eUndefined;
+        u64 src_uid = 0; // a VkImage handle can be reused by a later image
     };
     vk::UniqueDescriptorSetLayout set_layout;
     vk::UniquePipelineLayout layout;
@@ -2962,15 +2969,33 @@ DepthAsR16& DepthAsR16State(const Instance& instance) {
     return state;
 }
 
-const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, const void* image, u32 layer,
-                                       u32 width, u32 height) {
+const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, vk::Image src_image,
+                                       vk::Format src_format, u64 src_uid, u32 layer, u32 width,
+                                       u32 height) {
     auto& state = DepthAsR16State(instance);
+    const void* image = static_cast<VkImage>(src_image);
     const auto key = std::make_pair(image, layer);
     auto& copy = state.copies[key];
     if (copy.image && (copy.width != width || copy.height != height)) {
         instance.GetDevice().destroyImageView(copy.view);
         vmaDestroyImage(instance.GetAllocator(), copy.image, copy.allocation);
-        copy = {};
+        copy.image = VK_NULL_HANDLE;
+        copy.view = vk::ImageView{};
+    }
+    // A new image behind this handle (or another host format): a new source view. The old one is
+    // not destroyed here (frames in flight may still read it); this happens a few times per run.
+    if (copy.src_view && (copy.src_format != src_format || copy.src_uid != src_uid)) {
+        copy.src_view = vk::ImageView{};
+    }
+    if (!copy.src_view) {
+        copy.src_view = Check(instance.GetDevice().createImageView({
+            .image = src_image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = src_format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, layer, 1},
+        }));
+        copy.src_format = src_format;
+        copy.src_uid = src_uid;
     }
     if (!copy.image) {
         const VkImageCreateInfo image_ci = {
@@ -3308,14 +3333,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 desc.view_info.format == vk::Format::eR16Uint &&
                 desc.view_info.range.base.level == 0 && desc.view_info.range.extent.layers == 1) {
                 const u32 width = image.info.size.width, height = image.info.size.height;
-                const auto* copy = DepthAsR16Copy(instance, image.GetImage(),
-                                                  desc.view_info.range.base.layer, width, height);
+                const auto* copy = DepthAsR16Copy(
+                    instance, image.GetImage(),
+                    instance.GetSupportedFormat(image.info.pixel_format, image.format_features),
+                    image.image_uid, desc.view_info.range.base.layer, width, height);
                 if (copy) {
                     // The depth image was transited for reading above; the copy is rebuilt now.
                     scheduler.EndRendering();
                     runtime.FlushBarriers();
                     auto& state = DepthAsR16State(instance);
-                    const vk::ImageView src_view = view;
+                    const vk::ImageView src_view = copy->src_view;
                     const vk::ImageLayout src_layout = layout;
                     const vk::Image dst_image{copy->image};
                     const vk::ImageView dst_view = copy->view;
