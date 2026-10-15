@@ -449,7 +449,10 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
      * the rate. Z16+S8 shadow data uploaded from memory is kept as D16 (stencil dropped). */
     game_env(L"BB_NEO", L"0");
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
-    game_env(L"BB_WRITE_WINDOW", L"1");
+    /* Write windows off: with them on, an RX 9070 run faulted in the guest allocator (free-list
+     * next = 0x64, "RNA:Material:Buffer") after the first fight; with BB_WRITE_WINDOW=0 it played
+     * several fights and exited cleanly. Set BB_WRITE_WINDOW=1 before the launcher to turn it back on. */
+    game_env(L"BB_WRITE_WINDOW", L"0");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
     game_env(L"BB_PREUPLOAD", L"1"); game_env(L"BB_COPY_GPU_BUFFERS", L"1");
