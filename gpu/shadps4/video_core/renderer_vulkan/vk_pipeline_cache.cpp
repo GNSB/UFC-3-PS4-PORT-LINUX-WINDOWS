@@ -929,16 +929,19 @@ static bool AlphaToMaskDrawWanted(u32 num_indices) {
            (list.only.empty() || list.only.contains(num_indices));
 }
 
-/// UFC-7 colour-map rule (default; BB_ALPHA_TO_MASK=all or BB_ALPHA_TO_MASK_DRAWS turn it off, so
-/// the list alone decides): DB_ALPHA_TO_MASK is emulated only for pixel shaders that sample an
-/// uncompressed 8_8_8_8 sRGB texture. UFC 3's alpha-to-mask shader 39d6a7df draws every hairstyle
-/// with the hair colour map the game composites at run time (8_8_8_8 sRGB, BGRA, full mip chain);
-/// the one draw of it that is not hair (6456 indices, over the torso) samples only authored
-/// block-compressed maps (BC3 sRGB colour), and dithered by its alpha it shows a dark layer below.
+/// UFC-7 colour-map rule, opt-in since UFC-12 (BB_ALPHA_TO_MASK=colourmap; BB_ALPHA_TO_MASK_DRAWS
+/// turns it off, so the list alone decides): DB_ALPHA_TO_MASK emulated only for pixel shaders that
+/// sample an uncompressed 8_8_8_8 sRGB texture. It left out every hair and beard of the fights: the
+/// game compresses its colour maps to BC on the GPU (mips down to one 4x4 block: 512x512 has 8),
+/// and authored ones are BC too. The draw it was made for (6456 indices over the Create Fighter
+/// torso) samples the same kind of map as the created fighter's hair in a fight (GPU-compressed
+/// BC3 512x512, 8 mips, same t1/t4 and VS), so no T# tells them apart; and every test that showed
+/// that torso dark ran without UFC-6, when GPU-compressed textures (the created fighter's skin
+/// under that layer) were not read through memory yet. Default (and =all): no rule.
 static bool AlphaToMaskColourMapRule() {
     static const bool rule = [] {
         const char* env = std::getenv("BB_ALPHA_TO_MASK");
-        return !(env && std::string_view{env} == "all") && !AlphaToMaskDraws().set;
+        return env && std::string_view{env} == "colourmap" && !AlphaToMaskDraws().set;
     }();
     return rule;
 }
@@ -1146,8 +1149,8 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     // The register is context state that stays set across draws; the hardware ignores it when
     // the pixel shader's DB_SHADER_CONTROL sets ALPHA_TO_MASK_DISABLE or MRT0 exports no alpha.
     // The register gates, BB_ALPHA_TO_MASK_SKIP and _DRAWS are decided here; the MRT0-export and
-    // colour-map gates after the plain stages are selected. A draw left out never selects the
-    // dither variant, so it goes through exactly the path of BB_ALPHA_TO_MASK=0. (UFC-7: the
+    // (opt-in) colour-map gates after the plain stages are selected. A draw left out never selects
+    // the dither variant, so it goes through exactly the path of BB_ALPHA_TO_MASK=0. (UFC-7: the
     // fourth pass compiled and bound the variant first and only then dropped it; with no draw
     // emulated the result already differed from =0.)
     const u32 alpha_to_mask = regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC];
