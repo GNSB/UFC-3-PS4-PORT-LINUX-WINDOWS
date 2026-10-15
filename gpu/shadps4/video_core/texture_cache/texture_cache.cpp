@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <xxhash.h>
@@ -107,6 +108,35 @@ bool T4Portrait(const ImageInfo& info) {
            (info.size.width == 652 && info.size.height == 1080) ||
            (info.size.width == 600 && info.size.height == 1080) ||
            (info.size.width == 1000 && info.size.height == 1200);
+}
+
+bool T4PreserveAlias(const Image& source, const ImageInfo& destination) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_T4_PRESERVE_ALIAS");
+        return !env || std::string_view{env} != "0";
+    }();
+    const auto& src = source.info;
+    // UFC-13: only the observed portrait RT -> sampled mip-chain transition. A CPU/buffer
+    // write invalidates SafeToDownload(), so reused pools do not inherit a stale GPU image.
+    return enabled && T4Portrait(destination) &&
+           source.SafeToDownload() && source.usage.render_target &&
+           src.guest_address == destination.guest_address &&
+           src.size == Extent3D{1024, 2048, 1} && destination.size.depth == 1 &&
+           src.type == AmdGpu::ImageType::Color2D && destination.type == src.type &&
+           src.pixel_format == vk::Format::eR8G8B8A8Unorm &&
+           destination.pixel_format == src.pixel_format &&
+           src.tile_mode == AmdGpu::TileMode::Thin2DThin &&
+           destination.tile_mode == src.tile_mode && src.array_mode == destination.array_mode &&
+           src.props.is_tiled && destination.props.is_tiled &&
+           src.alt_tile == destination.alt_tile && src.bank_swizzle == destination.bank_swizzle &&
+           src.num_bits == 32 && destination.num_bits == 32 &&
+           src.num_samples == 1 && destination.num_samples == 1 &&
+           src.resources.layers == 1 && destination.resources.layers == 1 &&
+           src.resources.levels == 1 && destination.resources.levels > 1 &&
+           src.pitch == 1024 && destination.pitch == src.pitch &&
+           src.mips_layout[0].pitch == destination.mips_layout[0].pitch &&
+           src.mips_layout[0].offset == 0 && destination.mips_layout[0].offset == 0 &&
+           !(destination.micro_tiled_mips & 1u);
 }
 
 // UFC-13: diagnostics only; never write tiled images back as linear pixels. Called on the
@@ -612,6 +642,42 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                             u32(image_info.tile_mode), image_info.resources.levels, u32(binding));
                 TraceT4Pixels(cache_image, "alias-before-reject-host",
                               {image_info.size.width, image_info.size.height});
+            }
+            if (!merged_image_id && binding == BindingType::Texture &&
+                T4PreserveAlias(cache_image, image_info)) {
+                // Thin2DThin (tile 14), RGBA8, one sample: 8x8 microtiles are 256 bytes,
+                // no larger than the tile split. tiling.comp indexes macrotiles by
+                // (y / macro_height) * (pitch / macro_pitch) + x / macro_pitch.
+                // Height only enters the slice offset, which is zero for slice 0 here.
+                // Equal effective pitch, tiling parameters and bank swizzle therefore give
+                // identical guest addresses throughout this mip-0 origin rectangle.
+                const auto new_id = slot_images.insert(instance, runtime, slot_image_views,
+                                                       image_info);
+                RegisterImage(new_id);
+                // Slot insertion can move images; reacquire the source reference.
+                auto& src = slot_images[cache_image_id];
+                auto& dst = slot_images[new_id];
+                RefreshImage(dst);
+                // Initialize other mips from memory first, then replace ONLY mip 0. Later
+                // game dispatches and ordinary ExpandImage preserve/generate mips 1..N.
+                runtime.CopyImageMip0Region(&src, &dst);
+                TraceT4Pixels(dst, "alias-preserved-host");
+                static std::unordered_set<std::string> preserved;
+                const auto key = fmt::format("{:#x} {}x{}", image_info.guest_address,
+                                             image_info.size.width, image_info.size.height);
+                if (T4TraceEnabled() && preserved.insert(key).second) {
+                    std::printf("[T4] alias-preserved addr=%#llx region=%ux%u pitch=%u "
+                                "tile=%u mip=0 mips=%u\n",
+                                static_cast<unsigned long long>(image_info.guest_address),
+                                image_info.size.width, image_info.size.height, image_info.pitch,
+                                u32(image_info.tile_mode), image_info.resources.levels);
+                }
+                if (src.binding.is_bound || src.binding.is_target) {
+                    src.binding.needs_rebind = 1u;
+                }
+                FreeImage(cache_image_id);
+                TrackImage(new_id);
+                return {new_id, -1, -1};
             }
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {

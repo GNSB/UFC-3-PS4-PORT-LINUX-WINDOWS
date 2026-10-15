@@ -459,6 +459,42 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::CopyImageMip0Region(VideoCore::Image* src, VideoCore::Image* dst) {
+    ASSERT(src->info.type == AmdGpu::ImageType::Color2D &&
+           dst->info.type == AmdGpu::ImageType::Color2D &&
+           src->info.pixel_format == dst->info.pixel_format &&
+           src->info.num_samples == 1 && dst->info.num_samples == 1 &&
+           src->info.resources.layers == 1 && dst->info.resources.layers == 1 &&
+           src->info.size.width >= dst->info.size.width &&
+           src->info.size.height >= dst->info.size.height &&
+           src->aspect_mask == vk::ImageAspectFlagBits::eColor &&
+           dst->aspect_mask == vk::ImageAspectFlagBits::eColor);
+    SetBackingSamples(dst, 1, false);
+    SetBackingSamples(src, 1);
+    scheduler.EndRendering();
+    bool needs_flush =
+        Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferRead);
+    needs_flush |= Transit(dst, vk::ImageLayout::eTransferDstOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+    const vk::ImageCopy region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {dst->info.size.width, dst->info.size.height, 1},
+    };
+    scheduler.Record([src_image = src->GetImage(), dst_image = dst->GetImage(),
+                      region](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImage(src_image, vk::ImageLayout::eTransferSrcOptimal, dst_image,
+                         vk::ImageLayout::eTransferDstOptimal, region);
+    });
+    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    dst->gpu_write_tick = src->gpu_write_tick;
+}
+
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
