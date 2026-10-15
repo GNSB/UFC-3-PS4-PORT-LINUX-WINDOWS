@@ -85,3 +85,16 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   variant only for a draw that takes it, so a draw left out keeps the =0 path. Pending: why that
   draw's alpha (b2 dword 24 = 2 x red of t4, a BC1 sRGB mask on the second UV set) is low here.
   The fourth pass's guard was this rule inverted (hair square, torso dark).
+  UFC-12: the colour-map rule left out all the hair and beards of the fights (square black
+  cards): there every 39d6a7df/a4856d46 draw samples BC colour maps, authored or compressed by the
+  game on the GPU ("[T6a] BC view Bc3SrgbBlock over R32G32B32A32Uint ... GPU-written"; mips stop at
+  one 4x4 block, hence 8 mips at 512x512, 9 at 1024x1024). The torso draw (6456 indices) samples
+  one of those GPU-compressed maps too (t3 0x1039292500 in the 0.1.3 log), like the created
+  fighter's hair in a fight (4800 and 23682 indices: t3 GPU-compressed BC3, same t1, t4, VS,
+  b2[20..22]); no T#, mip count, constant or MRT count tells them apart. The alpha is not the
+  cause: MRT0 alpha = b2 dword 24 x red of t4 (BC1 sRGB, UV = Param0.zw = second UV vertex input),
+  and the console degammas an sRGB T# like Vulkan does. Every run that showed that torso dark
+  (UFC-7 passes 4-6, Windows g17f300d) was built without UFC-6, when GPU-compressed textures, the
+  created fighter's skin among them, were not read through memory: dithered, the layer shows the
+  skin under it. Default now: no rule (=all is the same); BB_ALPHA_TO_MASK=colourmap brings the
+  UFC-7 rule back. Cache versions unchanged.
