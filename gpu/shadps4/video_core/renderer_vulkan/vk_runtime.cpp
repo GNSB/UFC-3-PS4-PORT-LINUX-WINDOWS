@@ -33,6 +33,33 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     }
 }
 
+// UFC-13: include implicit backing conversions as well as explicit CB_RESOLVE.
+// Recording thread only; no new transfers, waits, or changes to image state.
+static void TraceT4Transfer(const VideoCore::Image& src, const VideoCore::Image& dst,
+                             const char* event, u64 tick, u32 samples, bool copy = true) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_T4_TRACE");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) return;
+    const auto portrait = [](const VideoCore::ImageInfo& info) {
+        return info.size.width >= 600 && info.size.width <= 1024 &&
+               info.size.height >= 1000 && info.size.height <= 2048;
+    };
+    if (!portrait(src.info) && !portrait(dst.info)) return;
+    static u32 count = 0;
+    if (count++ >= 256) return;
+    std::printf("%s\n", fmt::format(
+        "[T4] tick={} {} src={:#x}:{}x{}:{}:samples{}:backing{} "
+        "dst={:#x}:{}x{}:{}:samples{}:backing{} requested_samples={} copy={}",
+        tick, event, src.info.guest_address, src.info.size.width, src.info.size.height,
+        vk::to_string(src.info.pixel_format), src.info.num_samples,
+        src.backing ? src.backing->num_samples : 0,
+        dst.info.guest_address, dst.info.size.width, dst.info.size.height,
+        vk::to_string(dst.info.pixel_format), dst.info.num_samples,
+        dst.backing ? dst.backing->num_samples : 0, samples, copy).c_str());
+}
+
 static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_info,
                                               const VideoCore::ImageInfo& dst_info,
                                               const u32 depth) {
@@ -332,6 +359,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    TraceT4Transfer(*src, *dst, "image-copy", scheduler.CurrentTick(), dst->info.num_samples);
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -630,6 +658,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
     SetBackingSamples(dst, 1, false);
     scheduler.EndRendering();
 
+    TraceT4Transfer(*src, *dst, "image-resolve", scheduler.CurrentTick(), 1);
     const bool needs_resolve = src->backing->num_samples != 1;
     const auto dst_stage =
         needs_resolve ? vk::PipelineStageFlagBits2::eResolve : vk::PipelineStageFlagBits2::eCopy;
@@ -730,6 +759,8 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     if (!backing || backing->num_samples == num_samples) {
         return;
     }
+    TraceT4Transfer(*image, *image, "backing-samples", scheduler.CurrentTick(),
+                    num_samples, copy_backing);
     ASSERT_MSG(!image->info.props.is_depth, "Swapping samples is only valid for color images");
     VideoCore::Image::BackingImage* new_backing;
     auto it = std::ranges::find(backing_images, num_samples,

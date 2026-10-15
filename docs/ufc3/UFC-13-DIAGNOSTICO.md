@@ -1,3 +1,110 @@
+# UFC-13 / T4: tercera pasada (15 oct 2026)
+
+## Resultado y discrepancia de la evidencia
+
+**Sin fix confirmado; se deja instrumentación para una sola prueba corta.** No se
+cambia la política de alias ni el render. El log presente en este worktree no
+contiene los dos `nonzero=1` citados en el ticket. Para identificar exactamente
+el archivo analizado: `logs/20261015_203329.log`, 953966 bytes, SHA-256
+`d7ffbdecb3bb0984b13b7f57c99fc4bc3801f9c8568d852d44dda7e9a526bb64`.
+
+| Líneas del log | Dirección / evento | Resultado |
+| --- | --- | --- |
+| 4267–4269 | `0x1033548000`, RT 1024×2048 antes del rechazo | 1740117 bytes no cero; RGBA 434693,434781,434912,435731 |
+| 4271 | misma dirección, upload 864×1360 | 367730 bytes no cero; RGBA visible **0,0,0,0** |
+| 4366 | `0x1032f40000`, RT 1024×2048 antes del rechazo | 1009540 bytes no cero; RGBA 252184,252071,252257,253028 |
+| 4370 | misma dirección, upload 652×1080 | 191371 bytes no cero; RGBA visible **0,0,0,0** |
+
+Los bytes no cero del upload están fuera del rectángulo visible, en el padding
+incluido por `pitch=1024`. No demuestran que la textura recargada tenga contenido
+visible. Los conteos del RT completo tampoco demuestran todavía que sus píxeles
+estén dentro del rectángulo solicitado: se agrega una medición de esa región.
+No se puede concluir con este archivo que el RT ya estaba vacío. Tampoco se
+identifica visualmente al peleador sólo por esos conteos.
+
+Se repitió el informe offline con `tools/ufc13_spg_report.py` sobre los captures
+actuales, sin modificarlos. En `cap_10001`, `left_large.spg`, `left_medium.spg`,
+`right_large.spg`, `right_medium.spg`, `win.spg`, `win_wfa.spg`, los `*_tott.spg` y
+los belt siguen con RGB negro y alfa cero. El contenido visible sí se pierde antes
+del archivo final; no es sólo una interpretación del JPEG sin transparencia.
+
+## Draws y causa todavía pendiente
+
+Antes del primer rechazo, el log sólo registra los bindings del target
+900×1416 `0x1033ff8000` (tick 34391), luego su lectura y el binding del target
+1024×2048 `0x1033548000` (tick 34401). No enumera los draws ni sus estados, así
+que no permite atribuir VS/PS, depth/stencil, viewport, blend o clears a ese RT.
+La línea 3726 muestra PS `39d6a7df` / VS `d9a103aa` con shader dither, pero sobre
+CB0 `0x1074dd0000`, 4 muestras; no alcanza para atribuirlo al retrato.
+
+`ResolveOverlap` rechaza la nueva descripción por `BlockDim()`: ésta incluye
+pitch y altura, por lo que 1024×2048 y 1024×1360 difieren aunque sean RGBA8 y
+compartan tile 14. Ese retorno permite una recarga independiente. El path de
+alias BC ya usa `TileImageToBuffer`, pero aplicarlo indiscriminadamente aquí
+puede confundir reutilización del pool con un alias vigente. No se introduce
+ese cambio sin resolver la discrepancia y medir la región visible.
+
+## Trazas agregadas
+
+Todas requieren `BB_T4_TRACE=1` y se ejecutan en el hilo que registra el render:
+
+- `draw`: hasta 4096 draws en orden, directos e indirectos, hacia targets de
+  ancho 600–1024 y alto 1000–2048. Incluye todos sus MRT: dirección, formato,
+  tile, mip, muestras guest/backing de pipeline, clear y valor, write mask
+  efectivo y factores/operaciones de blend. También VS/PS y variante PS,
+  tamaño del framebuffer, viewport/scissor efectivos Vulkan, cull/discard,
+  depth asociado y estado efectivo de depth/stencil, bounds y clears.
+  `count`/`instances` son registros guest; en draws indirectos los argumentos
+  efectivos vienen del buffer indirecto, no de estos campos.
+- `db_alpha_to_mask`/`a2m_disable` y `a2c` registran estado guest y coverage
+  del pipeline; **el registro por sí solo no prueba shader dither**. Correlacionar
+  PS/variante/target con los mensajes `[T7]` existentes.
+- `fast-clear`: hasta 128 clears realmente ejecutados por eliminación de fast
+  clear, con dirección, CMASK, modo y valor. Los clears de attachments se ven
+  en `draw`.
+- `cb-resolve`: hasta 128 resolves explícitos, con origen/destino y muestras.
+- `image-copy`, `image-resolve`, `backing-samples`: hasta 256 eventos compartidos
+  del runtime para esas dimensiones; incluyen muestras de backing y si la
+  conversión copia contenido. Cubren conversiones implícitas además de CB_RESOLVE.
+
+Además, con **ambos** `BB_T4_TRACE=1 BB_T4_TRACE_PIXELS=1`, `alias-region-host`
+cuenta RGBA dentro de `[0,width) × [0,height)` de la textura solicitada, usando
+la misma copia staging del RT. No agrega copias ni esperas; se mantienen los
+límites de las probes anteriores (16, dos por evento/dimensión, 8 MiB cada una).
+Con flags apagados no hay nuevas transferencias ni esperas. Las probes con
+píxeles siguen haciendo `scheduler.Finish()` y pueden alterar tiempos.
+
+## UNA prueba siguiente
+
+Iniciar el comando habitual con
+`BB_T4_TRACE=1 BB_T4_TRACE_PIXELS=1 BB_SAVE_LOG=1`, crear **un solo peleador nuevo**
+y guardar hasta generar un `cap_*` nuevo; cerrar normalmente. Entregar ese log
+y ese capture. No hace falta una pelea.
+
+Seguir por dirección/tick los `draw` y transferencias hasta el rechazo. Si
+`alias-region-host` tiene RGB/alfa y `alias-upload-host` vuelve a cero, la pérdida
+está en la transición de descripción. Si la región ya es cero, los estados de
+los draws, clears y resolves permitirán seguir el productor del RT. Si el
+runtime llega al límite de trazas, la ausencia de líneas posteriores no prueba
+que no hubo operaciones. Queda pendiente correlacionar por separado el modelo
+del jugador en post-fight.
+
+## Validación de esta pasada
+
+La compilación final con `ufc3-build` terminó con código 0 y produjo
+`out/sacredfire`, versión `ufc3-v0.1.2-57-ga3cae11-dirty`. Se recompilaron
+`vk_rasterizer.cpp`, `vk_runtime.cpp` y el caché de texturas. Sólo se observaron
+los avisos de CMake/ODR de fsr-vulkan ya presentes; no hubo errores.
+`git diff --check` pasó. No se ejecutó el juego ni se hicieron commits, cambios
+de rama, merge, rebase o push. No se tocó online, `vk_pipeline_cache.*` ni
+`shader_recompiler/**`. Los symlinks `orig`/`user` no forman parte del diff.
+El submódulo fsr-vulkan ya figuraba modificado al inicio y se mantiene fuera
+del cambio del ticket.
+
+---
+
+## Segunda pasada (histórico)
+
 # UFC-13 / T4: segunda pasada (15 oct 2026)
 
 ## Resultado

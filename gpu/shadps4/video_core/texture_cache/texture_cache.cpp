@@ -172,7 +172,7 @@ void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_rea
 }
 } // Anonymous namespace
 
-void TextureCache::TraceT4Pixels(Image& image, const char* event) {
+void TextureCache::TraceT4Pixels(Image& image, const char* event, Extent2D region) {
     // Explicit, bounded diagnostic waits, separate from normal BB_T4_TRACE logging. This
     // reads the Vulkan image into host staging; it never changes guest/buffer-cache bytes.
     static const bool pixels_enabled = [] {
@@ -210,6 +210,26 @@ void TextureCache::TraceT4Pixels(Image& image, const char* event) {
     download.Invalidate();
     LogT4Image(image, event, scheduler.CurrentTick(), readback_linear_images,
                download.mapped, static_cast<u32>(size));
+    if (region.width && region.height) {
+        // Same completed staging copy: distinguish the requested portrait rectangle from
+        // pixels elsewhere in the padded 1024x2048 target. No additional GPU wait or copy.
+        const u32 width = std::min(region.width, info.size.width);
+        const u32 height = std::min(region.height, info.size.height);
+        std::array<u32, 4> channels{};
+        for (u32 y = 0; y < height; ++y) {
+            for (u32 x = 0; x < width; ++x) {
+                const u64 offset = (u64(y) * info.pitch + x) * 4;
+                for (u32 c = 0; c < 4; ++c) {
+                    channels[c] += download.mapped[offset + c] != 0;
+                }
+            }
+        }
+        std::printf("[T4] tick=%llu alias-region-host addr=%#llx region=%ux%u "
+                    "rgba_nonzero=%u,%u,%u,%u\n",
+                    static_cast<unsigned long long>(scheduler.CurrentTick()),
+                    static_cast<unsigned long long>(info.guest_address), width, height,
+                    channels[0], channels[1], channels[2], channels[3]);
+    }
 }
 
 std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
@@ -590,7 +610,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                             static_cast<unsigned long long>(cache_image.gpu_write_tick),
                             image_info.size.width, image_info.size.height, image_info.pitch,
                             u32(image_info.tile_mode), image_info.resources.levels, u32(binding));
-                TraceT4Pixels(cache_image, "alias-before-reject-host");
+                TraceT4Pixels(cache_image, "alias-before-reject-host",
+                              {image_info.size.width, image_info.size.height});
             }
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
