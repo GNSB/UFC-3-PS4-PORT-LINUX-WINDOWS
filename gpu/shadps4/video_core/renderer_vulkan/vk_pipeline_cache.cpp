@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -223,6 +225,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
             info.hw.fs.color_buffers[i] = sel.graphics_key.color_buffers[i];
         }
+        // DB_ALPHA_TO_MASK: with one sample the hardware turns MRT0 alpha into a 2x2 dither
+        // pattern (games resolve it with TAA, e.g. hair cards). Emulated in the shader.
+        info.hw.fs.alpha_to_mask = sel.alpha_to_mask;
         // Lowered user clip planes ride the same emulation path as guest-exported distances, so
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
         // locations in sync with the shifted vertex outputs.
@@ -519,12 +524,148 @@ void NoteDrawTarget(const AmdGpu::Regs& regs) {
 }
 } // namespace
 
+namespace {
+/// [T7] trace (UFC-7): once per session, every draw of two frames that renders to the colour or
+/// depth target of the DB_ALPHA_TO_MASK draws or samples them, in order: what is drawn under and
+/// over the hair and torso, and what reads the target afterwards. Armed on the
+/// BB_T7_TRACE_AFTER-th frame with such draws (unset or 0: never; it changes the frames it
+/// traces, which skip the prepared pipelines). GPU thread, except NoteAlphaToMaskDraw
+/// (draw-preparation workers too).
+struct AlphaToMaskTrace {
+    std::mutex mutex;
+    u64 color = 0, depth = 0;
+    u32 frames = 0, last_frame = ~0u;
+    std::atomic<u32> first{~0u};
+    u32 draws = 0, listed = 0;
+    bool ended = false;
+};
+AlphaToMaskTrace a2m_trace;
+constexpr u32 TraceFrames = 2;
+constexpr u32 TraceMaxLines = 800;
+
+u32 TraceAfterFrames() {
+    static const u32 after = [] {
+        const char* env = std::getenv("BB_T7_TRACE_AFTER");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
+    }();
+    return after;
+}
+
+/// A draw with DB_ALPHA_TO_MASK set: its targets, and the frame count that arms the trace.
+void NoteAlphaToMaskDraw(const PipelineSelection& sel) {
+    if ((sel.worker && sel.worker->failed) || TraceAfterFrames() == 0) {
+        return;
+    }
+    const auto& regs = *sel.regs;
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    std::scoped_lock lock{a2m_trace.mutex};
+    if (!a2m_trace.color && regs.color_buffers[0]) {
+        a2m_trace.color = regs.color_buffers[0].Address();
+    }
+    if (!a2m_trace.depth && regs.depth_buffer.DepthValid()) {
+        a2m_trace.depth = regs.depth_buffer.DepthAddress();
+    }
+    if (a2m_trace.last_frame == frame) {
+        return;
+    }
+    a2m_trace.last_frame = frame;
+    if (++a2m_trace.frames == TraceAfterFrames()) {
+        a2m_trace.first.store(frame + 1, std::memory_order_relaxed);
+        std::printf("[T7] trace: frames %u-%u, draws on CB %#llx / depth %#llx or sampling them\n",
+                    frame + 1, frame + TraceFrames, static_cast<unsigned long long>(a2m_trace.color),
+                    static_cast<unsigned long long>(a2m_trace.depth));
+        std::fflush(stdout);
+    }
+}
+
+/// GPU thread: inside the traced frames (draws then skip the prepared pipelines, so that each
+/// goes through RefreshGraphicsKey and is listed).
+bool TracingAlphaToMask() {
+    const u32 first = a2m_trace.first.load(std::memory_order_relaxed);
+    if (first == ~0u || a2m_trace.ended) {
+        return false;
+    }
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (frame < first) {
+        return false;
+    }
+    if (frame >= first + TraceFrames || a2m_trace.listed >= TraceMaxLines) {
+        a2m_trace.ended = true;
+        std::printf("[T7] trace end: %u draws, %u listed\n", a2m_trace.draws, a2m_trace.listed);
+        std::fflush(stdout);
+        return false;
+    }
+    return true;
+}
+
+void TraceAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
+    const auto& regs = *sel.regs;
+    const u32 ordinal = a2m_trace.draws++;
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
+    u64 color, depth;
+    {
+        std::scoped_lock lock{a2m_trace.mutex};
+        color = a2m_trace.color;
+        depth = a2m_trace.depth;
+    }
+    bool related = std::string_view{mode} != "-";
+    std::string targets;
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& buffer = regs.color_buffers[cb];
+            if (!buffer || !regs.color_target_mask.GetMask(cb)) {
+                continue;
+            }
+            related |= buffer.Address() == color;
+            const auto& bc = regs.blend_control[cb];
+            targets += fmt::format(" CB{} {:#x} fmt {}/{} x{} mask {:#x} blend {}", cb,
+                                   buffer.Address(), u32(buffer.GetDataFmt()),
+                                   u32(buffer.GetNumberFmt()), buffer.NumSamples(),
+                                   regs.color_target_mask.GetMask(cb),
+                                   bc.enable && !buffer.info.blend_bypass
+                                       ? fmt::format("{}*src {} {}*dst", u32(bc.color_src_factor),
+                                                     u32(bc.color_func), u32(bc.color_dst_factor))
+                                       : std::string{"off"});
+        }
+    }
+    targets += fmt::format(" colour mode {}", u32(regs.color_control.mode));
+    if (regs.depth_buffer.DepthValid()) {
+        related |= regs.depth_buffer.DepthAddress() == depth;
+        targets += fmt::format(" | depth {:#x} x{} test {} func {} write {} stencil {}",
+                               regs.depth_buffer.DepthAddress(), regs.depth_buffer.NumSamples(),
+                               u32(regs.depth_control.depth_enable),
+                               u32(regs.depth_control.depth_func),
+                               u32(regs.depth_control.depth_write_enable),
+                               u32(regs.depth_control.stencil_enable));
+    }
+    std::string images;
+    for (u32 i = 0; fs && i < fs->images.size(); ++i) {
+        const auto tsharp = fs->images[i].GetSharp(*fs);
+        related |= tsharp.Address() == color || tsharp.Address() == depth;
+        images += fmt::format(" t{}={:#x} {}x{} {}/{}", i, tsharp.Address(),
+                              u32(tsharp.width) + 1, u32(tsharp.height) + 1,
+                              u32(tsharp.data_format), u32(tsharp.num_format));
+    }
+    if (!related) {
+        return;
+    }
+    ++a2m_trace.listed;
+    std::printf("[T7] #%u f%u ps %016llx vs %016llx: %u indices x%u; a2m %s;%s;%s\n", ordinal,
+                BbStats::frame_number.load(std::memory_order_relaxed),
+                static_cast<unsigned long long>(fs ? fs->pgm_hash : 0),
+                static_cast<unsigned long long>(vs ? vs->pgm_hash : 0), regs.num_indices,
+                regs.num_instances.num_instances, mode, targets.c_str(), images.c_str());
+    std::fflush(stdout);
+}
+} // namespace
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
     used_prepared = nullptr;
     NoteDrawTarget(liverpool->regs);
-    if (prepared) {
+    if (prepared && !TracingAlphaToMask()) {
         if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
             used_prepared = prepared;
             return pipeline;
@@ -716,6 +857,217 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
+/// bbport: BB_ALPHA_TO_MASK=0 turns off the DB_ALPHA_TO_MASK emulation (69ab1996).
+static bool AlphaToMaskEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+/// bbport: BB_ALPHA_TO_MASK=coverage: multisampled targets use Vulkan alphaToCoverageEnable (the
+/// fork's choice). By default they take the shader dither too: whole pixels, every sample alike.
+/// With alphaToCoverage on the UFC 3 Create Fighter 4x MSAA pass the hair came out right and the
+/// fighter's torso dark (UFC-7).
+static bool AlphaToCoverageWanted() {
+    static const bool wanted = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return env && std::string_view{env} == "coverage";
+    }();
+    return wanted;
+}
+
+/// bbport: BB_ALPHA_TO_MASK_SKIP=<hash>,<hash>: pixel shaders (pgm_hash from the [T7] lines)
+/// left out of the emulation, to tell from one run which draw a wrong one is.
+static bool AlphaToMaskSkipped(u64 ps_hash) {
+    static const std::unordered_set<u64> skipped = [] {
+        std::unordered_set<u64> hashes;
+        const char* env = std::getenv("BB_ALPHA_TO_MASK_SKIP");
+        while (env && *env) {
+            char* end{};
+            const u64 hash = std::strtoull(env, &end, 16);
+            if (end == env) {
+                break;
+            }
+            hashes.insert(hash);
+            env = *end ? end + 1 : end;
+        }
+        return hashes;
+    }();
+    return !skipped.empty() && skipped.contains(ps_hash);
+}
+
+/// bbport: BB_ALPHA_TO_MASK_DRAWS=<indices>,...: per-draw A/B without recompiling. Positive
+/// entries: only draws with that index count are emulated; negative ones (-23682): those are left
+/// out.
+struct AlphaToMaskDrawList {
+    std::unordered_set<u32> only, except;
+    bool set = false;
+};
+static const AlphaToMaskDrawList& AlphaToMaskDraws() {
+    static const AlphaToMaskDrawList list = [] {
+        AlphaToMaskDrawList l;
+        const char* env = std::getenv("BB_ALPHA_TO_MASK_DRAWS");
+        l.set = env && *env;
+        while (env && *env) {
+            char* end{};
+            const long long n = std::strtoll(env, &end, 10);
+            if (end == env) {
+                break;
+            }
+            (n < 0 ? l.except : l.only).insert(u32(n < 0 ? -n : n));
+            env = *end ? end + 1 : end;
+        }
+        return l;
+    }();
+    return list;
+}
+static bool AlphaToMaskDrawWanted(u32 num_indices) {
+    const auto& list = AlphaToMaskDraws();
+    return !list.except.contains(num_indices) &&
+           (list.only.empty() || list.only.contains(num_indices));
+}
+
+/// UFC-7 colour-map rule (default; BB_ALPHA_TO_MASK=all or BB_ALPHA_TO_MASK_DRAWS turn it off, so
+/// the list alone decides): DB_ALPHA_TO_MASK is emulated only for pixel shaders that sample an
+/// uncompressed 8_8_8_8 sRGB texture. UFC 3's alpha-to-mask shader 39d6a7df draws every hairstyle
+/// with the hair colour map the game composites at run time (8_8_8_8 sRGB, BGRA, full mip chain);
+/// the one draw of it that is not hair (6456 indices, over the torso) samples only authored
+/// block-compressed maps (BC3 sRGB colour), and dithered by its alpha it shows a dark layer below.
+static bool AlphaToMaskColourMapRule() {
+    static const bool rule = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return !(env && std::string_view{env} == "all") && !AlphaToMaskDraws().set;
+    }();
+    return rule;
+}
+static bool SamplesRuntimeColourMap(const Shader::Info& fs) {
+    for (const auto& image : fs.images) {
+        const auto tsharp = image.GetSharp(fs);
+        if (AmdGpu::DataFormat(tsharp.data_format) == AmdGpu::DataFormat::Format8_8_8_8 &&
+            AmdGpu::NumberFormat(tsharp.num_format) == AmdGpu::NumberFormat::Srgb) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Alpha to mask takes the coverage from the alpha of the MRT0 export: off when that export
+/// format has no alpha (or nothing is exported).
+static bool ExportHasAlpha(AmdGpu::ShaderExportFormat format) {
+    using enum AmdGpu::ShaderExportFormat;
+    return format != Zero && format != R_32 && format != GR_32;
+}
+
+/// [T7] once per pixel shader and outcome, every draw with DB_ALPHA_TO_MASK enabled: the
+/// register, the hardware gates and the MRT0 state, to tell coverage draws (hair) from the rest.
+static void LogAlphaToMask(const PipelineSelection& sel, u32 reg, u32 samples, const char* mode) {
+    const auto& regs = *sel.regs;
+    const auto& key = sel.graphics_key;
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    if (sel.worker && sel.worker->failed) {
+        return; // a draw-preparation worker that met an uncompiled program: no stages to tell
+    }
+    const u64 hash = fs ? fs->pgm_hash : 0;
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged;
+    std::scoped_lock lock{log_mutex};
+    if (!logged.insert(hash ^ (u64{reg} << 32) ^ std::hash<std::string_view>{}(mode)).second) {
+        return;
+    }
+    const auto& cb0 = regs.color_buffers[0];
+    const bool cb0_bound = cb0 && regs.color_target_mask.GetMask(0);
+    std::printf("[T7] ps %016llx: reg 0x2DC %#07x (offsets %u%u%u%u, round %u), "
+                "DB_SHADER_CONTROL a2m_disable %u mask_export %u kill %u; MRT0 %s fmt %u/%u "
+                "export %u blend %s mask %#x written %s; MRTs bound %u written %u (mask %#x); "
+                "samples %u (key %u) -> %s\n",
+                static_cast<unsigned long long>(hash), reg, (reg >> 8) & 3, (reg >> 10) & 3,
+                (reg >> 12) & 3, (reg >> 14) & 3, (reg >> 16) & 1,
+                u32(regs.depth_shader_control.alpha_to_mask_disable),
+                u32(regs.depth_shader_control.mask_export_enable),
+                u32(regs.depth_shader_control.kill_enable), cb0_bound ? "bound" : "unbound",
+                cb0_bound ? u32(cb0.GetDataFmt()) : 0u, cb0_bound ? u32(cb0.GetNumberFmt()) : 0u,
+                u32(regs.color_export_format.GetFormat(0)),
+                regs.blend_control[0].enable && cb0_bound && !cb0.info.blend_bypass ? "on"
+                                                                                     : "off",
+                regs.color_target_mask.GetMask(0), key.mrt_mask & 1 ? "yes" : "no",
+                [&] {
+                    u32 bound = 0;
+                    for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                        bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb));
+                    }
+                    return bound;
+                }(),
+                u32(std::popcount(key.mrt_mask)), key.mrt_mask, samples, u32(key.num_samples),
+                mode);
+    std::fflush(stdout);
+}
+
+/// [T7] draw: one line per distinct draw that has DB_ALPHA_TO_MASK honoured (first 64): its
+/// stages, targets and the T#s/V#s of the pixel shader, to tell which draws of a coverage
+/// shader are hair and which are not, and what reads the target afterwards.
+static void LogAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
+    if (sel.worker && sel.worker->failed) {
+        return;
+    }
+    const auto& regs = *sel.regs;
+    const auto& key = sel.graphics_key;
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
+    if (!fs) {
+        return;
+    }
+    const auto& cb0 = regs.color_buffers[0];
+    const bool db = regs.depth_buffer.DepthValid();
+    std::string images;
+    u64 signature = fs->pgm_hash ^ (vs ? vs->pgm_hash << 1 : 0) ^ (u64{regs.num_indices} << 20) ^
+                    (cb0 ? cb0.Address() << 3 : 0) ^ (db ? regs.depth_buffer.DepthAddress() : 0);
+    for (u32 i = 0; i < fs->images.size(); ++i) {
+        const auto tsharp = fs->images[i].GetSharp(*fs);
+        signature = signature * 0x100000001B3ull ^ tsharp.Address();
+        images += fmt::format(" t{}={:#x} {}x{} fmt {}/{} type {} sel {}{}{}{} smp {} mips {}", i,
+                              tsharp.Address(), u32(tsharp.width) + 1, u32(tsharp.height) + 1,
+                              u32(tsharp.data_format), u32(tsharp.num_format), u32(tsharp.type),
+                              u32(tsharp.dst_sel_x), u32(tsharp.dst_sel_y),
+                              u32(tsharp.dst_sel_z), u32(tsharp.dst_sel_w), tsharp.NumSamples(),
+                              tsharp.NumLevels());
+    }
+    std::string buffers;
+    for (u32 i = 0; i < fs->buffers.size(); ++i) {
+        const auto vsharp = fs->buffers[i].GetSharp(*fs);
+        buffers += fmt::format(" b{}={:#x}+{}", i, vsharp.base_address, vsharp.GetSize());
+        // 39d6a7df: MRT0 alpha = b2 dword 24 x red of t4 (second UV set); dwords 20-24 of each
+        // small constant buffer, to compare the alpha scale of the hair and torso draws.
+        // GPU thread only: ahead of it a worker may find that memory already reused.
+        if (!sel.worker && vsharp.base_address != 0 && vsharp.GetSize() >= 25 * 4 &&
+            vsharp.GetSize() <= 4096) {
+            const auto* f = reinterpret_cast<const float*>(vsharp.base_address);
+            buffers += fmt::format(" [20..24] {} {} {} {} {}", f[20], f[21], f[22], f[23], f[24]);
+        }
+    }
+    signature ^= std::hash<std::string_view>{}(mode);
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged;
+    std::scoped_lock lock{log_mutex};
+    if (logged.size() >= 64 || !logged.insert(signature).second) {
+        return;
+    }
+    std::printf("[T7] draw ps %016llx vs %016llx (%s): %u indices x%u; CB0 %#llx samples %u "
+                "(pipeline %u, raster %u); depth %#llx samples %u test %u func %u write %u "
+                "stencil %u;%s;%s\n",
+                static_cast<unsigned long long>(fs->pgm_hash),
+                static_cast<unsigned long long>(vs ? vs->pgm_hash : 0), mode, regs.num_indices,
+                regs.num_instances.num_instances,
+                static_cast<unsigned long long>(cb0 ? cb0.Address() : 0),
+                cb0 ? cb0.NumSamples() : 0u, u32(key.color_samples[0]), u32(key.num_samples),
+                static_cast<unsigned long long>(db ? regs.depth_buffer.DepthAddress() : 0),
+                db ? regs.depth_buffer.NumSamples() : 0u, u32(regs.depth_control.depth_enable),
+                u32(regs.depth_control.depth_func), u32(regs.depth_control.depth_write_enable),
+                u32(regs.depth_control.stencil_enable), images.c_str(), buffers.c_str());
+    std::fflush(stdout);
+}
+
 bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     std::memset(&sel.graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = (*sel.regs);
@@ -760,6 +1112,7 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
     sel.motion = false;
 
+    u32 bound_samples = key.depth_samples;
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
@@ -767,6 +1120,8 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             // No attachment bound or writing to it is disabled.
             continue;
         }
+
+        bound_samples = std::max<u32>(bound_samples, col_buf.NumSamples());
 
         // Fill color target information
         auto& color_buffer = key.color_buffers[cb];
@@ -785,9 +1140,62 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
     }
 
-    // Compile and bind shader stages
+    // DB_ALPHA_TO_MASK (69ab1996): a dither discard in the fragment shader; with
+    // BB_ALPHA_TO_MASK=coverage multisampled targets use Vulkan alpha to coverage instead, as in
+    // the fork. Decided before the stages are compiled, from the samples of the bound targets.
+    // The register is context state that stays set across draws; the hardware ignores it when
+    // the pixel shader's DB_SHADER_CONTROL sets ALPHA_TO_MASK_DISABLE or MRT0 exports no alpha.
+    // The register gates, BB_ALPHA_TO_MASK_SKIP and _DRAWS are decided here; the MRT0-export and
+    // colour-map gates after the plain stages are selected. A draw left out never selects the
+    // dither variant, so it goes through exactly the path of BB_ALPHA_TO_MASK=0. (UFC-7: the
+    // fourth pass compiled and bound the variant first and only then dropped it; with no draw
+    // emulated the result already differed from =0.)
+    const u32 alpha_to_mask = regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC];
+    const bool alpha_to_mask_set = AlphaToMaskEnabled() && (alpha_to_mask & 1);
+    bool alpha_to_mask_on = alpha_to_mask_set;
+    const char* alpha_to_mask_mode = "none";
+    if (alpha_to_mask_set) {
+        if (regs.depth_shader_control.alpha_to_mask_disable) {
+            alpha_to_mask_mode = "off (DB_SHADER_CONTROL)";
+            alpha_to_mask_on = false;
+        } else if (!ExportHasAlpha(regs.color_export_format.GetFormat(0))) {
+            alpha_to_mask_mode = "off (MRT0 export without alpha)";
+            alpha_to_mask_on = false;
+        } else if (!regs.ps_program.Address<u32*>()) {
+            alpha_to_mask_mode = "off (no pixel shader)";
+            alpha_to_mask_on = false;
+        } else if (AlphaToMaskSkipped(AmdGpu::GetParams(regs.ps_program).hash)) {
+            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_SKIP)";
+            alpha_to_mask_on = false;
+        } else if (!AlphaToMaskDrawWanted(regs.num_indices)) {
+            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_DRAWS)";
+            alpha_to_mask_on = false;
+        }
+    }
+    const bool alpha_to_coverage = AlphaToCoverageWanted() && bound_samples > 1;
+    sel.alpha_to_mask = 0;
+
+    // Compile and bind shader stages. The plain variant first: the gates below need the pixel
+    // shader's info (MRT0 export, T#s), and a draw they leave out keeps exactly this selection,
+    // the BB_ALPHA_TO_MASK=0 one. Only a draw that takes the dither selects the stages again.
     if (!RefreshGraphicsStages(sel)) {
         return false;
+    }
+    if (alpha_to_mask_on) {
+        const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+        if (fs && !(fs->mrt_mask & 1)) {
+            // A pixel shader without an MRT0 export has nothing to take coverage from.
+            alpha_to_mask_mode = "off (no MRT0 export)";
+            alpha_to_mask_on = false;
+        } else if (fs && AlphaToMaskColourMapRule() && !SamplesRuntimeColourMap(*fs)) {
+            alpha_to_mask_mode = "off (no 8_8_8_8 sRGB colour map)";
+            alpha_to_mask_on = false;
+        } else if (!alpha_to_coverage) {
+            sel.alpha_to_mask = alpha_to_mask & 0x1FF01;
+            if (!RefreshGraphicsStages(sel)) {
+                return false;
+            }
+        }
     }
     if (motion_possible) {
         const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
@@ -892,6 +1300,21 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             key.color_samples.fill(key.depth_samples);
             key.num_samples = key.depth_samples;
         }
+    }
+
+    key.alpha_to_coverage = alpha_to_mask_on && alpha_to_coverage && key.num_samples > 1;
+    if (alpha_to_mask_set) {
+        if (alpha_to_mask_on) {
+            alpha_to_mask_mode = key.alpha_to_coverage ? "alphaToCoverage"
+                                 : sel.alpha_to_mask   ? "shader dither"
+                                                       : "none (samples)";
+        }
+        LogAlphaToMaskDraw(sel, alpha_to_mask_mode);
+        LogAlphaToMask(sel, alpha_to_mask, bound_samples, alpha_to_mask_mode);
+        NoteAlphaToMaskDraw(sel);
+    }
+    if (!sel.worker && TracingAlphaToMask()) {
+        TraceAlphaToMaskDraw(sel, alpha_to_mask_set ? alpha_to_mask_mode : "-");
     }
 
     return true;
