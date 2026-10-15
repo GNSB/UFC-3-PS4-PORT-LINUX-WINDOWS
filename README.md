@@ -112,7 +112,7 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
 | `BB_VBLANK_HZ` / `BB_FLIP_RATE` | 480 / 0 | The game asks for 30 Hz; with flip rate 0 and a high virtual vblank it runs at the real rate (the simulation follows real frame time). |
 | `BB_READBACKS` / `BB_READBACK_LINEAR` | 2 / 1 | Precise reads of GPU-written memory (without them the fight renders black, as UFC 4 does in shadPS4). |
 | `BB_WRITE_STEP` | 0 | CPU writes next to a few GPU-written bytes are single-stepped instead of waiting for the GPU. Off: created/career fighters' skin came out black or garbled. |
-| `BB_WRITE_WINDOW` | 0 | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). Off: the game crashed after the first fight. |
+| `BB_WRITE_WINDOW` | 1 on Linux (`run.sh`), 0 on Windows (launcher) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). Off on Windows: the game crashed after a fight there (RX 9070, RTX 4090); Linux RTX 4070 sessions of 20 minutes completed without a crash. |
 | `BB_PREUPLOAD` | 0 | Background upload of rewritten game memory into VRAM (1, 2 = all of it). Off for the same skin textures as `BB_WRITE_STEP`. |
 | `BB_LDS_ORDER` | 1 | Subgroup memory barriers around shared-memory (LDS) stores in translated shaders, which the GCN code expects (octagon floor grain on AMD). `0` turns them off; clear the shader cache when changing it. |
 | `BB_GPU_WRITE_TWINS` | 0 | Incompatible with precise readbacks (deadlock). |
@@ -157,11 +157,13 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
    a wait for the GPU and a page download. Now the page stays open for the CPU until the next
    `SubmitGfx`/`SubmitAsc`; it is then protected again, compared with the copy taken when it was
    opened, and only the changed words are uploaded (skipping the GPU's). Result on Linux:
-   readbacks 380 → 120 per second and fights from **105–113 to 137–196 FPS**.
+   readbacks 380 → 120 per second and fights from **105–113 to roughly 140–190 FPS**
+   on an RTX 4070 (the detailed run recorded 137–196 FPS uncapped).
    Known risk: if the game read the GPU bytes of an open page, it would see the previous
-   submission's data. **Off by default** (Windows launcher and `run.sh`): on an AMD RX 9070 the
-   game crashed after the first fight with it on (the guest heap's free list corrupted).
-   `BB_WRITE_WINDOW=1` turns it back on for the frame rate above.
+   submission's data. **On by default on Linux** (`run.sh`; 20-minute sessions without a crash
+   on an RTX 4070), **off on Windows** (launcher): there the game crashed after a fight with it
+   on (the guest heap's free list corrupted, guest fault at `0x1262a2a`; RX 9070 and RTX 4090),
+   still unresolved. `BB_WRITE_WINDOW=1` turns it on for Windows (at that risk), `=0` off on Linux.
 
 The full technical write-up (diagnostics, failed experiments, measurements) is in
 [`docs/ufc3/GROK_HANDOFF.md`](docs/ufc3/GROK_HANDOFF.md), [`docs/ufc3/HANDOFF.md`](docs/ufc3/HANDOFF.md)
@@ -184,8 +186,21 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) — renderer and shader recompiler.
 - The God of War III Windows port and *eltutz*'s work, as references for Windows tuning (timers,
   priorities, GPU readback model).
+- [@luscamovi](https://x.com/luscamovi) — the AMD (RX 9070) patches: PS4 Pro mode, the career
+  save fix, the octagon floor grain on AMD, the 90 FPS option and the launcher's Pro checkbox.
+- *mancelli*'s [shadPS4 fork](https://github.com/mancelli/shadPS4/releases/tag/ufc4-intel-arc-2026-10-14)
+  — hair (DB_ALPHA_TO_MASK), created-fighter skin, depth and NaN fixes (see
+  [`gpu/VENDOR.txt`](gpu/VENDOR.txt), which also credits the backported upstream shadPS4 PRs).
+- Upstream shadPS4 backport authors: TheTurtle, Claudio Godoi, kiwakiwaa, artemkaVG,
+  DanielSvoboda and Chris Chreece (original commits in [`gpu/VENDOR.txt`](gpu/VENDOR.txt)).
+- HeuZ — Windows RTX 4090 logs that located the write-window crash; pvict (GitHub) —
+  Portuguese testing with `BB_LANGUAGE` that motivated the Windows language selector.
+  Thanks to everyone who sent logs and reports.
+
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
   [FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), Dear ImGui.
+
+Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md).
 
 ## License
 
