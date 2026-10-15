@@ -2880,6 +2880,12 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
             return true;
+        } else if (*type == TextureCache::MetaType::CMask) {
+            // ufc3 (PS4 Pro mode): the colour targets are kept expanded on the host, so the
+            // guest reading their CMask sees every tile as uncompressed (4 bits of 0xf per tile),
+            // as HTile above.
+            runtime.FillBuffer(arena, arena->Offset(device_addr), size, 0xFFFFFFFFu);
+            return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
         }
