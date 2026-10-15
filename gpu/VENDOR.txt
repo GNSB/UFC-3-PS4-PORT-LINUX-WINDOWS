@@ -14,3 +14,5 @@ Backported video_core fixes (UFC-5):
   SHADPS4_FMASK_DECOMPRESS switch is not taken (#5283 already runs it unconditionally).
   c08218db (mancelli's fork) depth bias x256 for emulated Z16+S8; ufc3: the factor follows the
   host format (x1 for a real D16 with BB_Z16S8_AS_D16=1).
+  72251298 (mancelli's fork) depth read as a color format: only the Z32 -> R32_UINT case and
+  freeing copies with their image, on top of ufc3's DepthAsR16 (per-layer 2D views, AMD 0003).

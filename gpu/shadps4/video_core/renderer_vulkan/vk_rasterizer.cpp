@@ -46,6 +46,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/host_shaders/depth_to_r16ui_comp.h"
+#include "video_core/host_shaders/depth_to_r32ui_comp.h"
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
@@ -2916,10 +2917,11 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
 
 namespace {
 // ufc3: guest shaders that read a depth image through an R16_UINT view (UFC 3's shadow and
-// light passes read their Z16 depth as raw bits). The host depth image (D16_UNORM, or
-// D32_SFLOAT_S8 for Z16+S8) cannot be viewed as R16_UINT, so each bind converts it into an
-// R16_UINT copy (round(depth * 65535), what the console's view returns) and binds that.
-struct DepthAsR16 {
+// light passes read their Z16 depth as raw bits) or a Z32 depth through R32_UINT. The host depth
+// image (D16_UNORM, D32_SFLOAT(_S8)) cannot be viewed with a color format, so each bind converts
+// it into an R16_UINT copy (round(depth * 65535), what the console's view returns) or an R32_UINT
+// copy (the float bits) and binds that.
+struct DepthAsColor {
     struct Copy {
         VkImage image = VK_NULL_HANDLE;
         VmaAllocation allocation = VK_NULL_HANDLE;
@@ -2930,23 +2932,25 @@ struct DepthAsR16 {
         // returned garbage for it: the floor grain persisted on an RX 9070 after the per-layer
         // fix; NVIDIA tolerated it).
         vk::ImageView src_view{};
-        vk::Format src_format = vk::Format::eUndefined;
-        u64 src_uid = 0; // a VkImage handle can be reused by a later image
+        VkImage src_image = VK_NULL_HANDLE; // the backing can change under the same image
+        VideoCore::ImageId src_id{};
     };
     vk::UniqueDescriptorSetLayout set_layout;
     vk::UniquePipelineLayout layout;
-    vk::UniquePipeline pipeline;
-    // Keyed by the guest image's VkImage and the layer read: UFC 3's spot-light shadow map is a
+    std::array<vk::UniquePipeline, 2> pipelines; // R16_UINT, R32_UINT
+    // Keyed by the guest image's uid and the layer read: UFC 3's spot-light shadow map is a
     // 6-layer Z16 array that cs 34617c9f reads layer by layer (one per light) into the floor's
     // R32G32_UINT min/max map; only layer 0 converted gave garbage for lights 1-5 (the octagon
-    // floor's grain and gray blocks).
-    std::map<std::pair<const void*, u32>, Copy> copies;
+    // floor's grain and gray blocks). The uid (not the VkImage handle, which a later image can
+    // reuse) lets copies go away with their image.
+    std::map<std::pair<u64, u32>, Copy> copies;
+    u64 swept_tick = 0;
 };
 
-DepthAsR16& DepthAsR16State(const Instance& instance) {
-    static DepthAsR16 state = [&] {
+DepthAsColor& DepthAsColorState(const Instance& instance) {
+    static DepthAsColor state = [&] {
         const auto device = instance.GetDevice();
-        DepthAsR16 p;
+        DepthAsColor p;
         const std::array<vk::DescriptorSetLayoutBinding, 2> bindings{{
             {.binding = 0, .descriptorType = vk::DescriptorType::eSampledImage,
              .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
@@ -2964,35 +2968,73 @@ DepthAsR16& DepthAsR16State(const Instance& instance) {
             .setLayoutCount = 1, .pSetLayouts = &*p.set_layout,
             .pushConstantRangeCount = 1, .pPushConstantRanges = &range,
         }));
-        const auto module = CompileSPV(DEPTH_TO_R16UI_COMP, device);
-        p.pipeline = Check(device.createComputePipelineUnique(
-            {}, vk::ComputePipelineCreateInfo{
-                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module,
-                              .pName = "main"},
-                    .layout = *p.layout,
-                }));
-        device.destroyShaderModule(module);
+        for (u32 i = 0; i < 2; ++i) {
+            const auto module = i == 0 ? CompileSPV(DEPTH_TO_R16UI_COMP, device)
+                                       : CompileSPV(DEPTH_TO_R32UI_COMP, device);
+            p.pipelines[i] = Check(device.createComputePipelineUnique(
+                {}, vk::ComputePipelineCreateInfo{
+                        .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module,
+                                  .pName = "main"},
+                        .layout = *p.layout,
+                    }));
+            device.destroyShaderModule(module);
+        }
         return p;
     }();
     return state;
 }
 
-const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, vk::Image src_image,
-                                       vk::Format src_format, u64 src_uid, u32 layer, u32 width,
-                                       u32 height) {
-    auto& state = DepthAsR16State(instance);
-    const void* image = static_cast<VkImage>(src_image);
-    const auto key = std::make_pair(image, layer);
+// Destroys a copy's objects once the GPU is done with the frames that may still read them.
+void DestroyDepthAsColor(const Instance& instance, Scheduler& scheduler, VkImage image,
+                         VmaAllocation allocation, vk::ImageView view, vk::ImageView src_view) {
+    scheduler.DeferOperation([&instance, image, allocation, view, src_view] {
+        const auto device = instance.GetDevice();
+        if (view) {
+            device.destroyImageView(view);
+        }
+        if (src_view) {
+            device.destroyImageView(src_view);
+        }
+        if (image) {
+            vmaDestroyImage(instance.GetAllocator(), image, allocation);
+        }
+    });
+}
+
+const DepthAsColor::Copy* DepthAsColorCopy(const Instance& instance, Scheduler& scheduler,
+                                           VideoCore::TextureCache& texture_cache,
+                                           VideoCore::ImageId src_id, vk::Image src_image,
+                                           vk::Format src_format, u64 src_uid, u32 layer,
+                                           u32 width, u32 height, bool is32) {
+    auto& state = DepthAsColorState(instance);
+    const u64 tick = scheduler.CurrentTick();
+    // Once per submission: free the copies of images the texture cache has deleted.
+    if (tick != state.swept_tick) {
+        state.swept_tick = tick;
+        for (auto it = state.copies.begin(); it != state.copies.end();) {
+            if (texture_cache.TryGetImage(it->second.src_id, it->first.first)) {
+                ++it;
+                continue;
+            }
+            auto& dead = it->second;
+            DestroyDepthAsColor(instance, scheduler, dead.image, dead.allocation, dead.view,
+                                dead.src_view);
+            it = state.copies.erase(it);
+        }
+    }
+    const auto key = std::make_pair(src_uid, layer);
     auto& copy = state.copies[key];
+    copy.src_id = src_id;
     if (copy.image && (copy.width != width || copy.height != height)) {
-        instance.GetDevice().destroyImageView(copy.view);
-        vmaDestroyImage(instance.GetAllocator(), copy.image, copy.allocation);
+        DestroyDepthAsColor(instance, scheduler, copy.image, copy.allocation, copy.view, {});
         copy.image = VK_NULL_HANDLE;
         copy.view = vk::ImageView{};
     }
-    // A new image behind this handle (or another host format): a new source view. The old one is
-    // not destroyed here (frames in flight may still read it); this happens a few times per run.
-    if (copy.src_view && (copy.src_format != src_format || copy.src_uid != src_uid)) {
+    // A new backing behind this image: a new source view, the old one destroyed once the frames
+    // in flight are done with it.
+    if (copy.src_view && copy.src_image != static_cast<VkImage>(src_image)) {
+        DestroyDepthAsColor(instance, scheduler, VK_NULL_HANDLE, VK_NULL_HANDLE, {},
+                            copy.src_view);
         copy.src_view = vk::ImageView{};
     }
     if (!copy.src_view) {
@@ -3002,14 +3044,13 @@ const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, vk::Image src_i
             .format = src_format,
             .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, layer, 1},
         }));
-        copy.src_format = src_format;
-        copy.src_uid = src_uid;
+        copy.src_image = static_cast<VkImage>(src_image);
     }
     if (!copy.image) {
         const VkImageCreateInfo image_ci = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .imageType = VK_IMAGE_TYPE_2D,
-            .format = VK_FORMAT_R16_UINT,
+            .format = is32 ? VK_FORMAT_R32_UINT : VK_FORMAT_R16_UINT,
             .extent = {width, height, 1},
             .mipLevels = 1,
             .arrayLayers = 1,
@@ -3022,19 +3063,23 @@ const DepthAsR16::Copy* DepthAsR16Copy(const Instance& instance, vk::Image src_i
         const VmaAllocationCreateInfo alloc_ci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateImage(instance.GetAllocator(), &image_ci, &alloc_ci, &copy.image,
                            &copy.allocation, nullptr) != VK_SUCCESS) {
+            DestroyDepthAsColor(instance, scheduler, VK_NULL_HANDLE, VK_NULL_HANDLE, {},
+                                copy.src_view);
             state.copies.erase(key);
             return nullptr;
         }
         copy.view = Check(instance.GetDevice().createImageView({
             .image = copy.image,
             .viewType = vk::ImageViewType::e2D,
-            .format = vk::Format::eR16Uint,
+            .format = is32 ? vk::Format::eR32Uint : vk::Format::eR16Uint,
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         }));
         copy.width = width;
         copy.height = height;
-        std::printf("Depth as R16_UINT: %ux%u copy of layer %u for a depth image read as raw Z16 bits\n",
-                    width, height, layer);
+        std::printf("Depth as %s: %ux%u copy of layer %u for a depth image read as raw Z%u bits "
+                    "(%zu copies)\n",
+                    is32 ? "R32_UINT" : "R16_UINT", width, height, layer, is32 ? 32u : 16u,
+                    state.copies.size());
     }
     return &copy;
 }
@@ -3337,26 +3382,32 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
 
             vk::ImageView view = *image_view.image_view;
             vk::ImageLayout layout = image.backing->state.layout;
+            // Z32 read as R32_UINT: the float bits (a Z16 image read as R32 is left alone).
+            const bool depth_as_r32 = desc.view_info.format == vk::Format::eR32Uint &&
+                                      (image.info.pixel_format == vk::Format::eD32Sfloat ||
+                                       image.info.pixel_format == vk::Format::eD32SfloatS8Uint);
             if (!is_storage && !on_helper && image.info.props.is_depth &&
-                desc.view_info.format == vk::Format::eR16Uint &&
+                (desc.view_info.format == vk::Format::eR16Uint || depth_as_r32) &&
                 desc.view_info.range.base.level == 0 && desc.view_info.range.extent.layers == 1) {
                 const u32 width = image.info.size.width, height = image.info.size.height;
-                const auto* copy = DepthAsR16Copy(
-                    instance, image.GetImage(),
+                const auto* copy = DepthAsColorCopy(
+                    instance, scheduler, texture_cache, image_id, image.GetImage(),
                     instance.GetSupportedFormat(image.info.pixel_format, image.format_features),
-                    image.image_uid, desc.view_info.range.base.layer, width, height);
+                    image.image_uid, desc.view_info.range.base.layer, width, height,
+                    depth_as_r32);
                 if (copy) {
                     // The depth image was transited for reading above; the copy is rebuilt now.
                     scheduler.EndRendering();
                     runtime.FlushBarriers();
-                    auto& state = DepthAsR16State(instance);
+                    auto& state = DepthAsColorState(instance);
+                    const vk::Pipeline pipeline = *state.pipelines[depth_as_r32 ? 1 : 0];
                     const vk::ImageView src_view = copy->src_view;
                     const vk::ImageLayout src_layout = layout;
                     const vk::Image dst_image{copy->image};
                     const vk::ImageView dst_view = copy->view;
-                    scheduler.RecordCrumb({.name = "depth as R16_UINT"},
-                                          [&state, src_view, src_layout, dst_image, dst_view, width,
-                                           height](vk::CommandBuffer cmdbuf) {
+                    scheduler.RecordCrumb({.name = "depth as color"},
+                                          [&state, pipeline, src_view, src_layout, dst_image,
+                                           dst_view, width, height](vk::CommandBuffer cmdbuf) {
                         const vk::ImageMemoryBarrier2 to_general{
                             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                             .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
@@ -3380,7 +3431,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                              .pImageInfo = &dst_info},
                         }};
                         const std::array<u32, 2> extent{width, height};
-                        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *state.pipeline);
+                        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
                         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *state.layout,
                                                     0, writes);
                         cmdbuf.pushConstants(*state.layout, vk::ShaderStageFlagBits::eCompute, 0,
