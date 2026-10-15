@@ -11,6 +11,7 @@ void runtime_restart(void) { abort(); }
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef int (ABI *Register)(GuestCallback);
 typedef int (ABI *RegisterCxa)(void (ABI *)(void *), void *, void *);
@@ -174,6 +175,34 @@ static void wall_time(void) {
     assert(t.canary==0xabcdef && z.canary==0x123456);
     assert(get(NULL,NULL)==0 && get(NULL,z.value)==0);
     assert(!runtime_resolve("n88vx3C5nW8#libc",0));
+}
+static void localtime_conversion_abi(void) {
+    typedef int32_t (ABI *Convert)(int64_t,int64_t,int64_t *,int32_t *,int32_t *);
+    /* The game's generated import names contain this NID; the CTR fallback
+     * table compiled into the runtime does not. Supply the same mapping. */
+    char names[]="/tmp/ufc8-imports-XXXXXX";
+    int fd=mkstemp(names); assert(fd>=0);
+    FILE *file=fdopen(fd,"w"); assert(file);
+    fputs("0NTHN1NKONI libkernel sceKernelConvertLocaltimeToUtc\n",file);
+    assert(fclose(file)==0);
+    int loaded=runtime_load_import_names(names);
+    assert(unlink(names)==0 && loaded==1);
+    Convert convert=GET(Convert,"0NTHN1NKONI#libkernel");
+    assert(convert);
+    const int64_t hints[]={UINT32_MAX,-1,0,1};
+    for (unsigned i=0;i<sizeof(hints)/sizeof(hints[0]);++i) {
+        struct { int64_t value; uint64_t canary; } utc={-1,0xabcdef};
+        struct { int32_t value[2]; uint32_t canary; } tz={{INT32_MIN,INT32_MIN},0x123456};
+        struct { int32_t value; uint32_t canary; } dst={INT32_MIN,0x654321};
+        /* Match native libc's five-register call, including tm_isdst=-1 in ESI.
+         * The old four-argument import writes to address 0xffffffff here. */
+        assert(convert(1705320000,hints[i],&utc.value,tz.value,&dst.value)==0);
+        assert(utc.value==INT64_C(1705320000)+(int64_t)tz.value[0]*60);
+        assert(tz.value[1]!=INT32_MIN && dst.value==tz.value[1]);
+        assert(utc.canary==0xabcdef && tz.canary==0x123456 && dst.canary==0x654321);
+        assert(convert(1705320000,hints[i],&utc.value,NULL,NULL)==0);
+        assert((uint32_t)convert(1705320000,hints[i],NULL,NULL,NULL)==0x80020016);
+    }
 }
 static void direct_memory(void) {
     Allocate alloc=GET(Allocate,"rTXw65xmLIA#libkernel");
@@ -350,7 +379,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
+    libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
     rw_lifecycle(); rw_concurrency(); rw_timeouts();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;
