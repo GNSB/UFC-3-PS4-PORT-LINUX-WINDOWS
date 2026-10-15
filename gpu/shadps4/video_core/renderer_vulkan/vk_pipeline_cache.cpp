@@ -929,6 +929,30 @@ static bool AlphaToMaskDrawWanted(u32 num_indices) {
            (list.only.empty() || list.only.contains(num_indices));
 }
 
+/// UFC-7 colour-map rule (default; BB_ALPHA_TO_MASK=all or BB_ALPHA_TO_MASK_DRAWS turn it off, so
+/// the list alone decides): DB_ALPHA_TO_MASK is emulated only for pixel shaders that sample an
+/// uncompressed 8_8_8_8 sRGB texture. UFC 3's alpha-to-mask shader 39d6a7df draws every hairstyle
+/// with the hair colour map the game composites at run time (8_8_8_8 sRGB, BGRA, full mip chain);
+/// the one draw of it that is not hair (6456 indices, over the torso) samples only authored
+/// block-compressed maps (BC3 sRGB colour), and dithered by its alpha it shows a dark layer below.
+static bool AlphaToMaskColourMapRule() {
+    static const bool rule = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return !(env && std::string_view{env} == "all") && !AlphaToMaskDraws().set;
+    }();
+    return rule;
+}
+static bool SamplesRuntimeColourMap(const Shader::Info& fs) {
+    for (const auto& image : fs.images) {
+        const auto tsharp = image.GetSharp(fs);
+        if (AmdGpu::DataFormat(tsharp.data_format) == AmdGpu::DataFormat::Format8_8_8_8 &&
+            AmdGpu::NumberFormat(tsharp.num_format) == AmdGpu::NumberFormat::Srgb) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Alpha to mask takes the coverage from the alpha of the MRT0 export: off when that export
 /// format has no alpha (or nothing is exported).
 static bool ExportHasAlpha(AmdGpu::ShaderExportFormat format) {
@@ -1121,10 +1145,11 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     // the fork. Decided before the stages are compiled, from the samples of the bound targets.
     // The register is context state that stays set across draws; the hardware ignores it when
     // the pixel shader's DB_SHADER_CONTROL sets ALPHA_TO_MASK_DISABLE or MRT0 exports no alpha.
-    // Every gate (BB_ALPHA_TO_MASK_SKIP, _DRAWS included) is decided here, before the stages
-    // compile: a draw left out never selects the dither variant, so it goes through exactly the
-    // path of BB_ALPHA_TO_MASK=0. (UFC-7: the fourth pass compiled and bound the variant first
-    // and only then dropped it; with no draw emulated the result already differed from =0.)
+    // The register gates, BB_ALPHA_TO_MASK_SKIP and _DRAWS are decided here; the MRT0-export and
+    // colour-map gates after the plain stages are selected. A draw left out never selects the
+    // dither variant, so it goes through exactly the path of BB_ALPHA_TO_MASK=0. (UFC-7: the
+    // fourth pass compiled and bound the variant first and only then dropped it; with no draw
+    // emulated the result already differed from =0.)
     const u32 alpha_to_mask = regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC];
     const bool alpha_to_mask_set = AlphaToMaskEnabled() && (alpha_to_mask & 1);
     bool alpha_to_mask_on = alpha_to_mask_set;
@@ -1148,24 +1173,27 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         }
     }
     const bool alpha_to_coverage = AlphaToCoverageWanted() && bound_samples > 1;
-    sel.alpha_to_mask = alpha_to_mask_on && !alpha_to_coverage ? (alpha_to_mask & 0x1FF01) : 0;
+    sel.alpha_to_mask = 0;
 
-    // Compile and bind shader stages
+    // Compile and bind shader stages. The plain variant first: the gates below need the pixel
+    // shader's info (MRT0 export, T#s), and a draw they leave out keeps exactly this selection,
+    // the BB_ALPHA_TO_MASK=0 one. Only a draw that takes the dither selects the stages again.
     if (!RefreshGraphicsStages(sel)) {
         return false;
     }
     if (alpha_to_mask_on) {
-        // A pixel shader without an MRT0 export has nothing to take coverage from (the variant's
-        // code is the plain one then; only its specialization differs, so select the plain one).
         const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
         if (fs && !(fs->mrt_mask & 1)) {
+            // A pixel shader without an MRT0 export has nothing to take coverage from.
             alpha_to_mask_mode = "off (no MRT0 export)";
             alpha_to_mask_on = false;
-            if (sel.alpha_to_mask != 0) {
-                sel.alpha_to_mask = 0;
-                if (!RefreshGraphicsStages(sel)) {
-                    return false;
-                }
+        } else if (fs && AlphaToMaskColourMapRule() && !SamplesRuntimeColourMap(*fs)) {
+            alpha_to_mask_mode = "off (no 8_8_8_8 sRGB colour map)";
+            alpha_to_mask_on = false;
+        } else if (!alpha_to_coverage) {
+            sel.alpha_to_mask = alpha_to_mask & 0x1FF01;
+            if (!RefreshGraphicsStages(sel)) {
+                return false;
             }
         }
     }

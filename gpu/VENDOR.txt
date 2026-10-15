@@ -66,3 +66,13 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   (BB_T7_TRACE_AFTER unset or 0; its frames skip the prepared pipelines), and the "[T7] draw"
   constant-buffer dwords are read on the GPU thread only. A draw left out now takes exactly the
   BB_ALPHA_TO_MASK=0 path. Cache versions unchanged.
+  Sixth pass: the user's A/B (_DRAWS=23682: hair and torso right; default: torso dark) puts the
+  dark torso on the other 39d6a7df draw, which samples only authored block-compressed maps (t3
+  512x512 BC3 sRGB colour), while every hairstyle samples the hair colour map the game composites
+  at run time (t3 8_8_8_8 sRGB, BGRA). Index counts do not tell them apart (a short hairstyle also
+  has 6456 indices). Colour-map rule (default): DB_ALPHA_TO_MASK is emulated only when the pixel
+  shader samples an uncompressed 8_8_8_8 sRGB texture (log "off (no 8_8_8_8 sRGB colour map)");
+  BB_ALPHA_TO_MASK=all or _DRAWS turn it off. The plain stages are selected first and the dither
+  variant only for a draw that takes it, so a draw left out keeps the =0 path. Pending: why that
+  draw's alpha (b2 dword 24 = 2 x red of t4, a BC1 sRGB mask on the second UV set) is low here.
+  The fourth pass's guard was this rule inverted (hair square, torso dark).
