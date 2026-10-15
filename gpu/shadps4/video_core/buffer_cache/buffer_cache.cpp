@@ -923,6 +923,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         return;
     }
     const auto write_range = [&](VAddr guest, const u8* src, u64 bytes) {
+        PageManager::DiagnoseWindowWrite(guest, std::span<const u8>{src, bytes}, false);
         BbFreeCheck::Check(guest, bytes, src, BbFreeCheck::BufferDownload);
         u32 first = 0;
         std::memcpy(&first, src, std::min<u64>(bytes, sizeof(first)));
@@ -2253,6 +2254,8 @@ void BufferCache::ProcessLateWrites() {
             bool conflict = false;
             gpu_modified_ranges.ForEachInRange(addr + at, 4, [&](VAddr, VAddr) { conflict = true; });
             if (conflict) {
+                PageManager::DiagnoseWindowWrite(
+                    addr + at, std::span<const u8>{bytes.data() + at, 4}, true);
                 stepped_write_conflicts.fetch_add(1, std::memory_order_relaxed);
                 at += 4;
                 continue;

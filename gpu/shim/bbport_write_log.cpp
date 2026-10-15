@@ -3,6 +3,7 @@
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "common/signal_context.h"
+#include "video_core/page_manager.h"
 
 #include <array>
 #include <atomic>
@@ -108,6 +109,7 @@ void DumpRange(std::uint64_t address, std::uint64_t size) {
 } // namespace BbWriteLog
 
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
+    VideoCore::PageManager::DumpWindowFault(ucontext);
     using namespace BbWriteLog;
     using Common::FaultRegister;
     const auto reg = [&](FaultRegister r) { return Common::GetFaultRegister(ucontext, r); };

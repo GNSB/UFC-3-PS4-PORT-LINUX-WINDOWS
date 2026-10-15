@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache//region_definitions.h"
@@ -56,6 +57,11 @@ public:
     static void RequestWindow();
     /// Closes every open window (the submitting thread, before the GPU side sees the submission).
     static void CloseWriteWindows();
+
+    /// BB_WRITE_WINDOW_DIAG=1: audit a readback or a skipped upload against active/recent
+    /// window snapshots. Observational only; a matching page does not establish CPU ownership.
+    static void DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip);
+    static void DumpWindowFault(void* context);
 
     /// Register a range of mapped gpu memory.
     void OnGpuMap(VAddr address, size_t size);
