@@ -128,7 +128,7 @@ static int32_t logged(const char *what, const char *name, int32_t r) {
     return r;
 }
 static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
-    char name[40]; snprintf(name,sizeof(name),"'%.32s' mode 0x%x",dir ? dir->data : "?",mode);
+    char name[64]; snprintf(name,sizeof(name),"'%.32s' mode 0x%x",dir ? dir->data : "?",mode);
     return logged("save mount",name,mount_impl(user,title,dir,mode,result));
 }
 static int32_t mount_impl(int32_t user, const char *title, const DirName *dir, uint32_t mode, MountResult *result) {
