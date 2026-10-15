@@ -14,6 +14,10 @@
 #include <dirent.h>
 #include <unistd.h>
 #include "common/assert.h"
+#ifdef _WIN32
+extern "C" __declspec(dllimport) int __stdcall K32GetProcessMemoryInfo(void* process, void* counters,
+                                                                      unsigned long cb);
+#endif
 #include "bbport_timeline.h"
 #include "bbport_toggles.h"
 #include "bbport_heap_sites.h"
@@ -341,7 +345,25 @@ static void PrintMemory() {
         }
         std::fclose(statm);
     }
-    const u64 rss = u64(rss_pages) * u64(sysconf(_SC_PAGESIZE));
+    u64 rss = u64(rss_pages) * u64(sysconf(_SC_PAGESIZE));
+#ifdef _WIN32
+    // ufc3 (Windows): the working set and private bytes of the process (no /proc/self/statm).
+    {
+        struct ProcessMemoryCountersEx {
+            unsigned long cb, page_fault_count;
+            size_t peak_working_set, working_set, quota_peak_paged, quota_paged,
+                quota_peak_nonpaged, quota_nonpaged, pagefile, peak_pagefile, private_usage;
+        } pmc{};
+        pmc.cb = sizeof(pmc);
+        if (K32GetProcessMemoryInfo(reinterpret_cast<void*>(-1), &pmc, sizeof(pmc))) {
+            rss = pmc.working_set;
+            std::printf("Memory (process): working set %llu MiB (peak %llu), private %llu MiB\n",
+                        (unsigned long long)(pmc.working_set >> 20),
+                        (unsigned long long)(pmc.peak_working_set >> 20),
+                        (unsigned long long)(pmc.private_usage >> 20));
+        }
+    }
+#endif
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);
