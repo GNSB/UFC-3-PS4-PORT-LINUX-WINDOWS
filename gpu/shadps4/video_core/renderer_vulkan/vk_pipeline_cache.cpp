@@ -524,12 +524,147 @@ void NoteDrawTarget(const AmdGpu::Regs& regs) {
 }
 } // namespace
 
+namespace {
+/// [T7] trace (UFC-7): once per session, every draw of two frames that renders to the colour or
+/// depth target of the DB_ALPHA_TO_MASK draws or samples them, in order: what is drawn under and
+/// over the hair and torso, and what reads the target afterwards. Armed on the
+/// BB_T7_TRACE_AFTER-th frame (default 120, 0: never) with such draws. GPU thread, except
+/// NoteAlphaToMaskDraw (draw-preparation workers too).
+struct AlphaToMaskTrace {
+    std::mutex mutex;
+    u64 color = 0, depth = 0;
+    u32 frames = 0, last_frame = ~0u;
+    std::atomic<u32> first{~0u};
+    u32 draws = 0, listed = 0;
+    bool ended = false;
+};
+AlphaToMaskTrace a2m_trace;
+constexpr u32 TraceFrames = 2;
+constexpr u32 TraceMaxLines = 800;
+
+u32 TraceAfterFrames() {
+    static const u32 after = [] {
+        const char* env = std::getenv("BB_T7_TRACE_AFTER");
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 120u;
+    }();
+    return after;
+}
+
+/// A draw with DB_ALPHA_TO_MASK set: its targets, and the frame count that arms the trace.
+void NoteAlphaToMaskDraw(const PipelineSelection& sel) {
+    if ((sel.worker && sel.worker->failed) || TraceAfterFrames() == 0) {
+        return;
+    }
+    const auto& regs = *sel.regs;
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    std::scoped_lock lock{a2m_trace.mutex};
+    if (!a2m_trace.color && regs.color_buffers[0]) {
+        a2m_trace.color = regs.color_buffers[0].Address();
+    }
+    if (!a2m_trace.depth && regs.depth_buffer.DepthValid()) {
+        a2m_trace.depth = regs.depth_buffer.DepthAddress();
+    }
+    if (a2m_trace.last_frame == frame) {
+        return;
+    }
+    a2m_trace.last_frame = frame;
+    if (++a2m_trace.frames == TraceAfterFrames()) {
+        a2m_trace.first.store(frame + 1, std::memory_order_relaxed);
+        std::printf("[T7] trace: frames %u-%u, draws on CB %#llx / depth %#llx or sampling them\n",
+                    frame + 1, frame + TraceFrames, static_cast<unsigned long long>(a2m_trace.color),
+                    static_cast<unsigned long long>(a2m_trace.depth));
+        std::fflush(stdout);
+    }
+}
+
+/// GPU thread: inside the traced frames (draws then skip the prepared pipelines, so that each
+/// goes through RefreshGraphicsKey and is listed).
+bool TracingAlphaToMask() {
+    const u32 first = a2m_trace.first.load(std::memory_order_relaxed);
+    if (first == ~0u || a2m_trace.ended) {
+        return false;
+    }
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (frame < first) {
+        return false;
+    }
+    if (frame >= first + TraceFrames || a2m_trace.listed >= TraceMaxLines) {
+        a2m_trace.ended = true;
+        std::printf("[T7] trace end: %u draws, %u listed\n", a2m_trace.draws, a2m_trace.listed);
+        std::fflush(stdout);
+        return false;
+    }
+    return true;
+}
+
+void TraceAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
+    const auto& regs = *sel.regs;
+    const u32 ordinal = a2m_trace.draws++;
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
+    u64 color, depth;
+    {
+        std::scoped_lock lock{a2m_trace.mutex};
+        color = a2m_trace.color;
+        depth = a2m_trace.depth;
+    }
+    bool related = std::string_view{mode} != "-";
+    std::string targets;
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& buffer = regs.color_buffers[cb];
+            if (!buffer || !regs.color_target_mask.GetMask(cb)) {
+                continue;
+            }
+            related |= buffer.Address() == color;
+            const auto& bc = regs.blend_control[cb];
+            targets += fmt::format(" CB{} {:#x} fmt {}/{} x{} mask {:#x} blend {}", cb,
+                                   buffer.Address(), u32(buffer.GetDataFmt()),
+                                   u32(buffer.GetNumberFmt()), buffer.NumSamples(),
+                                   regs.color_target_mask.GetMask(cb),
+                                   bc.enable && !buffer.info.blend_bypass
+                                       ? fmt::format("{}*src {} {}*dst", u32(bc.color_src_factor),
+                                                     u32(bc.color_func), u32(bc.color_dst_factor))
+                                       : std::string{"off"});
+        }
+    }
+    targets += fmt::format(" colour mode {}", u32(regs.color_control.mode));
+    if (regs.depth_buffer.DepthValid()) {
+        related |= regs.depth_buffer.DepthAddress() == depth;
+        targets += fmt::format(" | depth {:#x} x{} test {} func {} write {} stencil {}",
+                               regs.depth_buffer.DepthAddress(), regs.depth_buffer.NumSamples(),
+                               u32(regs.depth_control.depth_enable),
+                               u32(regs.depth_control.depth_func),
+                               u32(regs.depth_control.depth_write_enable),
+                               u32(regs.depth_control.stencil_enable));
+    }
+    std::string images;
+    for (u32 i = 0; fs && i < fs->images.size(); ++i) {
+        const auto tsharp = fs->images[i].GetSharp(*fs);
+        related |= tsharp.Address() == color || tsharp.Address() == depth;
+        images += fmt::format(" t{}={:#x} {}x{} {}/{}", i, tsharp.Address(),
+                              u32(tsharp.width) + 1, u32(tsharp.height) + 1,
+                              u32(tsharp.data_format), u32(tsharp.num_format));
+    }
+    if (!related) {
+        return;
+    }
+    ++a2m_trace.listed;
+    std::printf("[T7] #%u f%u ps %016llx vs %016llx: %u indices x%u; a2m %s;%s;%s\n", ordinal,
+                BbStats::frame_number.load(std::memory_order_relaxed),
+                static_cast<unsigned long long>(fs ? fs->pgm_hash : 0),
+                static_cast<unsigned long long>(vs ? vs->pgm_hash : 0), regs.num_indices,
+                regs.num_instances.num_instances, mode, targets.c_str(), images.c_str());
+    std::fflush(stdout);
+}
+} // namespace
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
     used_prepared = nullptr;
     NoteDrawTarget(liverpool->regs);
-    if (prepared) {
+    if (prepared && !TracingAlphaToMask()) {
         if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
             used_prepared = prepared;
             return pipeline;
@@ -762,6 +897,65 @@ static bool AlphaToMaskSkipped(u64 ps_hash) {
     return !skipped.empty() && skipped.contains(ps_hash);
 }
 
+/// bbport: BB_ALPHA_TO_MASK_DRAWS=<indices>,...: per-draw A/B without recompiling. Positive
+/// entries: only draws with that index count are emulated; negative ones (-23682): those are left
+/// out. Setting it also drops the baked-albedo guard below, so the list alone decides.
+struct AlphaToMaskDrawList {
+    std::unordered_set<u32> only, except;
+    bool set = false;
+};
+static const AlphaToMaskDrawList& AlphaToMaskDraws() {
+    static const AlphaToMaskDrawList list = [] {
+        AlphaToMaskDrawList l;
+        const char* env = std::getenv("BB_ALPHA_TO_MASK_DRAWS");
+        l.set = env && *env;
+        while (env && *env) {
+            char* end{};
+            const long long n = std::strtoll(env, &end, 10);
+            if (end == env) {
+                break;
+            }
+            (n < 0 ? l.except : l.only).insert(u32(n < 0 ? -n : n));
+            env = *end ? end + 1 : end;
+        }
+        return l;
+    }();
+    return list;
+}
+static bool AlphaToMaskDrawWanted(u32 num_indices) {
+    const auto& list = AlphaToMaskDraws();
+    return !list.except.contains(num_indices) &&
+           (list.only.empty() || list.only.contains(num_indices));
+}
+
+/// UFC-7 baked-albedo guard (default; BB_ALPHA_TO_MASK=all or BB_ALPHA_TO_MASK_DRAWS turn it
+/// off). UFC 3 Create Fighter draws two meshes with the hair pixel shader 39d6a7df and
+/// DB_ALPHA_TO_MASK (alpha = material constant x red of an alpha mask, second UV set): the head
+/// hair, whose colour map is a block-compressed asset, and the torso (23682 indices), whose colour
+/// map is the fighter's skin baked at run time into a 1024x1024 8_8_8_8 sRGB texture. With that
+/// draw at full coverage (emulation off) the torso is normal skin with chest hair; dithered by its
+/// alpha the torso shows what is under it, a dark sleeveless shape ending at the clavicle. Why
+/// its alpha is low here and not on the console is open (see VENDOR.txt): until then draws that
+/// sample a run-time colour map (2D 8_8_8_8 sRGB) keep full coverage.
+static bool AlphaToMaskGuarded() {
+    static const bool guarded = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return !(env && std::string_view{env} == "all") && !AlphaToMaskDraws().set;
+    }();
+    return guarded;
+}
+static bool SamplesBakedAlbedo(const Shader::Info& fs) {
+    for (const auto& image : fs.images) {
+        const auto tsharp = image.GetSharp(fs);
+        if (tsharp.GetType() == AmdGpu::ImageType::Color2D &&
+            AmdGpu::DataFormat(tsharp.data_format) == AmdGpu::DataFormat::Format8_8_8_8 &&
+            AmdGpu::NumberFormat(tsharp.num_format) == AmdGpu::NumberFormat::Srgb) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Alpha to mask takes the coverage from the alpha of the MRT0 export: off when that export
 /// format has no alpha (or nothing is exported).
 static bool ExportHasAlpha(AmdGpu::ShaderExportFormat format) {
@@ -846,7 +1040,14 @@ static void LogAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
     for (u32 i = 0; i < fs->buffers.size(); ++i) {
         const auto vsharp = fs->buffers[i].GetSharp(*fs);
         buffers += fmt::format(" b{}={:#x}+{}", i, vsharp.base_address, vsharp.GetSize());
+        // 39d6a7df: MRT0 alpha = b2 dword 24 x red of t4 (second UV set); dwords 20-24 of each
+        // small constant buffer, to compare the alpha scale of the hair and torso draws.
+        if (vsharp.base_address != 0 && vsharp.GetSize() >= 25 * 4 && vsharp.GetSize() <= 4096) {
+            const auto* f = reinterpret_cast<const float*>(vsharp.base_address);
+            buffers += fmt::format(" [20..24] {} {} {} {} {}", f[20], f[21], f[22], f[23], f[24]);
+        }
     }
+    signature ^= std::hash<std::string_view>{}(mode);
     static std::mutex log_mutex;
     static std::unordered_set<u64> logged;
     std::scoped_lock lock{log_mutex};
@@ -973,6 +1174,12 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         } else if (AlphaToMaskSkipped(fs->pgm_hash)) {
             alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_SKIP)";
             alpha_to_mask_on = false;
+        } else if (!AlphaToMaskDrawWanted(regs.num_indices)) {
+            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_DRAWS)";
+            alpha_to_mask_on = false;
+        } else if (AlphaToMaskGuarded() && SamplesBakedAlbedo(*fs)) {
+            alpha_to_mask_mode = "off (baked albedo)";
+            alpha_to_mask_on = false;
         }
         if (!alpha_to_mask_on && sel.alpha_to_mask != 0) {
             sel.alpha_to_mask = 0;
@@ -1092,9 +1299,13 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             alpha_to_mask_mode = key.alpha_to_coverage ? "alphaToCoverage"
                                  : sel.alpha_to_mask   ? "shader dither"
                                                        : "none (samples)";
-            LogAlphaToMaskDraw(sel, alpha_to_mask_mode);
         }
+        LogAlphaToMaskDraw(sel, alpha_to_mask_mode);
         LogAlphaToMask(sel, alpha_to_mask, bound_samples, alpha_to_mask_mode);
+        NoteAlphaToMaskDraw(sel);
+    }
+    if (!sel.worker && TracingAlphaToMask()) {
+        TraceAlphaToMaskDraw(sel, alpha_to_mask_set ? alpha_to_mask_mode : "-");
     }
 
     return true;

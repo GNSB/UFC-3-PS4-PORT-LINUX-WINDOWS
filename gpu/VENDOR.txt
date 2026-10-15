@@ -45,3 +45,15 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   alphaToCoverage. "[T7] draw" lines: each distinct draw honouring the register (stages, targets,
   T#s and V#s of the pixel shader), first 64. Cache versions unchanged (same key layout, same
   shader for a given runtime info).
+  Fourth pass: two draws use the alpha-to-mask pixel shader 39d6a7df (alpha = material constant
+  x red of a mask on the second UV set). One samples block-compressed assets (the head hair); the
+  other (23682 indices) samples the fighter's skin baked at run time (1024x1024 8_8_8_8 sRGB): it
+  is the visible torso skin. With full coverage the torso is right; dithered by its alpha it
+  shows what lies under it (dark, ending at the clavicle). By default draws sampling a 2D
+  8_8_8_8 sRGB texture keep full coverage (log "off (baked albedo)"); BB_ALPHA_TO_MASK=all turns
+  that guard off. BB_ALPHA_TO_MASK_DRAWS=<indices>,... emulates only those draws (-n: all but n;
+  setting it drops the guard). "[T7] draw" now also lists draws left out, with dwords 20-24 of
+  small constant buffers (alpha scale). "[T7] trace": on the 120th frame with such draws
+  (BB_T7_TRACE_AFTER, 0: never) every draw of two frames rendering to or sampling their colour or
+  depth target, in order. Pending: why the torso alpha is low here (alpha scale, mask, second UV
+  set) and what draws the dark layer under it.
