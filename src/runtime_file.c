@@ -98,6 +98,13 @@ void runtime_file_configure(const char *app0,const char *user) {
         char guest[32]; snprintf(guest,sizeof(guest),"/%s",writable[i]);
         runtime_file_mount(guest,path);
     }
+    /* ufc3: folders the game reads its fighter portraits and created-player data from
+     * (/temp0/images/career, /temp0/images/match, /temp0/createplayer); it only opens them, so
+     * without them the career pause menu showed no portrait. */
+    {
+        const char *ufc_dirs[]={"temp0/images","temp0/images/career","temp0/images/match","temp0/createplayer"};
+        for (int i=0;i<4;++i) { snprintf(path,sizeof(path),"%s/%s",user,ufc_dirs[i]); platform_mkdir(path,0755); }
+    }
 }
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {

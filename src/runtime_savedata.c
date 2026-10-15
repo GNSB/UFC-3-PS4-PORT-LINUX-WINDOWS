@@ -24,6 +24,7 @@
 #define ERR_INVALID_USER ((int32_t)0x809F0011)
 #define ERR_MEMORY_NOT_READY ((int32_t)0x809F0012)
 #define MODE_RDONLY 1
+#define MODE_RDWR 2
 #define MODE_CREATE 4
 #define MODE_COPY_ICON 16
 #define MODE_CREATE2 32
@@ -141,6 +142,14 @@ static int32_t mount_impl(int32_t user, const char *title, const DirName *dir, u
     PlatformStat st;
     int exists=!platform_stat(host,&st) && st.is_dir;
     if ((mode & MODE_CREATE) && exists) return ERR_EXISTS;
+    /* ufc3: the career save (CAREERSAVE0) is first mounted read-write without a create flag
+     * when the game saves; on the console the save was created earlier (career start), which
+     * never happens here, so the game showed "An error has occurred while saving". A read-write
+     * mount of a missing save creates it; read-only probes still find nothing. */
+    if (!exists && (mode & MODE_RDWR) && !(mode & (MODE_CREATE|MODE_CREATE2))) {
+        printf("Runtime: save data '%s' missing for a read-write mount: created\n",dir->data);
+        mode |= MODE_CREATE2;
+    }
     if (!(mode & (MODE_CREATE|MODE_CREATE2)) && !exists) return ERR_NOT_FOUND;
     pthread_mutex_lock(&lock);
     int slot=-1;
