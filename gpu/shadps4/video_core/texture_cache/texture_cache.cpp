@@ -107,7 +107,12 @@ bool T4Portrait(const ImageInfo& info) {
     return (info.size.width == 864 && info.size.height == 1360) ||
            (info.size.width == 652 && info.size.height == 1080) ||
            (info.size.width == 600 && info.size.height == 1080) ||
-           (info.size.width == 1000 && info.size.height == 1200);
+           (info.size.width == 1000 && info.size.height == 1200) ||
+           (info.size.width == 252 && info.size.height == 400) ||
+           (info.size.width == 328 && info.size.height == 280) ||
+           (info.size.width == 188 && info.size.height == 160) ||
+           (info.size.width == 360 && info.size.height == 260) ||
+           (info.size.width == 120 && info.size.height == 100);
 }
 
 bool T4PreserveAlias(const Image& source, const ImageInfo& destination) {
@@ -116,12 +121,19 @@ bool T4PreserveAlias(const Image& source, const ImageInfo& destination) {
         return !env || std::string_view{env} != "0";
     }();
     const auto& src = source.info;
-    // UFC-13: only the observed portrait RT -> sampled mip-chain transition. A CPU/buffer
+    // UFC-13: only the observed portrait RT -> sampled texture transitions. A CPU/buffer
     // write invalidates SafeToDownload(), so reused pools do not inherit a stale GPU image.
-    return enabled && T4Portrait(destination) &&
+    const bool padded_shape =
+        (destination.size.width >= 600 && src.size == Extent3D{1024, 2048, 1}) ||
+        (destination.size == Extent3D{252, 400, 1} && src.size == Extent3D{256, 512, 1}) ||
+        ((destination.size == Extent3D{328, 280, 1} ||
+          destination.size == Extent3D{360, 260, 1}) && src.size == Extent3D{512, 512, 1}) ||
+        (destination.size == Extent3D{188, 160, 1} && src.size == Extent3D{256, 256, 1}) ||
+        (destination.size == Extent3D{120, 100, 1} && src.size == Extent3D{128, 128, 1});
+    return enabled && T4Portrait(destination) && padded_shape &&
            source.SafeToDownload() && source.usage.render_target &&
            src.guest_address == destination.guest_address &&
-           src.size == Extent3D{1024, 2048, 1} && destination.size.depth == 1 &&
+           destination.size.depth == 1 &&
            src.type == AmdGpu::ImageType::Color2D && destination.type == src.type &&
            src.pixel_format == vk::Format::eR8G8B8A8Unorm &&
            destination.pixel_format == src.pixel_format &&
@@ -132,11 +144,11 @@ bool T4PreserveAlias(const Image& source, const ImageInfo& destination) {
            src.num_bits == 32 && destination.num_bits == 32 &&
            src.num_samples == 1 && destination.num_samples == 1 &&
            src.resources.layers == 1 && destination.resources.layers == 1 &&
-           src.resources.levels == 1 && destination.resources.levels > 1 &&
-           src.pitch == 1024 && destination.pitch == src.pitch &&
+           src.resources.levels == 1 && destination.resources.levels >= 1 &&
+           src.pitch == src.size.width && destination.pitch == src.pitch &&
            src.mips_layout[0].pitch == destination.mips_layout[0].pitch &&
            src.mips_layout[0].offset == 0 && destination.mips_layout[0].offset == 0 &&
-           !(destination.micro_tiled_mips & 1u);
+           !((src.micro_tiled_mips | destination.micro_tiled_mips) & 1u);
 }
 
 // UFC-13: diagnostics only; never write tiled images back as linear pixels. Called on the
@@ -643,42 +655,6 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 TraceT4Pixels(cache_image, "alias-before-reject-host",
                               {image_info.size.width, image_info.size.height});
             }
-            if (!merged_image_id && binding == BindingType::Texture &&
-                T4PreserveAlias(cache_image, image_info)) {
-                // Thin2DThin (tile 14), RGBA8, one sample: 8x8 microtiles are 256 bytes,
-                // no larger than the tile split. tiling.comp indexes macrotiles by
-                // (y / macro_height) * (pitch / macro_pitch) + x / macro_pitch.
-                // Height only enters the slice offset, which is zero for slice 0 here.
-                // Equal effective pitch, tiling parameters and bank swizzle therefore give
-                // identical guest addresses throughout this mip-0 origin rectangle.
-                const auto new_id = slot_images.insert(instance, runtime, slot_image_views,
-                                                       image_info);
-                RegisterImage(new_id);
-                // Slot insertion can move images; reacquire the source reference.
-                auto& src = slot_images[cache_image_id];
-                auto& dst = slot_images[new_id];
-                RefreshImage(dst);
-                // Initialize other mips from memory first, then replace ONLY mip 0. Later
-                // game dispatches and ordinary ExpandImage preserve/generate mips 1..N.
-                runtime.CopyImageMip0Region(&src, &dst);
-                TraceT4Pixels(dst, "alias-preserved-host");
-                static std::unordered_set<std::string> preserved;
-                const auto key = fmt::format("{:#x} {}x{}", image_info.guest_address,
-                                             image_info.size.width, image_info.size.height);
-                if (T4TraceEnabled() && preserved.insert(key).second) {
-                    std::printf("[T4] alias-preserved addr=%#llx region=%ux%u pitch=%u "
-                                "tile=%u mip=0 mips=%u\n",
-                                static_cast<unsigned long long>(image_info.guest_address),
-                                image_info.size.width, image_info.size.height, image_info.pitch,
-                                u32(image_info.tile_mode), image_info.resources.levels);
-                }
-                if (src.binding.is_bound || src.binding.is_target) {
-                    src.binding.needs_rebind = 1u;
-                }
-                FreeImage(cache_image_id);
-                TrackImage(new_id);
-                return {new_id, -1, -1};
-            }
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -996,10 +972,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     key_hash = (key_hash ^ key_hash >> 33) * 0xC4CEB9FE1A85EC53ull;
     key_hash ^= key_hash >> 33;
     auto& cached = find_image_cache[key_hash % find_image_cache.size()];
-    // An exact match stays valid while that image is registered with the same description;
-    // resolved overlaps (views into other images) only until any image registration changes.
+    // An exact match stays valid while that image is registered with the same description.
+    // Portraits also check registrations: a newly rendered padded source can supersede an
+    // exact alias. Resolved overlaps likewise depend on the registry generation.
     const auto still_exact = [&] {
-        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id) {
+        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id ||
+            (desc.type == BindingType::Texture && T4Portrait(info))) {
             return false;
         }
         const Image& image = slot_images[cached.image_id];
@@ -1033,8 +1011,73 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     ImageId image_id{};
 
-    // Check for a perfect match first
+    // A newly registered padded RT must take precedence over an exact sampled alias.
+    // Otherwise a second postprocess pass reuses the old alias (even in the same tick).
+    // Consume the source once, before mip generation, so later binds keep generated mips.
+    ImageId portrait_source{};
+    if (desc.type == BindingType::Texture && T4Portrait(info)) {
+        for (const auto id : image_ids) {
+            if (T4PreserveAlias(slot_images[id], info)) {
+                if (portrait_source) { // Ambiguous pool overlap: keep ordinary resolution.
+                    portrait_source = {};
+                    break;
+                }
+                portrait_source = id;
+            }
+        }
+    }
+    if (portrait_source) {
+        for (const auto id : image_ids) {
+            const auto& other = slot_images[id].info;
+            if (id != portrait_source && other.guest_address == info.guest_address &&
+                other.guest_size >= info.guest_size && other.size == info.size &&
+                other.pixel_format == info.pixel_format && other.type == info.type &&
+                other.resources.levels >= info.resources.levels &&
+                other.resources.layers == info.resources.layers &&
+                other.props.is_pow2 == info.props.is_pow2 && other.pitch == info.pitch &&
+                other.tile_mode == info.tile_mode && other.alt_tile == info.alt_tile &&
+                other.bank_swizzle == info.bank_swizzle &&
+                T4PreserveAlias(slot_images[portrait_source], other)) {
+                // Keep a previously expanded chain as one image: creating a separate
+                // mip-0 alias here would fork it from the later storage mip writes.
+                image_id = id;
+                break;
+            }
+        }
+        const bool reused = bool(image_id);
+        if (!image_id) {
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+            RegisterImage(image_id);
+        }
+        // Insertion may move slots; reacquire both references afterwards.
+        auto& src = slot_images[portrait_source];
+        auto& dst = slot_images[image_id];
+        TraceT4Pixels(src, "alias-before-copy-host", {info.size.width, info.size.height});
+        RefreshImage(dst);
+        // Equal macro-tile parameters and effective pitch give identical addresses in
+        // the mip-0 origin rectangle. Slice height has no effect on slice 0 (RGBA8, 1x).
+        runtime.CopyImageMip0Region(&src, &dst);
+        TraceT4Pixels(dst, "alias-preserved-host");
+        static u32 preserved_count = 0;
+        if (T4TraceEnabled() && preserved_count++ < 128) {
+            std::printf("[T4] tick=%llu alias-preserved addr=%#llx region=%ux%u pitch=%u "
+                        "tile=%u mip=0 mips=%u requested_mips=%u src_id=%u dst_id=%u reused=%d\n",
+                        static_cast<unsigned long long>(scheduler.CurrentTick()),
+                        static_cast<unsigned long long>(info.guest_address),
+                        info.size.width, info.size.height, info.pitch, u32(info.tile_mode),
+                        dst.info.resources.levels, info.resources.levels, portrait_source.index,
+                        image_id.index, reused);
+        }
+        if (src.binding.is_bound || src.binding.is_target) {
+            src.binding.needs_rebind = 1u;
+        }
+        FreeImage(portrait_source);
+        TrackImage(image_id);
+    }
+
+    // Check for a perfect match unless a live portrait source has already supplied it.
     for (const auto& cache_id : image_ids) {
+        if (portrait_source) break;
         auto& cache_image = slot_images[cache_id];
         if (cache_image.info.guest_address != info.guest_address) {
             continue;
@@ -1197,11 +1240,12 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         if (view_count++ < 256) {
             const auto& view = desc.view_info;
             std::printf("[T4] tick=%llu view addr=%#llx requested=%ux%u "
-                        "resolved=%ux%u view_fmt=%s mip=%u+%u layer=%u+%u swizzle=%u,%u,%u,%u\n",
+                        "resolved=%ux%u image_id=%u binding=%u view_fmt=%s mip=%u+%u "
+                        "layer=%u+%u swizzle=%u,%u,%u,%u\n",
                         static_cast<unsigned long long>(scheduler.CurrentTick()),
                         static_cast<unsigned long long>(image.info.guest_address),
                         desc.info.size.width, desc.info.size.height,
-                        image.info.size.width, image.info.size.height,
+                        image.info.size.width, image.info.size.height, image_id.index, u32(desc.type),
                         vk::to_string(view.format).c_str(), view.range.base.level,
                         view.range.extent.levels, view.range.base.layer, view.range.extent.layers,
                         u32(view.mapping.r), u32(view.mapping.g),
