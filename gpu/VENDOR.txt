@@ -12,3 +12,5 @@ Backported video_core fixes (UFC-5):
   14ada48a pending fast clears on FMASK decompress (#5283, Claudio Godoi).
   789551b0 (mancelli's fork) fast clear elimination clears a never-rendered MSAA image; the
   SHADPS4_FMASK_DECOMPRESS switch is not taken (#5283 already runs it unconditionally).
+  c08218db (mancelli's fork) depth bias x256 for emulated Z16+S8; ufc3: the factor follows the
+  host format (x1 for a real D16 with BB_Z16S8_AS_D16=1).

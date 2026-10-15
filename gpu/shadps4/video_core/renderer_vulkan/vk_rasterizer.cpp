@@ -4435,8 +4435,30 @@ void Rasterizer::UpdateDepthStencilState() const {
     dynamic_state.SetDepthBiasEnabled(depth_bias_enabled);
     if (depth_bias_enabled) {
         const bool front = regs.polygon_control.enable_polygon_offset_front;
+        // The constant bias is in units of the depth format's precision. Z16+S8 without
+        // D16_UNORM_S8_UINT is emulated with D32_SFLOAT_S8 or D24_UNORM_S8 (NVIDIA, Intel),
+        // whose minimum resolvable difference is ~256x smaller (exact for D24; for D32 float it
+        // is 2^-24 at depths 0.5-1), so the guest's bias barely moved depth: shadow acne and
+        // flicker. ufc3: the factor follows the host format pipelines are built with, so a real
+        // D16 (BB_Z16S8_AS_D16=1, AMD 0004) keeps the bias as is.
+        static const f32 z16s8_bias_scale = [this] {
+            switch (instance.GetSupportedFormat(
+                vk::Format::eD16UnormS8Uint, vk::FormatFeatureFlagBits2::eDepthStencilAttachment)) {
+            case vk::Format::eD24UnormS8Uint:
+            case vk::Format::eD32SfloatS8Uint:
+            case vk::Format::eD32Sfloat:
+                return 256.f;
+            default:
+                return 1.f;
+            }
+        }();
+        const bool is_z16s8 =
+            regs.depth_buffer.DepthValid() && regs.depth_buffer.StencilValid() &&
+            regs.depth_buffer.z_info.format == AmdGpu::DepthBuffer::ZFormat::Z16 &&
+            regs.depth_buffer.stencil_info.format == AmdGpu::DepthBuffer::StencilFormat::Stencil8;
+        const f32 bias_scale = is_z16s8 ? z16s8_bias_scale : 1.f;
         dynamic_state.SetDepthBias(
-            front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset,
+            (front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset) * bias_scale,
             regs.poly_offset.depth_bias,
             (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
     }
