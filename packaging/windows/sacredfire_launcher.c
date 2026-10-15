@@ -82,7 +82,7 @@ static const wchar_t *const sharpness_attenuation[] = {L"2000", L"1000", L"500",
 static const wchar_t *const managed_env[] = {
     L"BB_FULLSCREEN", L"BB_VK_VALIDATION", L"BB_FRAME_STATS", L"BB_MENU_TRACE", L"BB_GAMEPAD", L"BB_NEO",
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
-    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
+    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
     L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
@@ -465,7 +465,11 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_WRITE_WINDOW", L"0");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
-    game_env(L"BB_PREUPLOAD", L"1"); game_env(L"BB_COPY_GPU_BUFFERS", L"1");
+    /* Created fighters' skin is compressed by the game on the CPU into texture memory: with the
+     * background pre-upload or the single-stepped writes on, those textures came out black or
+     * garbled (career, fighter creation); with both off they draw correctly in fights. */
+    game_env(L"BB_PREUPLOAD", L"0"); game_env(L"BB_WRITE_STEP", L"0");
+    game_env(L"BB_COPY_GPU_BUFFERS", L"1");
     game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
     game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);

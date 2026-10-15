@@ -213,7 +213,6 @@ static ABI int32_t save_mount_info(const MountPoint *point, MountInfo *info) {
 static ABI int32_t save_not_found(void) { return initialized ? ERR_NOT_FOUND : ERR_NOT_INITIALIZED; }
 #define NOT_FOUND_LOGGED(tag, fname) \
     static ABI int32_t tag(void) { return logged(fname, NULL, save_not_found()); }
-NOT_FOUND_LOGGED(save_load_icon, "sceSaveDataLoadIcon")
 NOT_FOUND_LOGGED(save_event_result, "sceSaveDataGetEventResult")
 NOT_FOUND_LOGGED(save_transferring, "sceSaveDataTransferringMount")
 NOT_FOUND_LOGGED(save_check_backup, "sceSaveDataCheckBackupData")
@@ -254,6 +253,39 @@ static ABI int32_t save_icon(const MountPoint *point, const Icon *icon) {
     pthread_mutex_unlock(&lock);
     return r;
 }
+/* ufc3: the career save's slot shows its icon; on the console a save always has one (the
+ * app's icon0.png unless the game set its own), and a NOT_FOUND here made the game report
+ * "Your career data will not be saved due to an error". The save's own icon is returned,
+ * else the app's, else a 1x1 PNG. */
+static const uint8_t tiny_png[]={0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0,0,0,0x0D,0x49,0x48,0x44,0x52,
+    0,0,0,1,0,0,0,1,8,6,0,0,0,0x1F,0x15,0xC4,0x89,0,0,0,0x0D,0x49,0x44,0x41,0x54,0x78,0x9C,0x63,
+    0xF8,0x0F,0x00,0x01,0x01,0x01,0x00,0x18,0xDD,0x8D,0xB0,0,0,0,0,0x49,0x45,0x4E,0x44,0xAE,0x42,0x60,0x82};
+static long read_whole(const char *path, void *buffer, uint64_t capacity) {
+    FILE *f=fopen(path,"rb");
+    if (!f) return -1;
+    size_t n=fread(buffer,1,capacity,f); fclose(f);
+    return (long)n;
+}
+static ABI int32_t save_load_icon_impl(const MountPoint *point, Icon *icon) {
+    if (!initialized) return ERR_NOT_INITIALIZED;
+    if (!icon || !icon->buffer) return ERR_PARAMETER;
+    pthread_mutex_lock(&lock);
+    int slot=slot_of(point);
+    char path[700]="";
+    if (slot>=0) snprintf(path,sizeof(path),"%s/icon0.png",slots[slot].meta);
+    pthread_mutex_unlock(&lock);
+    if (slot<0) return ERR_NOT_MOUNTED;
+    long n=read_whole(path,(void *)icon->buffer,icon->buffer_size);
+    if (n<=0 && !runtime_file_translate("/app0/sce_sys/icon0.png",path,sizeof(path)))
+        n=read_whole(path,(void *)icon->buffer,icon->buffer_size);
+    if (n<=0) {
+        n=sizeof(tiny_png)<icon->buffer_size ? (long)sizeof(tiny_png) : (long)icon->buffer_size;
+        memcpy((void *)icon->buffer,tiny_png,(size_t)n);
+    }
+    icon->data_size=(uint64_t)n;
+    return 0;
+}
+static ABI int32_t save_load_icon(const MountPoint *p, Icon *i) { return logged("sceSaveDataLoadIcon",p?p->data:NULL,save_load_icon_impl(p,i)); }
 static ABI int32_t save_delete(const Delete *d) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!d || !d->dir || !valid_name(d->dir->data,sizeof(d->dir->data))) return ERR_PARAMETER;
