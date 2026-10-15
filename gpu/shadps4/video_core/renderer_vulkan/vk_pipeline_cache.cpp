@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -719,28 +721,6 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-/// [T7] each fragment shader drawn with DB_ALPHA_TO_MASK once, to see whether UFC 3 uses it.
-static void LogAlphaToMask(const PipelineSelection& sel, u32 reg, u32 samples) {
-    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
-    const u64 hash = fs ? fs->pgm_hash : 0;
-    static std::mutex log_mutex;
-    static std::unordered_set<u64> logged;
-    {
-        std::scoped_lock lock{log_mutex};
-        if (!logged.insert(hash).second) {
-            return;
-        }
-    }
-    const char* mode = sel.graphics_key.alpha_to_coverage ? "alphaToCoverage"
-                       : sel.alpha_to_mask                ? "shader dither"
-                                                          : "none";
-    LOG_INFO(Render_Vulkan,
-             "[T7] DB_ALPHA_TO_MASK ps {:016x}: reg {:#07x} (offsets {}{}{}{}, round {}), "
-             "samples {} -> {}",
-             hash, reg, (reg >> 8) & 3, (reg >> 10) & 3, (reg >> 12) & 3, (reg >> 14) & 3,
-             (reg >> 16) & 1, samples, mode);
-}
-
 /// bbport: BB_ALPHA_TO_MASK=0 turns off the DB_ALPHA_TO_MASK emulation (69ab1996).
 static bool AlphaToMaskEnabled() {
     static const bool enabled = [] {
@@ -748,6 +728,74 @@ static bool AlphaToMaskEnabled() {
         return !env || env[0] != '0';
     }();
     return enabled;
+}
+
+/// bbport: BB_ALPHA_TO_MASK_SKIP=<hash>,<hash>: pixel shaders (pgm_hash from the [T7] lines)
+/// left out of the emulation, to tell from one run which draw a wrong one is.
+static bool AlphaToMaskSkipped(u64 ps_hash) {
+    static const std::unordered_set<u64> skipped = [] {
+        std::unordered_set<u64> hashes;
+        const char* env = std::getenv("BB_ALPHA_TO_MASK_SKIP");
+        while (env && *env) {
+            char* end{};
+            const u64 hash = std::strtoull(env, &end, 16);
+            if (end == env) {
+                break;
+            }
+            hashes.insert(hash);
+            env = *end ? end + 1 : end;
+        }
+        return hashes;
+    }();
+    return !skipped.empty() && skipped.contains(ps_hash);
+}
+
+/// Alpha to mask takes the coverage from the alpha of the MRT0 export: off when that export
+/// format has no alpha (or nothing is exported).
+static bool ExportHasAlpha(AmdGpu::ShaderExportFormat format) {
+    using enum AmdGpu::ShaderExportFormat;
+    return format != Zero && format != R_32 && format != GR_32;
+}
+
+/// [T7] once per pixel shader and outcome, every draw with DB_ALPHA_TO_MASK enabled: the
+/// register, the hardware gates and the MRT0 state, to tell coverage draws (hair) from the rest.
+static void LogAlphaToMask(const PipelineSelection& sel, u32 reg, u32 samples, const char* mode) {
+    const auto& regs = *sel.regs;
+    const auto& key = sel.graphics_key;
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    const u64 hash = fs ? fs->pgm_hash : 0;
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged;
+    std::scoped_lock lock{log_mutex};
+    if (!logged.insert(hash ^ (u64{reg} << 32) ^ std::hash<std::string_view>{}(mode)).second) {
+        return;
+    }
+    const auto& cb0 = regs.color_buffers[0];
+    const bool cb0_bound = cb0 && regs.color_target_mask.GetMask(0);
+    std::printf("[T7] ps %016llx: reg 0x2DC %#07x (offsets %u%u%u%u, round %u), "
+                "DB_SHADER_CONTROL a2m_disable %u mask_export %u kill %u; MRT0 %s fmt %u/%u "
+                "export %u blend %s mask %#x written %s; MRTs bound %u written %u (mask %#x); "
+                "samples %u (key %u) -> %s\n",
+                static_cast<unsigned long long>(hash), reg, (reg >> 8) & 3, (reg >> 10) & 3,
+                (reg >> 12) & 3, (reg >> 14) & 3, (reg >> 16) & 1,
+                u32(regs.depth_shader_control.alpha_to_mask_disable),
+                u32(regs.depth_shader_control.mask_export_enable),
+                u32(regs.depth_shader_control.kill_enable), cb0_bound ? "bound" : "unbound",
+                cb0_bound ? u32(cb0.GetDataFmt()) : 0u, cb0_bound ? u32(cb0.GetNumberFmt()) : 0u,
+                u32(regs.color_export_format.GetFormat(0)),
+                regs.blend_control[0].enable && cb0_bound && !cb0.info.blend_bypass ? "on"
+                                                                                     : "off",
+                regs.color_target_mask.GetMask(0), key.mrt_mask & 1 ? "yes" : "no",
+                [&] {
+                    u32 bound = 0;
+                    for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                        bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb));
+                    }
+                    return bound;
+                }(),
+                u32(std::popcount(key.mrt_mask)), key.mrt_mask, samples, u32(key.num_samples),
+                mode);
+    std::fflush(stdout);
 }
 
 bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
@@ -825,13 +873,42 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     // DB_ALPHA_TO_MASK (69ab1996): multisampled targets use Vulkan alpha to coverage, single
     // sample targets a dither discard in the fragment shader. Decided before the stages are
     // compiled, from the samples of the bound targets.
+    // The register is context state that stays set across draws; the hardware ignores it when
+    // the pixel shader's DB_SHADER_CONTROL sets ALPHA_TO_MASK_DISABLE or MRT0 exports no alpha.
+    // Without these gates draws whose MRT0 alpha is not coverage (UFC 3: the fighter's torso in
+    // Create Fighter came out black) were dithered away.
     const u32 alpha_to_mask = regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC];
-    const bool alpha_to_mask_on = AlphaToMaskEnabled() && (alpha_to_mask & 1);
+    const bool alpha_to_mask_set = AlphaToMaskEnabled() && (alpha_to_mask & 1);
+    bool alpha_to_mask_on = alpha_to_mask_set;
+    const char* alpha_to_mask_mode = "none";
+    if (alpha_to_mask_set && regs.depth_shader_control.alpha_to_mask_disable) {
+        alpha_to_mask_mode = "off (DB_SHADER_CONTROL)";
+        alpha_to_mask_on = false;
+    } else if (alpha_to_mask_set && !ExportHasAlpha(regs.color_export_format.GetFormat(0))) {
+        alpha_to_mask_mode = "off (MRT0 export without alpha)";
+        alpha_to_mask_on = false;
+    }
     sel.alpha_to_mask = alpha_to_mask_on && bound_samples <= 1 ? (alpha_to_mask & 0x1FF01) : 0;
 
     // Compile and bind shader stages
     if (!RefreshGraphicsStages(sel)) {
         return false;
+    }
+    if (alpha_to_mask_on) {
+        const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+        if (!fs || !(fs->mrt_mask & 1)) {
+            alpha_to_mask_mode = "off (no MRT0 export)";
+            alpha_to_mask_on = false;
+        } else if (AlphaToMaskSkipped(fs->pgm_hash)) {
+            alpha_to_mask_mode = "off (BB_ALPHA_TO_MASK_SKIP)";
+            alpha_to_mask_on = false;
+        }
+        if (!alpha_to_mask_on && sel.alpha_to_mask != 0) {
+            sel.alpha_to_mask = 0;
+            if (!RefreshGraphicsStages(sel)) {
+                return false;
+            }
+        }
     }
     if (motion_possible) {
         const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
@@ -939,8 +1016,13 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     }
 
     key.alpha_to_coverage = alpha_to_mask_on && bound_samples > 1 && key.num_samples > 1;
-    if (alpha_to_mask_on) {
-        LogAlphaToMask(sel, alpha_to_mask, bound_samples);
+    if (alpha_to_mask_set) {
+        if (alpha_to_mask_on) {
+            alpha_to_mask_mode = key.alpha_to_coverage ? "alphaToCoverage"
+                                 : sel.alpha_to_mask   ? "shader dither"
+                                                       : "none (samples)";
+        }
+        LogAlphaToMask(sel, alpha_to_mask, bound_samples, alpha_to_mask_mode);
     }
 
     return true;

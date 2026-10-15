@@ -35,3 +35,7 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   from the samples of the bound targets before the stages compile (the fork reads the key's
   num_samples there, which is still the depth samples); "[T7]" log once per pixel shader.
   Cache versions: ShaderBinaryVersion 11, ShaderMetaVersion 10, PipelineKeyVersion 7.
+  Second pass: the register is left set across draws, so it is honoured only like the hardware
+  does: not when DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE is set, MRT0 exports no alpha or the
+  pixel shader has no MRT0 export (UFC 3 torso came out black). BB_ALPHA_TO_MASK_SKIP=<ps hashes>
+  leaves pixel shaders out; the "[T7]" line goes to stdout (Render_Vulkan info is filtered).
