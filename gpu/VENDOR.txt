@@ -15,3 +15,4 @@ Backported for UFC-4 (recompiler batch T1 of docs/ufc3/MANCELLI-BACKPORT.md), on
   7721a1ef instance id unbiased for every instance id use, step rates too (#5260; by hand, our fetch_data is std::optional).
   10393d2c step rates allowed together with a base instance (#5274).
   c5dd8b8b ZERO/ONE blend factors emulated for MIN/MAX blend ops (#5197).
+  c34ca21f EXEC scope preserved after an empty branch (#5220).
