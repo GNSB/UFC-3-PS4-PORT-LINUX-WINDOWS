@@ -63,10 +63,12 @@ if [[ $BB_GAME_PROFILE == ufc3 ]]; then
     # Precise readbacks deadlock against the GPU write twins (twins_mutex held by the thread a
     # readback waits for); off for this game.
     export BB_GPU_WRITE_TWINS=${BB_GPU_WRITE_TWINS:-0}
-    # CPU writes beside GPU-written bytes (the engine's dynamic buffers share pages with small
-    # shader outputs) keep their page open until the next submission instead of a readback each:
-    # fights 105-113 -> 140-190 FPS on the 4070 (GROK_HANDOFF §17).
-    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1}
+    # Same defaults as the Windows launcher. Write windows (CPU writes beside GPU-written bytes
+    # keep their page open until the next submission: fights 105-113 -> 140-190 FPS on the 4070,
+    # GROK_HANDOFF §17) are off: with them the game crashed after the first fight (the guest
+    # heap's free list corrupted). Background pre-upload and single-stepped writes are off too:
+    # created/career fighters' skin, compressed by the game on the CPU, came out black or garbled.
+    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-0} BB_PREUPLOAD=${BB_PREUPLOAD:-0} BB_WRITE_STEP=${BB_WRITE_STEP:-0}
     # The EA intro and the 2.5-minute first-start video play a short black clip instead.
     export BB_SKIP_MOVIES=${BB_SKIP_MOVIES:-1} BB_SKIP_MOVIE_FILE=${BB_SKIP_MOVIE_FILE:-$PWD/share/skip_movie.mkv}
     # Frame rate: the game asks for flip rate 1 (30 Hz) through its present-interval setter
