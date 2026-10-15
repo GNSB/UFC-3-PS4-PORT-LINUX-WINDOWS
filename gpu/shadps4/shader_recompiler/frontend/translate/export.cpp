@@ -95,8 +95,9 @@ void Translator::ExportRenderTarget(const GcnInst& inst) {
 
     if (mrt == IR::Attribute::RenderTarget0 && runtime_info.hw.fs.alpha_to_mask != 0 &&
         !components[3].IsEmpty()) {
-        // Alpha to mask with one sample: the pixel is covered when alpha reaches a threshold
-        // given per pixel of the 2x2 quad by the dither offsets (in quarters of a sample).
+        // Alpha to mask as whole pixels (also on multisampled targets unless
+        // BB_ALPHA_TO_MASK=coverage): the pixel is covered when alpha reaches a threshold given
+        // per pixel of the 2x2 quad by the dither offsets (in quarters of a sample).
         const u32 alpha_to_mask = runtime_info.hw.fs.alpha_to_mask;
         const f32 rounding = (alpha_to_mask >> 16) & 1 ? 0.5f : 0.f;
         std::array<f32, 4> thresholds{};

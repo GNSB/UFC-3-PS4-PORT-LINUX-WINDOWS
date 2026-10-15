@@ -730,6 +730,18 @@ static bool AlphaToMaskEnabled() {
     return enabled;
 }
 
+/// bbport: BB_ALPHA_TO_MASK=coverage: multisampled targets use Vulkan alphaToCoverageEnable (the
+/// fork's choice). By default they take the shader dither too: whole pixels, every sample alike.
+/// With alphaToCoverage on the UFC 3 Create Fighter 4x MSAA pass the hair came out right and the
+/// fighter's torso dark (UFC-7).
+static bool AlphaToCoverageWanted() {
+    static const bool wanted = [] {
+        const char* env = std::getenv("BB_ALPHA_TO_MASK");
+        return env && std::string_view{env} == "coverage";
+    }();
+    return wanted;
+}
+
 /// bbport: BB_ALPHA_TO_MASK_SKIP=<hash>,<hash>: pixel shaders (pgm_hash from the [T7] lines)
 /// left out of the emulation, to tell from one run which draw a wrong one is.
 static bool AlphaToMaskSkipped(u64 ps_hash) {
@@ -763,6 +775,9 @@ static void LogAlphaToMask(const PipelineSelection& sel, u32 reg, u32 samples, c
     const auto& regs = *sel.regs;
     const auto& key = sel.graphics_key;
     const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    if (sel.worker && sel.worker->failed) {
+        return; // a draw-preparation worker that met an uncompiled program: no stages to tell
+    }
     const u64 hash = fs ? fs->pgm_hash : 0;
     static std::mutex log_mutex;
     static std::unordered_set<u64> logged;
@@ -795,6 +810,61 @@ static void LogAlphaToMask(const PipelineSelection& sel, u32 reg, u32 samples, c
                 }(),
                 u32(std::popcount(key.mrt_mask)), key.mrt_mask, samples, u32(key.num_samples),
                 mode);
+    std::fflush(stdout);
+}
+
+/// [T7] draw: one line per distinct draw that has DB_ALPHA_TO_MASK honoured (first 64): its
+/// stages, targets and the T#s/V#s of the pixel shader, to tell which draws of a coverage
+/// shader are hair and which are not, and what reads the target afterwards.
+static void LogAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
+    if (sel.worker && sel.worker->failed) {
+        return;
+    }
+    const auto& regs = *sel.regs;
+    const auto& key = sel.graphics_key;
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
+    if (!fs) {
+        return;
+    }
+    const auto& cb0 = regs.color_buffers[0];
+    const bool db = regs.depth_buffer.DepthValid();
+    std::string images;
+    u64 signature = fs->pgm_hash ^ (vs ? vs->pgm_hash << 1 : 0) ^ (u64{regs.num_indices} << 20) ^
+                    (cb0 ? cb0.Address() << 3 : 0) ^ (db ? regs.depth_buffer.DepthAddress() : 0);
+    for (u32 i = 0; i < fs->images.size(); ++i) {
+        const auto tsharp = fs->images[i].GetSharp(*fs);
+        signature = signature * 0x100000001B3ull ^ tsharp.Address();
+        images += fmt::format(" t{}={:#x} {}x{} fmt {}/{} type {} sel {}{}{}{} smp {} mips {}", i,
+                              tsharp.Address(), u32(tsharp.width) + 1, u32(tsharp.height) + 1,
+                              u32(tsharp.data_format), u32(tsharp.num_format), u32(tsharp.type),
+                              u32(tsharp.dst_sel_x), u32(tsharp.dst_sel_y),
+                              u32(tsharp.dst_sel_z), u32(tsharp.dst_sel_w), tsharp.NumSamples(),
+                              tsharp.NumLevels());
+    }
+    std::string buffers;
+    for (u32 i = 0; i < fs->buffers.size(); ++i) {
+        const auto vsharp = fs->buffers[i].GetSharp(*fs);
+        buffers += fmt::format(" b{}={:#x}+{}", i, vsharp.base_address, vsharp.GetSize());
+    }
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged;
+    std::scoped_lock lock{log_mutex};
+    if (logged.size() >= 64 || !logged.insert(signature).second) {
+        return;
+    }
+    std::printf("[T7] draw ps %016llx vs %016llx (%s): %u indices x%u; CB0 %#llx samples %u "
+                "(pipeline %u, raster %u); depth %#llx samples %u test %u func %u write %u "
+                "stencil %u;%s;%s\n",
+                static_cast<unsigned long long>(fs->pgm_hash),
+                static_cast<unsigned long long>(vs ? vs->pgm_hash : 0), mode, regs.num_indices,
+                regs.num_instances.num_instances,
+                static_cast<unsigned long long>(cb0 ? cb0.Address() : 0),
+                cb0 ? cb0.NumSamples() : 0u, u32(key.color_samples[0]), u32(key.num_samples),
+                static_cast<unsigned long long>(db ? regs.depth_buffer.DepthAddress() : 0),
+                db ? regs.depth_buffer.NumSamples() : 0u, u32(regs.depth_control.depth_enable),
+                u32(regs.depth_control.depth_func), u32(regs.depth_control.depth_write_enable),
+                u32(regs.depth_control.stencil_enable), images.c_str(), buffers.c_str());
     std::fflush(stdout);
 }
 
@@ -870,9 +940,9 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
     }
 
-    // DB_ALPHA_TO_MASK (69ab1996): multisampled targets use Vulkan alpha to coverage, single
-    // sample targets a dither discard in the fragment shader. Decided before the stages are
-    // compiled, from the samples of the bound targets.
+    // DB_ALPHA_TO_MASK (69ab1996): a dither discard in the fragment shader; with
+    // BB_ALPHA_TO_MASK=coverage multisampled targets use Vulkan alpha to coverage instead, as in
+    // the fork. Decided before the stages are compiled, from the samples of the bound targets.
     // The register is context state that stays set across draws; the hardware ignores it when
     // the pixel shader's DB_SHADER_CONTROL sets ALPHA_TO_MASK_DISABLE or MRT0 exports no alpha.
     // Without these gates draws whose MRT0 alpha is not coverage (UFC 3: the fighter's torso in
@@ -888,7 +958,8 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         alpha_to_mask_mode = "off (MRT0 export without alpha)";
         alpha_to_mask_on = false;
     }
-    sel.alpha_to_mask = alpha_to_mask_on && bound_samples <= 1 ? (alpha_to_mask & 0x1FF01) : 0;
+    const bool alpha_to_coverage = AlphaToCoverageWanted() && bound_samples > 1;
+    sel.alpha_to_mask = alpha_to_mask_on && !alpha_to_coverage ? (alpha_to_mask & 0x1FF01) : 0;
 
     // Compile and bind shader stages
     if (!RefreshGraphicsStages(sel)) {
@@ -1015,12 +1086,13 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         }
     }
 
-    key.alpha_to_coverage = alpha_to_mask_on && bound_samples > 1 && key.num_samples > 1;
+    key.alpha_to_coverage = alpha_to_mask_on && alpha_to_coverage && key.num_samples > 1;
     if (alpha_to_mask_set) {
         if (alpha_to_mask_on) {
             alpha_to_mask_mode = key.alpha_to_coverage ? "alphaToCoverage"
                                  : sel.alpha_to_mask   ? "shader dither"
                                                        : "none (samples)";
+            LogAlphaToMaskDraw(sel, alpha_to_mask_mode);
         }
         LogAlphaToMask(sel, alpha_to_mask, bound_samples, alpha_to_mask_mode);
     }

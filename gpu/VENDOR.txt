@@ -39,3 +39,9 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   does: not when DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE is set, MRT0 exports no alpha or the
   pixel shader has no MRT0 export (UFC 3 torso came out black). BB_ALPHA_TO_MASK_SKIP=<ps hashes>
   leaves pixel shaders out; the "[T7]" line goes to stdout (Render_Vulkan info is filtered).
+  Third pass: the torso stayed dark with only one pixel shader using the emulation (the hair, on
+  a 4x MSAA R11G11B10F target through alphaToCoverage). Multisampled targets now take the shader
+  dither too (whole pixels, all samples alike); BB_ALPHA_TO_MASK=coverage brings back
+  alphaToCoverage. "[T7] draw" lines: each distinct draw honouring the register (stages, targets,
+  T#s and V#s of the pixel shader), first 64. Cache versions unchanged (same key layout, same
+  shader for a given runtime info).
