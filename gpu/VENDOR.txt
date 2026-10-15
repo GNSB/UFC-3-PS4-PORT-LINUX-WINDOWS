@@ -17,3 +17,4 @@ Backported for UFC-4 (recompiler batch T1 of docs/ufc3/MANCELLI-BACKPORT.md), on
   c5dd8b8b ZERO/ONE blend factors emulated for MIN/MAX blend ops (#5197).
   c34ca21f EXEC scope preserved after an empty branch (#5220).
   1c2b8f97 V_RCP_CLAMP_F32, V_RSQ_CLAMP_F32, V_RSQ_LEGACY_F32, V_LOG_CLAMP_F32 (#5346).
+  02d3b06d (mancelli) v_min/v_max (FPMin/FPMax 32/64) as NMin/NMax, redone on top of #5257 as in mancelli's fork.
