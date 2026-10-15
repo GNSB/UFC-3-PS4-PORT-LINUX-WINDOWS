@@ -698,8 +698,15 @@ void Rasterizer::EliminateFastClear() {
     }
     VideoCore::TextureCache::ImageDesc desc(col_buf, CbExtent(0));
     const auto image_id = texture_cache.FindImage(desc);
+    // A multisampled image cannot be uploaded from guest memory, so one the GPU never rendered
+    // to has undefined contents. The game fast cleared it, possibly before its CMASK was known
+    // here (it only gets tracked once the target is bound), and expands the clear now.
+    const auto& found = texture_cache.GetImage(image_id);
+    const bool undefined_msaa =
+        found.info.num_samples > 1 && False(found.flags & VideoCore::ImageFlagBits::GpuModified);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
-    if (!texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
+    if (!undefined_msaa &&
+        !texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
         return;
     }
     for (u32 slice = col_buf.view.slice_start; slice <= col_buf.view.slice_max; ++slice) {

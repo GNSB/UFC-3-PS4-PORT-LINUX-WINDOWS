@@ -10,3 +10,5 @@ Backported from upstream after b4e7ae7 (2026-10-02), recompiler correctness fixe
   d1cb90dbb ADDC (#5200), dd43d1cac V_CVT_PK_U8_F32 (#5194), ef08b1e1f V_ALIGNBIT/ALIGNBYTE (#5186).
 Backported video_core fixes (UFC-5):
   14ada48a pending fast clears on FMASK decompress (#5283, Claudio Godoi).
+  789551b0 (mancelli's fork) fast clear elimination clears a never-rendered MSAA image; the
+  SHADPS4_FMASK_DECOMPRESS switch is not taken (#5283 already runs it unconditionally).
