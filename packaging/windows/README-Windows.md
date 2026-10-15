@@ -22,9 +22,18 @@ your own dump of the game and its 1.14 update.
 3. The first start prepares the game for a few seconds. Data, saves and logs live in
    `%LOCALAPPDATA%\UFC3Native`.
 
+Use the launcher's **Save logs to** field and **Browse...** button to choose where launcher and
+game logs are saved. The selection is remembered in the launcher settings; leave it blank to use
+the default folder. **Open logs folder** opens the selected location.
+
 ### Launcher settings
 
-- **Player name** — the name the game shows (16 characters, ASCII).
+- **Player name** — the name the game shows (16 characters, ASCII). Use a different name
+  on each PC. Two copies with the same name are the same player.
+- **Online server** — the Linux PC's address on this network (for example `192.168.1.20`).
+  Empty leaves the game offline. The Linux PC runs `python3 tools/ufc3_server.py --bind 0.0.0.0`
+  and its own game with `BB_ONLINE_SERVER=127.0.0.1`. FighterNet and inviting a friend are not
+  finished: login reaches the shared server, a fight between the two PCs does not yet.
 - **Controls...** — keyboard keys (click, then press the key) and gamepad buttons for every PS4
   input. The keyboard and a gamepad work together.
 - **Game resolution** — 720p / 1080p, what the game renders.

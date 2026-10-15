@@ -54,7 +54,8 @@ and saves.
 2. Open **`UFC3.exe`**. Pick the `CUSA06534` folder (the base game; an update next to it is
    detected automatically) and press **Play**.
 3. On first launch the game is prepared (a few seconds) in `%LOCALAPPDATA%\UFC3Native`. Each
-   session's log goes to `%LOCALAPPDATA%\UFC3Native\logs\`.
+   session's log goes to `%LOCALAPPDATA%\UFC3Native\logs\` by default. Choose another folder
+   in the launcher's **Save logs to** field and **Browse...** button.
 
 ### Launcher settings (God of War III port style)
 

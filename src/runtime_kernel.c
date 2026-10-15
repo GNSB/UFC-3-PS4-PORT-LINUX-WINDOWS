@@ -329,21 +329,27 @@ static ABI int32_t kernel_mlock(const void *address,uint64_t length) { (void)add
 /* libSceLibcInternalExt: heap tracing is off; no trace buffer exists. */
 static ABI int32_t libc_heap_trace_info(void *info) { (void)info; return ERR(2); }
 static ABI int32_t posix_nanosleep_alias(const GuestTimespec *rq,GuestTimespec *rem) { return posix_nanosleep(rq,rem); }
-/* Time zone conversions with the host's zone (the console uses the user's configured zone). */
-static ABI int32_t utc_to_localtime(int64_t utc,int64_t *local,GuestTimezone *tz,int32_t *dst) {
+/* PS4 conversion ABI (shadPS4 kernel/time.h): UTC->local's third output is a
+ * 16-byte timesec, not the 8-byte gettimeofday timezone. Local->UTC has a DST
+ * selector BEFORE the output pointer; treating it as a pointer crashed UFC's
+ * authenticated startup when libc passed selector=1. */
+typedef struct { int64_t t; uint32_t west_sec, dst_sec; } GuestTimesec;
+static ABI int32_t utc_to_localtime(int64_t utc,int64_t *local,GuestTimesec *st,uint64_t *dst) {
     if (!local) return ERR(22);
     const long offset=platform_utc_offset((time_t)utc); const int is_dst=platform_is_dst((time_t)utc);
     *local=utc+offset;
-    if (tz) { tz->minuteswest=(int32_t)(-offset/60); tz->dsttime=is_dst; }
-    if (dst) *dst=is_dst;
+    const uint32_t dst_seconds=is_dst ? 3600 : 0;
+    if (st) { st->t=utc; st->west_sec=(uint32_t)offset; st->dst_sec=dst_seconds; }
+    if (dst) *dst=dst_seconds;
     return 0;
 }
-static ABI int32_t localtime_to_utc(int64_t local,int64_t *utc,GuestTimezone *tz,int32_t *dst) {
+static ABI int32_t localtime_to_utc(int64_t local,int64_t dst_hint,int64_t *utc,GuestTimezone *tz,int32_t *dst) {
+    (void)dst_hint;
     if (!utc) return ERR(22);
     const long offset=platform_utc_offset((time_t)local); const int is_dst=platform_is_dst((time_t)local);
     *utc=local-offset;
     if (tz) { tz->minuteswest=(int32_t)(-offset/60); tz->dsttime=is_dst; }
-    if (dst) *dst=is_dst;
+    if (dst) *dst=is_dst ? 3600 : 0;
     return 0;
 }
 

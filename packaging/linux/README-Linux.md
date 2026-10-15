@@ -20,6 +20,8 @@ tar xf UFC3Native-*-linux-x86_64.tar.gz && cd UFC3Native
 The update folder next to the base game (`CUSA06534-patch`, `-PATCH`, `-update`…) is merged
 into `CUSA06534-merged` with hard links. Data, saves and logs go to
 `~/.local/share/UFC3Native` (`BB_DATA_DIR` changes it).
+Set `BB_LOG_DIR` to place the log files elsewhere, independently of saves and settings, for
+example: `BB_LOG_DIR="$HOME/UFC3-logs" ./ufc3.sh`.
 
 ## Settings
 

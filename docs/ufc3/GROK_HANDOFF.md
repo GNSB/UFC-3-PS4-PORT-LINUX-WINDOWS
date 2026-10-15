@@ -814,3 +814,27 @@ Route, on the model the user confirmed (run81, lights and fighters, 90–100):
   garbage -> grainy floor and gray blocks. Now one copy per (VkImage, layer), any single layer.
   Same bug class as shadPS4 PR #5284 (UFC 4, "grainy or shimmering shadows on the octagon floor").
 - run113: user played a fight and confirmed the floor renders correctly.
+
+## 20. Online P2P (host + guest) — work in progress (2026-10-14 17:10)
+
+Goal: one player runs tools/ufc3_server.py and the game with BB_ONLINE_SERVER=<host IP>; the friend
+points BB_ONLINE_SERVER at the host. The fight itself is the game's own peer-to-peer
+(DirtySDK, CCS_MODE_PEERONLY); EA's services are replaced by a minimal Blaze server.
+
+- src/runtime_net.c (new; only active with BB_ONLINE_SERVER): real TCP/UDP sockets (POSIX and
+  Winsock), PS4 sockaddr/errno/sockopt/epoll ABI (from shadPS4), resolver (only *.ea.com -> the
+  server, everything else refused), NetCtl connected, PSN signed in + PS Plus + fake auth code
+  ("UFC3NATIVE-<hash>", issuer 256), NpWebApi unavailable, sceHttp as plain HTTP/1.0 to the
+  server; ports < 1024 on the server reached at +40000. BB_NET_LOG=1 default (2: send/recv too).
+- Facts found: redirector winter15.gosredirector.ea.com:42230 POST /redirector/getServerInstance
+  (XML: ufc-2018-ps4, UFC2018_PS4, BlazeSDK 15.1.1.6.5, DirtySDK 15.1.3.0.5, standardSecure_v4).
+  Answering <secure>0</secure> makes the client speak Blaze in plain TCP (no cert patch needed).
+  Blaze framing = Fire2 (16-byte header), TDF heat2 — tools/blaze_tdf.py encodes/decodes it.
+- Flow seen (run116): Util::preAuth (9/7) -> our reply accepted -> Util::ping (9/2) ->
+  Util::fetchClientConfig "UfcConfig" (9/1) -> empty reply -> ~38 s later a host fault: strlen(NULL)
+  in a string setter at +0x17234d0 called from +0xbb27a9 (obj->vtbl[0x20]() returned NULL right
+  after obj->vtbl[0]() said true — likely a persona/display name that only exists after login).
+  No Authentication login was sent yet.
+- Next: find the UfcConfig keys the game reads (and/or the login trigger), implement
+  Authentication login (PS4 auth code) + UserSessions notifications, then GameManager
+  create/join for two clients and the peer address exchange.
