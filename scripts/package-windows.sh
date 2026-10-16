@@ -79,6 +79,10 @@ cp tools/gen_import_names.py tools/ufc3_server.py tools/blaze_tdf.py tools/ufc3_
 # Community patches only: not the disabled CTR file, not shader dumps taken from the game.
 mkdir -p "$stage/patches"
 find patches -maxdepth 1 -type f -name '*.xml' -exec cp {} "$stage/patches/" \;
+# The launcher's 2K / 4K experiments (UFC-45/46): each folder's patch and its patches json.
+find patches/experiments -mindepth 2 -maxdepth 2 -type f \( -name '*.xml' -o -name '*.json' \) | while read -r f; do
+    mkdir -p "$stage/$(dirname "$f")"; cp "$f" "$stage/$f"
+done
 cp "$root/downloads/aerolib.inl" "$stage/share/aerolib.inl"
 cp share/skip_movie.mkv "$stage/share/skip_movie.mkv"
 cp LICENSE "$stage/LICENSE"; cp "$root/bin/VERSION" "$stage/VERSION"

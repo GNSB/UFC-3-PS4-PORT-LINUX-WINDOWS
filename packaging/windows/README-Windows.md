@@ -34,7 +34,10 @@ your own dump of the game and its 1.14 update.
   `192.168.1.20`. Empty (the default) plays offline. See *Online (experimental)* below.
 - **Controls...** — keyboard keys (click, then press the key) and gamepad buttons for every PS4
   input. The keyboard and a gamepad work together.
-- **Game resolution** — 720p / 1080p, what the game renders.
+- **Game resolution** — 720p / 1080p, what the game renders, or **2560x1440 (2K, experimental)** /
+  **3840x2160 (4K, experimental)**: PS4 Pro mode (forced on) with a 4K output and the scene patch
+  in `patches\experiments\` (it replaces the community patches for that run). In the game choose
+  **VIDEO -> Favor Resolution**: the scene only grows with it. Heavier on the GPU.
 - **Display resolution** — the window size: 1080p, 1440p (2K) or 4K. The game's 1080p frame is
   scaled to it; use **Upscaling = AMD FSR 1.0** and some **Sharpening** for a sharp image. In
   fullscreen the monitor's size is used.

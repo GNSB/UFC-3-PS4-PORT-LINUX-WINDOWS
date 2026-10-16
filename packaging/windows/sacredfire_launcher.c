@@ -20,6 +20,11 @@
  * when started from one.
  * Command line: `--play` starts the game at once with the saved settings and no window (Steam
  * shortcuts); `--game <folder>` sets the folder; other arguments go to the game.
+ * Look (UFC-28): the colours of the UFC 3 retail cover (near-black, gold, UFC red for Play/Stop),
+ * owner-drawn buttons and check boxes, sections drawn by the window; the banner shows the game's
+ * own sce_sys\icon0.png (or pic1.png) read with WIC from the user's dump: no EA art is shipped.
+ * Game resolution 2K / 4K (experimental, UFC-45/46): PS4 Pro with a 3840x2160 VideoOut and the
+ * scene patch of patches\experiments\ufc46-1440p / ufc45-4k; in game: VIDEO -> Favor Resolution.
  * Data (generated files, saves, shader cache, bbport.ini, logs): %LOCALAPPDATA%\SacredFire, or
  * BB_DATA_DIR; BB_DATA_DIR=. keeps everything beside the executable. UTF-8 inside (the manifest
  * selects the UTF-8 code page), UTF-16 at the Win32 calls. */
@@ -36,6 +41,7 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <tlhelp32.h>
+#include <wincodec.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,8 +76,14 @@ typedef struct {
 } Settings;
 static Settings settings = {.resolution = 1, .fps_mode = 5, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
 /* Choices of the Video panel (index = the saved value). */
-static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080"};
-static const wchar_t *const resolution_w[] = {L"1280", L"1920"}, *const resolution_h[] = {L"720", L"1080"};
+static const wchar_t *const resolution_names[] = {L"1280x720", L"1920x1080", L"2560x1440 (2K, experimental)", L"3840x2160 (4K, experimental)"};
+/* 2K and 4K (UFC-45/46, validated on Linux): PS4 Pro with a 3840x2160 VideoOut in both, and the
+ * experiment's patch (patches\experiments\<dir>, its own patches json) turning the game's
+ * 3200x1800 Favor Resolution scene into 2560x1440 / 3840x2160. The scene only grows with
+ * VIDEO -> Favor Resolution chosen in the game. */
+static const wchar_t *const resolution_w[] = {L"1280", L"1920", L"3840", L"3840"}, *const resolution_h[] = {L"720", L"1080", L"2160", L"2160"};
+static const wchar_t *const resolution_experiment[] = {NULL, NULL, L"ufc46-1440p", L"ufc45-4k"};
+static const wchar_t *const resolution_experiment_config[] = {NULL, NULL, L"patches-1440p.json", L"patches-4k.json"};
 static const wchar_t *const display_names[] = {L"Same as the game", L"1920x1080 (Full HD)", L"2560x1440 (2K)", L"3840x2160 (4K)"};
 static const wchar_t *const display_sizes[] = {NULL, L"1920x1080", L"2560x1440", L"3840x2160"};
 static const wchar_t *const fps_names[] = {L"60 FPS", L"90 FPS", L"120 FPS", L"144 FPS", L"240 FPS", L"Unlimited"};
@@ -113,7 +125,7 @@ static const wchar_t *const managed_env[] = {
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
     L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
     L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
-    L"BB_LANGUAGE", L"BB_ONLINE_SERVER", L"BB_FRAME_LOG", L"BB_READBACK_LOG",
+    L"BB_LANGUAGE", L"BB_ONLINE_SERVER", L"BB_FRAME_LOG", L"BB_READBACK_LOG", L"BB_PATCHES_DIR", L"BB_PATCHES_CONFIG",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
 static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
@@ -833,9 +845,22 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     if (script(L"tools", L"gen_import_names.py", names_args, 4, NULL, 0)) { fail(L"gen_import_names.py failed (see the log)"); return 2; }
     const wchar_t *content_args[] = {game, L"--out", out, L"--sku", env_or(L"BB_CONTENT_SKU", L"full")};
     if (script(L"scripts", L"content_profile.py", content_args, 5, NULL, 0)) { fail(L"content_profile.py failed (see the log)"); return 2; }
+    /* 2K / 4K: the experiment's folder and json instead of the community patches (as
+     * tools/ufc45-4k-test.sh and ufc46-1440p-test.sh run them); a BB_PATCHES_DIR or
+     * BB_PATCHES_CONFIG the launcher was started with wins. */
+    const wchar_t *experiment = resolution_experiment[settings.resolution];
     wchar_t patches_dir[PATHW], patches_config[PATHW];
-    join(patches_dir, PATHW, root, L"patches"); join(patches_config, PATHW, data, L"patches.json");
-    const wchar_t *patch_args[] = {L"--patches-dir", env_or(L"BB_PATCHES_DIR", patches_dir), L"--patches-config", env_or(L"BB_PATCHES_CONFIG", patches_config),
+    if (experiment) {
+        join(patches_dir, PATHW, root, L"patches\\experiments"); join(patches_dir, PATHW, patches_dir, experiment);
+        join(patches_config, PATHW, patches_dir, resolution_experiment_config[settings.resolution]);
+        if (!given_env(L"BB_PATCHES_CONFIG") && !exists(patches_config)) {
+            wchar_t m[PATHW + 128]; _snwprintf(m, PATHW + 128, L"%ls is missing: the package is incomplete (2K / 4K need it).", patches_config);
+            m[PATHW + 127] = 0; fail(m); return 2;
+        }
+    } else { join(patches_dir, PATHW, root, L"patches"); join(patches_config, PATHW, data, L"patches.json"); }
+    const wchar_t *patches_dir_used = given_env(L"BB_PATCHES_DIR") ? given_env(L"BB_PATCHES_DIR") : patches_dir;
+    const wchar_t *patches_config_used = given_env(L"BB_PATCHES_CONFIG") ? given_env(L"BB_PATCHES_CONFIG") : patches_config;
+    const wchar_t *patch_args[] = {L"--patches-dir", patches_dir_used, L"--patches-config", patches_config_used,
                                    L"--app-version", L"01.14", L"--title-id", L"CUSA06534", L"--out", out, L"--settings", config};
     if (script(L"scripts", L"patches.py", patch_args, 12, NULL, 0)) { fail(L"patches.py failed (see the log)"); return 2; }
     /* The count of guest TCB loads the linker rewrote (link.json fs_loads_patched): the game
@@ -885,7 +910,7 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
      * the rate. Z16+S8 shadow data uploaded from memory is kept as D16 (stencil dropped). */
     /* PS4 Pro mode: the game renders its scene at 1080p instead of 900p (CMask reads are
      * answered as uncompressed by the runtime). */
-    game_env(L"BB_NEO", settings.neo ? L"1" : L"0");
+    game_env(L"BB_NEO", settings.neo || experiment ? L"1" : L"0"); /* 2K / 4K: always Pro (its 4K VideoOut) */
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
     /* Write windows off by default on Windows: with them on, Windows corrupts the game's heap
      * (crashes loading the second fight or signing the career contract). Five cases so far:
@@ -932,6 +957,9 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
         const wchar_t *server = env_or(L"BB_ONLINE_SERVER", L"");
         if (server[0]) logw(L"UFC 3: online server %ls (BB_ONLINE_SERVER)\n", server); else logw(L"UFC 3: offline (no BB_ONLINE_SERVER)\n");
     }
+    if (experiment)
+        logw(L"4K/2K experimental: in game choose VIDEO -> Favor Resolution (the scene grows only with it). %ls scene, PS4 Pro %ls, "
+             L"patches %ls\n", resolution_names[settings.resolution], env_or(L"BB_NEO", L"?"), patches_dir_used);
     logw(L"UFC 3: window %ls, FSR 1.0 %ls, RCAS %ls (attenuation %ls), readbacks %ls (2 = precise)\n",
          env_or(L"BB_WINDOW_SIZE", L"= output"), env_or(L"BB_FSR1", L"0"), env_or(L"BB_RCAS", L"?"), env_or(L"BB_RCAS_ATTENUATION", L"?"), env_or(L"BB_READBACKS", L"?"));
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
@@ -1157,7 +1185,7 @@ enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_ONLINE, ID_MODE, ID_
 static HWND controls[ID_LAST - 100];
 static int running;
 static float scale = 1.0f;
-static HFONT ui_font; /* the system's message font at the system DPI (scales with it) */
+static HFONT ui_font; /* Segoe UI at the system DPI (the Controls window uses it too) */
 static int sx(int v) { return (int)(v * scale + 0.5f); }
 static HWND make(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
     HWND h_wnd = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, sx(x), sx(y), sx(w), sx(h), main_window, (HMENU)(INT_PTR)id,
@@ -1167,8 +1195,246 @@ static HWND make(const wchar_t *cls, const wchar_t *text, DWORD style, int x, in
     return h_wnd;
 }
 static HWND control(int id) { return controls[id - 100]; }
-static int checked(int id) { return SendMessageW(control(id), BM_GETCHECK, 0, 0) == BST_CHECKED; }
-static void set_checked(int id, int on) { SendMessageW(control(id), BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0); }
+
+/* ---- the look: the UFC 3 retail cover (near-black stadium, gold belts, UFC red) ----
+ * The window paints the background, the banner and the sections; statics, edits and lists take
+ * their colours from WM_CTLCOLOR*; buttons and check boxes are owner-drawn (the themed ones
+ * ignore text colours). Red is for Play and Stop only. */
+#define HEX(v) RGB(((v) >> 16) & 255, ((v) >> 8) & 255, (v) & 255)
+#define C_BACKGROUND HEX(0x0B0B0D)
+#define C_PANEL HEX(0x16161A)
+#define C_BORDER HEX(0x2A2A30)
+#define C_INPUT HEX(0x1F1F25)
+#define C_LOG HEX(0x101013)
+#define C_GOLD HEX(0xC9A24A)
+#define C_GOLD_LIGHT HEX(0xE8C872)
+#define C_TEXT HEX(0xF2F2F2)
+#define C_TEXT_DIM HEX(0xA0A0A8)
+#define C_TEXT_OFF HEX(0x5C5C66)
+#define C_RED HEX(0xD20A0A)
+enum { CLIENT_W = 900, CLIENT_H = 884, BANNER_H = 120 };
+/* The sections, at 96 DPI (sx scales them). */
+static const struct { int x, y, w, h; const wchar_t *title; } panels[] = {
+    {16, 134, 426, 214, L"GAME"}, {16, 360, 426, 220, L"ONLINE"},
+    {458, 134, 426, 330, L"VIDEO"}, {458, 476, 426, 104, L"ADVANCED"},
+    {16, 592, 868, 88, L"LOGS"}};
+static HBRUSH brush_background, brush_panel, brush_input, brush_log;
+static HFONT font_section, font_title, font_small, font_log, font_action;
+static int hot_id;                       /* the owner-drawn button under the mouse */
+static unsigned char check_state[ID_LAST - 100], is_check[ID_LAST - 100];
+static HWND notes[8]; static int note_count; /* secondary text */
+static HBITMAP banner_art; static int banner_art_w, banner_art_h;
+static int checked(int id) { return check_state[id - 100]; }
+static void set_checked(int id, int on) {
+    if (check_state[id - 100] == !!on) return;
+    check_state[id - 100] = (unsigned char)!!on;
+    InvalidateRect(control(id), NULL, FALSE);
+}
+static HFONT make_font(int height, int weight, const wchar_t *face) {
+    LOGFONTW f = {.lfHeight = -sx(height), .lfWeight = weight, .lfCharSet = DEFAULT_CHARSET, .lfQuality = CLEARTYPE_QUALITY};
+    wcsncpy(f.lfFaceName, face, LF_FACESIZE - 1);
+    return CreateFontIndirectW(&f);
+}
+/* uxtheme / dwmapi, loaded when present: dark scroll bars and lists, a dark title bar. */
+static HRESULT (WINAPI *p_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
+static void dark_theme(HWND h, const wchar_t *name) { if (p_SetWindowTheme) p_SetWindowTheme(h, name, NULL); }
+static void theme_load(HWND window) {
+    HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+    if (ux) { FARPROC f = GetProcAddress(ux, "SetWindowTheme"); if (f) memcpy(&p_SetWindowTheme, &f, sizeof f); }
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    FARPROC f = dwm ? GetProcAddress(dwm, "DwmSetWindowAttribute") : NULL;
+    if (!f) return;
+    HRESULT (WINAPI *set)(HWND, DWORD, LPCVOID, DWORD); memcpy(&set, &f, sizeof f);
+    const BOOL dark = TRUE; const COLORREF caption = C_BACKGROUND, border = C_BORDER;
+    if (FAILED(set(window, 20, &dark, sizeof dark))) set(window, 19, &dark, sizeof dark); /* DWMWA_USE_IMMERSIVE_DARK_MODE */
+    set(window, 35, &caption, sizeof caption); set(window, 34, &border, sizeof border); /* Windows 11: caption / border colour */
+}
+static void fill(HDC dc, RECT r, COLORREF c) { SetDCBrushColor(dc, c); FillRect(dc, &r, GetStockObject(DC_BRUSH)); }
+static void rounded(HDC dc, RECT r, COLORREF face, COLORREF border, int width, int radius) {
+    HPEN pen = CreatePen(PS_INSIDEFRAME, width, border); HBRUSH brush = CreateSolidBrush(face);
+    HGDIOBJ old_pen = SelectObject(dc, pen), old_brush = SelectObject(dc, brush);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(dc, old_pen); SelectObject(dc, old_brush); DeleteObject(pen); DeleteObject(brush);
+}
+/* The banner: a warm stadium glow at the top fading into the background. */
+static COLORREF banner_color(int y) {
+    const int h = sx(BANNER_H), t = y < 0 ? 0 : y > h ? h : y;
+    return RGB(0x24 + (0x0B - 0x24) * t / h, 0x1D + (0x0B - 0x1D) * t / h, 0x12 + (0x0D - 0x12) * t / h);
+}
+/* <game>\sce_sys\icon0.png (or pic1.png) of the user's dump, scaled with WIC and laid over the
+ * banner's colours once; nothing when the folder has neither. */
+static void banner_load(const wchar_t *game) {
+    if (banner_art) { DeleteObject(banner_art); banner_art = NULL; }
+    static const wchar_t *const names[] = {L"sce_sys\\icon0.png", L"sce_sys\\pic1.png"};
+    wchar_t path[PATHW]; int found = 0;
+    for (int i = 0; i < COUNT(names) && game[0] && !found; ++i) { join(path, PATHW, game, names[i]); found = exists(path); }
+    if (!found) return;
+    IWICImagingFactory *factory = NULL; IWICBitmapDecoder *decoder = NULL; IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapScaler *scaler = NULL; IWICFormatConverter *converter = NULL;
+    unsigned char *pixels = NULL; UINT w = 0, h = 0, tw = 0, th = 0;
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&factory))) return;
+    if (SUCCEEDED(factory->lpVtbl->CreateDecoderFromFilename(factory, path, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) &&
+        SUCCEEDED(decoder->lpVtbl->GetFrame(decoder, 0, &frame)) && SUCCEEDED(frame->lpVtbl->GetSize(frame, &w, &h)) && w && h) {
+        th = (UINT)sx(BANNER_H - 24); tw = w * th / h;                         /* icon0: square; pic1: 16:9 */
+        if (tw > (UINT)sx(190)) { tw = (UINT)sx(190); th = h * tw / w; }
+        if (tw && th && SUCCEEDED(factory->lpVtbl->CreateBitmapScaler(factory, &scaler)) &&
+            SUCCEEDED(scaler->lpVtbl->Initialize(scaler, (IWICBitmapSource *)frame, tw, th, WICBitmapInterpolationModeFant)) &&
+            SUCCEEDED(factory->lpVtbl->CreateFormatConverter(factory, &converter)) &&
+            SUCCEEDED(converter->lpVtbl->Initialize(converter, (IWICBitmapSource *)scaler, &GUID_WICPixelFormat32bppPBGRA,
+                                                    WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom)) &&
+            (pixels = malloc((size_t)tw * th * 4)) &&
+            SUCCEEDED(converter->lpVtbl->CopyPixels(converter, NULL, tw * 4, tw * th * 4, pixels))) {
+            BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER), .biWidth = (LONG)tw, .biHeight = -(LONG)th, .biPlanes = 1,
+                                             .biBitCount = 32, .biCompression = BI_RGB}};
+            void *bits = NULL;
+            banner_art = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+            if (banner_art && bits) {
+                const int top = (sx(BANNER_H) - (int)th) / 2;
+                unsigned char *out = bits;
+                for (UINT y = 0; y < th; ++y) {
+                    const COLORREF bg = banner_color(top + (int)y);
+                    for (UINT x = 0; x < tw; ++x) {
+                        const unsigned char *p = pixels + ((size_t)y * tw + x) * 4; unsigned char *o = out + ((size_t)y * tw + x) * 4;
+                        const int a = 255 - p[3]; /* premultiplied over the banner */
+                        o[0] = (unsigned char)(p[0] + GetBValue(bg) * a / 255); o[1] = (unsigned char)(p[1] + GetGValue(bg) * a / 255);
+                        o[2] = (unsigned char)(p[2] + GetRValue(bg) * a / 255); o[3] = 255;
+                    }
+                }
+                banner_art_w = (int)tw; banner_art_h = (int)th;
+            } else if (banner_art) { DeleteObject(banner_art); banner_art = NULL; }
+        }
+    }
+    free(pixels);
+    if (converter) converter->lpVtbl->Release(converter);
+    if (scaler) scaler->lpVtbl->Release(scaler);
+    if (frame) frame->lpVtbl->Release(frame);
+    if (decoder) decoder->lpVtbl->Release(decoder);
+    factory->lpVtbl->Release(factory);
+}
+static void paint_window(HDC dc, RECT client) {
+    fill(dc, client, C_BACKGROUND);
+    SetBkMode(dc, TRANSPARENT);
+    /* The banner. */
+    const int banner_h = sx(BANNER_H);
+    for (int y = 0; y < banner_h; ++y) fill(dc, (RECT){0, y, client.right, y + 1}, banner_color(y));
+    int text_x = sx(24);
+    if (banner_art) {
+        const int top = (banner_h - banner_art_h) / 2;
+        HDC art = CreateCompatibleDC(dc); HGDIOBJ old = SelectObject(art, banner_art);
+        BitBlt(dc, sx(16), top, banner_art_w, banner_art_h, art, 0, 0, SRCCOPY);
+        SelectObject(art, old); DeleteDC(art);
+        SetDCPenColor(dc, C_GOLD); HGDIOBJ old_pen = SelectObject(dc, GetStockObject(DC_PEN)), old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, sx(16) - 1, top - 1, sx(16) + banner_art_w + 1, top + banner_art_h + 1);
+        SelectObject(dc, old_pen); SelectObject(dc, old_brush);
+        text_x = sx(16) + banner_art_w + sx(22);
+    }
+    RECT t = {text_x, sx(26), client.right - sx(16), sx(66)};
+    SelectObject(dc, font_title); SetTextColor(dc, C_GOLD);
+    DrawTextW(dc, L"EA SPORTS UFC 3 \x2014 native PC port", -1, &t, DT_SINGLELINE | DT_LEFT | DT_BOTTOM | DT_NOPREFIX | DT_END_ELLIPSIS);
+    char version[64]; read_version(version, sizeof(version));
+    wchar_t line[160]; _snwprintf(line, 160, L"PS4 CUSA06534 \x00B7 SacredFire %hs \x00B7 your own game dump required", version); line[159] = 0;
+    t.top = sx(70); t.bottom = sx(90);
+    SelectObject(dc, ui_font); SetTextColor(dc, C_TEXT_DIM);
+    DrawTextW(dc, line, -1, &t, DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+#ifdef UFC3_DIAGNOSTIC_PACKAGE
+    t.top = sx(92); t.bottom = sx(112); SetTextColor(dc, C_RED);
+    DrawTextW(dc, L"Windows diagnostic test: write windows + audit forced, data in diagnostic-data", -1, &t, DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+#endif
+    fill(dc, (RECT){0, banner_h - sx(2), client.right, banner_h}, C_GOLD);
+    /* The sections: a panel, a gold bar and the title. */
+    SelectObject(dc, font_section);
+    for (int i = 0; i < COUNT(panels); ++i) {
+        RECT r = {sx(panels[i].x), sx(panels[i].y), sx(panels[i].x + panels[i].w), sx(panels[i].y + panels[i].h)};
+        rounded(dc, r, C_PANEL, C_BORDER, 1, sx(10));
+        fill(dc, (RECT){r.left + sx(12), r.top + sx(10), r.left + sx(15), r.top + sx(26)}, C_GOLD);
+        RECT title = {r.left + sx(22), r.top + sx(8), r.right - sx(12), r.top + sx(28)};
+        SetTextColor(dc, C_GOLD);
+        DrawTextW(dc, panels[i].title, -1, &title, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_NOPREFIX);
+    }
+}
+/* Owner-drawn: Play (red, gold border), Stop (red outline), the other buttons (dark, gold on
+ * hover) and the check boxes (gold when on). */
+static void draw_button(const DRAWITEMSTRUCT *d) {
+    const int id = (int)d->CtlID;
+    HDC dc = d->hDC; RECT r = d->rcItem;
+    const int enabled = !(d->itemState & ODS_DISABLED), pressed = (d->itemState & ODS_SELECTED) != 0, hot = enabled && hot_id == id;
+    const int on_panel = id != ID_PLAY && id != ID_STOP && id != ID_STEAM;
+    fill(dc, r, on_panel ? C_PANEL : C_BACKGROUND);
+    wchar_t text[128]; GetWindowTextW(d->hwndItem, text, COUNT(text));
+    SetBkMode(dc, TRANSPARENT);
+    const int focus = (d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT);
+    if (id >= 100 && id < ID_LAST && is_check[id - 100]) {
+        const int on = check_state[id - 100], box = sx(16), top = r.top + (r.bottom - r.top - box) / 2;
+        RECT b = {r.left + 1, top, r.left + 1 + box, top + box};
+        rounded(dc, b, on ? (enabled ? C_GOLD : C_BORDER) : C_INPUT, !enabled ? C_BORDER : hot || on ? C_GOLD_LIGHT : HEX(0x4A4A52), 1, sx(4));
+        if (on) {
+            HPEN pen = CreatePen(PS_SOLID, sx(2), enabled ? C_BACKGROUND : C_TEXT_DIM); HGDIOBJ old = SelectObject(dc, pen);
+            const POINT mark[] = {{b.left + sx(4), b.top + sx(8)}, {b.left + sx(7), b.bottom - sx(4)}, {b.right - sx(4), b.top + sx(4)}};
+            Polyline(dc, mark, 3);
+            SelectObject(dc, old); DeleteObject(pen);
+        }
+        RECT t = r; t.left = b.right + sx(8);
+        SelectObject(dc, ui_font); SetTextColor(dc, !enabled ? C_TEXT_OFF : hot ? C_GOLD_LIGHT : C_TEXT);
+        DrawTextW(dc, text, -1, &t, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (focus) {
+            RECT f = t; DrawTextW(dc, text, -1, &f, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_CALCRECT);
+            OffsetRect(&f, 0, (r.bottom - r.top - (f.bottom - f.top)) / 2 - (f.top - r.top)); InflateRect(&f, sx(2), 0); DrawFocusRect(dc, &f);
+        }
+        return;
+    }
+    COLORREF face, border, ink; int width = 1; HFONT font = ui_font;
+    if (id == ID_PLAY) {
+        face = !enabled ? HEX(0x3A1416) : pressed ? HEX(0xA00808) : hot ? HEX(0xE81C1C) : C_RED;
+        border = !enabled ? C_BORDER : hot ? C_GOLD_LIGHT : C_GOLD; ink = enabled ? C_TEXT : C_TEXT_DIM; width = sx(2); font = font_action;
+    } else if (id == ID_STOP) {
+        face = !enabled ? C_BACKGROUND : pressed ? HEX(0x3A0A0A) : hot ? HEX(0x260C0C) : C_BACKGROUND;
+        border = enabled ? C_RED : C_BORDER; ink = enabled ? HEX(0xFF4040) : C_TEXT_OFF; width = sx(2); font = font_action;
+    } else {
+        face = !enabled ? C_PANEL : pressed ? HEX(0x101014) : hot ? HEX(0x26262E) : C_INPUT;
+        border = !enabled ? C_BORDER : hot ? C_GOLD_LIGHT : HEX(0x3A3A42); ink = !enabled ? C_TEXT_OFF : hot ? C_GOLD_LIGHT : C_TEXT;
+    }
+    rounded(dc, r, face, border, width, sx(8));
+    SelectObject(dc, font); SetTextColor(dc, ink);
+    DrawTextW(dc, text, -1, &r, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    if (focus) { RECT f = r; InflateRect(&f, -sx(4), -sx(4)); DrawFocusRect(dc, &f); }
+}
+/* Hover for the owner-drawn buttons. */
+static LRESULT CALLBACK hover_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id, DWORD_PTR data_unused) {
+    (void)data_unused;
+    if (message == WM_MOUSEMOVE && hot_id != (int)id) {
+        const int previous = hot_id; hot_id = (int)id;
+        TRACKMOUSEEVENT track = {.cbSize = sizeof(track), .dwFlags = TME_LEAVE, .hwndTrack = window};
+        TrackMouseEvent(&track);
+        if (previous >= 100 && previous < ID_LAST && control(previous)) InvalidateRect(control(previous), NULL, FALSE);
+        InvalidateRect(window, NULL, FALSE);
+    } else if (message == WM_MOUSELEAVE && hot_id == (int)id) { hot_id = 0; InvalidateRect(window, NULL, FALSE); }
+    else if (message == WM_NCDESTROY) RemoveWindowSubclass(window, hover_proc, id);
+    return DefSubclassProc(window, message, wparam, lparam);
+}
+/* The window's controls, at 96 DPI. */
+static HWND label(const wchar_t *text, int x, int y, int w) { return make(L"STATIC", text, SS_CENTERIMAGE | SS_NOPREFIX, x, y, w, 24, 0); }
+static HWND note(const wchar_t *text, int x, int y, int w, int h) {
+    HWND n = make(L"STATIC", text, SS_NOPREFIX, x, y, w, h, 0);
+    SendMessageW(n, WM_SETFONT, (WPARAM)font_small, TRUE);
+    if (note_count < COUNT(notes)) notes[note_count++] = n;
+    return n;
+}
+static HWND button(const wchar_t *text, int x, int y, int w, int h, int id) {
+    HWND b = make(L"BUTTON", text, BS_OWNERDRAW | WS_TABSTOP, x, y, w, h, id);
+    SetWindowSubclass(b, hover_proc, (UINT_PTR)id, 0);
+    return b;
+}
+static HWND checkbox(const wchar_t *text, int x, int y, int w, int id) { is_check[id - 100] = 1; return button(text, x, y, w, 22, id); }
+static HWND combo(int x, int y, int w, int id, int editable) {
+    HWND c = make(L"COMBOBOX", L"", (editable ? CBS_DROPDOWN | CBS_AUTOHSCROLL : CBS_DROPDOWNLIST) | WS_VSCROLL | WS_TABSTOP, x, y, w, 300, id);
+    dark_theme(c, L"DarkMode_CFD");
+    return c;
+}
+static HWND edit(const wchar_t *text, int x, int y, int w, int id) {
+    HWND e = make(L"EDIT", text, WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, x, y, w, 24, id);
+    dark_theme(e, L"DarkMode_CFD");
+    return e;
+}
 static void fill_gamepads(void) {
     HWND combo = control(ID_GAMEPAD);
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
@@ -1386,6 +1652,15 @@ static void online_controls(void) {
     EnableWindow(control(ID_HOSTSCAN), !running && mode == ONLINE_HOST);
     EnableWindow(control(ID_COPYHOST), mode == ONLINE_HOST);
 }
+/* 2K / 4K run in PS4 Pro mode: the box shows it on and locked; the user's own choice (neo_user)
+ * comes back with 720p / 1080p and is what sacredfire.ini keeps. */
+static int neo_user;
+static void video_controls(void) {
+    const int r = clampi((int)SendMessageW(control(ID_RESOLUTION), CB_GETCURSEL, 0, 0), COUNT(resolution_names));
+    const int forced = resolution_experiment[r] != NULL;
+    set_checked(ID_NEO, forced || neo_user);
+    EnableWindow(control(ID_NEO), !running && !forced);
+}
 static void fill_host_addresses(void) {
     wchar_t current[256]; GetWindowTextW(control(ID_HOST), current, COUNT(current));
     if (!current[0]) wcsncpy(current, settings.host_address, COUNT(current)-1);
@@ -1427,7 +1702,7 @@ static void read_controls(void) {
     address_token(host, settings.host_address, COUNT(settings.host_address));
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
-    settings.fullscreen = checked(ID_FULLSCREEN); settings.neo = checked(ID_NEO); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
+    settings.fullscreen = checked(ID_FULLSCREEN); settings.neo = neo_user; settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
     settings.validation = checked(ID_VALIDATION); settings.frame_stats = checked(ID_STATS); settings.menu_trace = checked(ID_TRACE);
     settings.resolution = clampi((int)SendMessageW(control(ID_RESOLUTION), CB_GETCURSEL, 0, 0), COUNT(resolution_names));
     settings.fps_mode = clampi((int)SendMessageW(control(ID_FPS), CB_GETCURSEL, 0, 0), COUNT(fps_names));
@@ -1504,15 +1779,30 @@ static void set_running(int on) {
     for (int id = ID_GAME; id <= ID_LOGDIR_BROWSE; ++id) EnableWindow(control(id), !on);
     EnableWindow(control(ID_STEAM), !on);
     online_controls();
+    video_controls();
 }
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
     case WM_COMMAND: {
-        const int id = LOWORD(wparam);
-        if (id == ID_MODE && HIWORD(wparam) == CBN_SELCHANGE) online_controls();
+        const int id = LOWORD(wparam), code = HIWORD(wparam);
+        /* Owner-drawn check boxes toggle themselves (a quick second click arrives as a double click). */
+        if (id >= 100 && id < ID_LAST && is_check[id - 100]) {
+            if (code == BN_CLICKED || code == BN_DOUBLECLICKED) { set_checked(id, !checked(id)); if (id == ID_NEO) neo_user = checked(id); }
+            return 0;
+        }
+        if (code == BN_DOUBLECLICKED) return 0;
+        if (id == ID_RESOLUTION && code == CBN_SELCHANGE) video_controls();
+        else if (id == ID_GAME && code == EN_KILLFOCUS) {
+            wchar_t folder[PATHW]; GetWindowTextW(control(ID_GAME), folder, PATHW); trimw(folder);
+            banner_load(folder); RECT banner = {0, 0, sx(CLIENT_W), sx(BANNER_H)}; InvalidateRect(window, &banner, FALSE);
+        }
+        else if (id == ID_MODE && code == CBN_SELCHANGE) online_controls();
         else if (id == ID_HOSTSCAN && !running) fill_host_addresses();
         else if (id == ID_COPYHOST) copy_host_address();
-        else if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(L"The game folder (CUSA06534; CUSA06534-patch beside it is merged automatically)", folder)) SetWindowTextW(control(ID_GAME), folder); }
+        else if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(L"The game folder (CUSA06534; CUSA06534-patch beside it is merged automatically)", folder)) {
+            SetWindowTextW(control(ID_GAME), folder);
+            banner_load(folder); RECT banner = {0, 0, sx(CLIENT_W), sx(BANNER_H)}; InvalidateRect(window, &banner, FALSE);
+        } }
         else if (id == ID_LOGDIR_BROWSE && !running) {
             wchar_t folder[PATHW];
             if (pick_folder(L"The log folder (empty: the data folder's logs)", folder)) {
@@ -1563,6 +1853,32 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         free(text);
         return 0;
     }
+    case WM_ERASEBKGND: return 1; /* WM_PAINT draws everything (double buffered) */
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC screen = BeginPaint(window, &ps);
+        RECT client; GetClientRect(window, &client);
+        HDC dc = CreateCompatibleDC(screen); HBITMAP buffer = CreateCompatibleBitmap(screen, client.right, client.bottom);
+        HGDIOBJ old = SelectObject(dc, buffer);
+        paint_window(dc, client);
+        BitBlt(screen, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old); DeleteObject(buffer); DeleteDC(dc);
+        EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_DRAWITEM: draw_button((const DRAWITEMSTRUCT *)lparam); return TRUE;
+    case WM_CTLCOLORBTN: return (LRESULT)brush_panel;
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: {
+        HDC dc = (HDC)wparam; HWND child = (HWND)lparam;
+        if (child == log_edit) { SetTextColor(dc, HEX(0xD4D4DA)); SetBkColor(dc, C_LOG); return (LRESULT)brush_log; }
+        wchar_t cls[16] = L""; GetClassNameW(child, cls, COUNT(cls));
+        /* Edits, lists and combo boxes (a disabled or read-only edit asks with WM_CTLCOLORSTATIC). */
+        if (message != WM_CTLCOLORSTATIC || !_wcsicmp(cls, L"Edit") || !_wcsicmp(cls, L"ComboBox")) {
+            SetTextColor(dc, IsWindowEnabled(child) ? C_TEXT : C_TEXT_DIM); SetBkColor(dc, C_INPUT); return (LRESULT)brush_input;
+        }
+        int is_note = 0;
+        for (int i = 0; i < note_count; ++i) is_note |= notes[i] == child;
+        SetTextColor(dc, is_note ? C_TEXT_DIM : C_TEXT); SetBkColor(dc, C_PANEL); return (LRESULT)brush_panel;
+    }
     case WM_APP_DONE:
         set_running(0);
         open_log_file(L"launcher.log");
@@ -1587,18 +1903,20 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
     { const UINT dpi = GetDpiForSystem(); scale = (dpi >= 96 && dpi <= 480) ? dpi / 96.0f : 1.0f; }
-    {
-        NONCLIENTMETRICSW metrics = {.cbSize = sizeof(metrics)};
-        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) ui_font = CreateFontIndirectW(&metrics.lfMessageFont);
-        if (!ui_font) ui_font = GetStockObject(DEFAULT_GUI_FONT);
-    }
+    ui_font = make_font(13, FW_NORMAL, L"Segoe UI");
+    if (!ui_font) ui_font = GetStockObject(DEFAULT_GUI_FONT);
+    font_section = make_font(13, FW_BOLD, L"Segoe UI"); font_title = make_font(28, FW_BOLD, L"Segoe UI");
+    font_small = make_font(12, FW_NORMAL, L"Segoe UI"); font_action = make_font(16, FW_BOLD, L"Segoe UI");
+    font_log = make_font(12, FW_NORMAL, L"Consolas");
+    brush_background = CreateSolidBrush(C_BACKGROUND); brush_panel = CreateSolidBrush(C_PANEL);
+    brush_input = CreateSolidBrush(C_INPUT); brush_log = CreateSolidBrush(C_LOG);
     WNDCLASSW wc = {.lpfnWndProc = window_proc, .hInstance = instance, .hCursor = LoadCursorW(NULL, IDC_ARROW),
-                    .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"UFC3NativeLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
+                    .hbrBackground = brush_background, .lpszClassName = L"UFC3NativeLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
     RegisterClassW(&wc);
-    const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
-    /* The client area is 760x912 at 96 DPI: the window is created, measured, and resized by the
-     * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(912);
+    const DWORD style = (WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
+    /* The client area is CLIENT_W x CLIENT_H at 96 DPI: the window is created, measured, and
+     * resized by the difference (the frame metrics of the running system, whatever they are). */
+    const int client_w = sx(CLIENT_W), client_h = sx(CLIENT_H);
 #ifdef UFC3_DIAGNOSTIC_PACKAGE
     const wchar_t *window_title = L"EA SPORTS UFC 3 - native PC port (Windows diagnostic test)";
 #else
@@ -1607,6 +1925,8 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     main_window = CreateWindowExW(0, wc.lpszClassName, window_title, style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
+    theme_load(main_window);
+    banner_load(settings.game);
     open_log_file(L"launcher.log");
     {
         RECT window_rect, client_rect;
@@ -1618,61 +1938,63 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
              window_rect.right - window_rect.left, window_rect.bottom - window_rect.top, client_rect.right, client_rect.bottom, dw, dh,
              GetDpiForWindow(main_window), GetSystemMetrics(SM_CYCAPTION));
     }
-    int y = 12;
-    make(L"STATIC", L"EA SPORTS UFC 3 (CUSA06534): the game folder (CUSA06534-patch beside it is merged automatically):", 0, 12, y, 640, 18, 0); y += 20;
-    make(L"EDIT", settings.game, WS_BORDER | ES_AUTOHSCROLL, 12, y, 640, 24, ID_GAME);
-    make(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 660, y, 88, 24, ID_BROWSE); y += 34;
-    make(L"STATIC", L"Player name (shown in the game; 16 letters, no accents):", 0, 12, y + 4, 330, 18, 0);
-    make(L"EDIT", settings.player[0] ? settings.player : L"Player 1", WS_BORDER | ES_AUTOHSCROLL, 344, y, 200, 24, ID_PLAYER);
-    SendMessageW(control(ID_PLAYER), EM_SETLIMITTEXT, 16, 0); y += 34;
-    make(L"STATIC", L"Game language (the game's text and menus):", 0, 12, y + 4, 330, 18, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 344, y, 200, 300, ID_LANGUAGE); y += 34;
-    make(L"STATIC", L"Online play", 0, 12, y + 4, 115, 18, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 132, y, 180, 150, ID_MODE);
-    make(L"STATIC", L"Join address", 0, 328, y + 4, 110, 18, 0);
-    make(L"EDIT", settings.join_address, WS_BORDER | ES_AUTOHSCROLL, 440, y, 308, 24, ID_ONLINE); y += 32;
-    make(L"STATIC", L"Host address to share", 0, 12, y + 4, 155, 18, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL, 170, y, 390, 160, ID_HOST);
-    make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 568, y, 80, 24, ID_HOSTSCAN);
-    make(L"BUTTON", L"Copy IP", BS_PUSHBUTTON, 656, y, 92, 24, ID_COPYHOST); y += 28;
-    make(L"STATIC", L"Outside your LAN: both PCs need a VPN; choose this PC's VPN IP. Host starts with Play and stops with the game.", 0, 12, y, 736, 18, 0); y += 24;
-    make(L"STATIC", L"Controller for player 1 (in-game menu: L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 520, 200, ID_GAMEPAD);
-    make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 540, y, 88, 24, ID_RESCAN);
-    make(L"BUTTON", L"Controls...", BS_PUSHBUTTON, 636, y, 112, 24, ID_CONTROLS); y += 34;
-    make(L"BUTTON", L"Video", BS_GROUPBOX, 12, y, 360, 216, 0);
-    make(L"STATIC", L"Game resolution", 0, 24, y + 24, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 20, 200, 200, ID_RESOLUTION);
-    make(L"STATIC", L"Display resolution", 0, 24, y + 56, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 52, 200, 200, ID_DISPLAY);
-    make(L"STATIC", L"Present mode", 0, 24, y + 88, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 84, 200, 200, ID_PRESENT);
-    make(L"STATIC", L"Upscaling", 0, 24, y + 120, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 116, 200, 200, ID_UPSCALER);
-    make(L"STATIC", L"Sharpening (RCAS)", 0, 24, y + 152, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 160, y + 148, 200, 200, ID_SHARPNESS);
-    make(L"BUTTON", L"Fullscreen", BS_AUTOCHECKBOX, 24, y + 184, 120, 20, ID_FULLSCREEN);
-    make(L"BUTTON", L"PS4 Pro mode (sharper)", BS_AUTOCHECKBOX, 160, y + 184, 200, 20, ID_NEO);
-    make(L"BUTTON", L"Frame rate", BS_GROUPBOX, 388, y, 360, 216, 0);
-    make(L"STATIC", L"FPS limit", 0, 400, y + 24, 130, 20, 0);
-    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 536, y + 20, 200, 200, ID_FPS);
-    make(L"BUTTON", L"Show the FPS counter", BS_AUTOCHECKBOX, 400, y + 56, 330, 20, ID_SHOWFPS);
-    make(L"BUTTON", L"Clear the shader cache at start", BS_AUTOCHECKBOX, 400, y + 88, 330, 20, ID_CLEAR);
-    make(L"BUTTON", L"Skip the intro videos (EA logo, first start)", BS_AUTOCHECKBOX, 400, y + 188, 340, 20, ID_SKIPMOVIES);
-    make(L"STATIC", L"2K / 4K: the game draws 900p (1080p in PS4 Pro mode); pick the display resolution\r\n(windowed) or play fullscreen on a 1440p / 4K monitor, with\r\nUpscaling = AMD FSR 1.0 and some sharpening.", 0, 400, y + 120, 340, 56, 0); y += 226;
-    make(L"BUTTON", L"Developer switches", BS_GROUPBOX, 12, y, 736, 48, 0);
-    make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
-    make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
-    make(L"BUTTON", L"Menu input trace", BS_AUTOCHECKBOX, 420, y + 20, 200, 20, ID_TRACE); y += 58;
-    make(L"STATIC", L"Log folder (empty: the data folder's logs; BB_LOG_DIR wins; a shared drive works):", 0, 12, y + 4, 330, 30, 0);
-    make(L"EDIT", settings.log_dir, WS_BORDER | ES_AUTOHSCROLL, 344, y, 304, 24, ID_LOGDIR);
-    make(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 660, y, 88, 24, ID_LOGDIR_BROWSE); y += 34;
-    make(L"BUTTON", L"Play", BS_DEFPUSHBUTTON, 12, y, 120, 30, ID_PLAY);
-    make(L"BUTTON", L"Stop", BS_PUSHBUTTON, 140, y, 90, 30, ID_STOP);
-    make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
-    make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
-    make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 912 - y - 12, ID_LOG);
+    /* GAME (left column; content x 28..430) */
+    int y = 134 + 34;
+    label(L"Game folder (CUSA06534, with CUSA06534-patch beside it)", 28, y, 402); y += 26;
+    edit(settings.game, 28, y, 306, ID_GAME);
+    button(L"Browse...", 342, y, 88, 24, ID_BROWSE); y += 32;
+    label(L"Player name", 28, y, 118);
+    edit(settings.player[0] ? settings.player : L"Player 1", 150, y, 280, ID_PLAYER);
+    SendMessageW(control(ID_PLAYER), EM_SETLIMITTEXT, 16, 0); y += 30;
+    label(L"Language", 28, y, 118); combo(150, y, 280, ID_LANGUAGE, 0); y += 30;
+    label(L"Controller", 28, y, 118); combo(150, y, 280, ID_GAMEPAD, 0); y += 30;
+    note(L"In-game menu: L3+R3 or Insert", 28, y + 4, 190, 18);
+    button(L"Rescan", 226, y, 90, 24, ID_RESCAN);
+    button(L"Controls...", 322, y, 108, 24, ID_CONTROLS);
+    /* ONLINE */
+    y = 360 + 34;
+    label(L"Online play", 28, y, 118); combo(150, y, 280, ID_MODE, 0); y += 30;
+    label(L"Join address", 28, y, 118); edit(settings.join_address, 150, y, 280, ID_ONLINE); y += 30;
+    label(L"Host address", 28, y, 118); combo(150, y, 280, ID_HOST, 1); y += 30;
+    button(L"Rescan", 150, y, 90, 24, ID_HOSTSCAN);
+    button(L"Copy IP", 246, y, 100, 24, ID_COPYHOST); y += 32;
+    note(L"Host: share this PC's address with your friend (Copy IP). Outside your LAN both PCs need a VPN: "
+         L"choose this PC's VPN IP. The server starts with Play and stops with the game.", 28, y, 402, 58);
+    /* VIDEO (right column; content x 470..872) */
+    y = 134 + 34;
+    const struct { const wchar_t *text; int id; } video_rows[] = {
+        {L"Game resolution", ID_RESOLUTION}, {L"Display resolution", ID_DISPLAY}, {L"Present mode", ID_PRESENT},
+        {L"Upscaling", ID_UPSCALER}, {L"Sharpening (RCAS)", ID_SHARPNESS}, {L"FPS limit", ID_FPS}};
+    for (int i = 0; i < COUNT(video_rows); ++i, y += 30) {
+        label(video_rows[i].text, 470, y, 130); combo(604, y, 268, video_rows[i].id, 0);
+        SendMessageW(control(video_rows[i].id), CB_SETDROPPEDWIDTH, (WPARAM)sx(330), 0);
+    }
+    y += 4;
+    checkbox(L"Fullscreen", 470, y, 190, ID_FULLSCREEN); checkbox(L"PS4 Pro mode (sharper)", 672, y, 200, ID_NEO); y += 26;
+    checkbox(L"Show the FPS counter", 470, y, 190, ID_SHOWFPS); checkbox(L"Skip the intro videos", 672, y, 200, ID_SKIPMOVIES); y += 30;
+    note(L"2K / 4K (experimental): PS4 Pro with a 4K output; in game choose VIDEO \x2192 Favor Resolution. "
+         L"720p / 1080p on a large screen: Display resolution with Upscaling = AMD FSR 1.0.", 470, y, 402, 50);
+    /* ADVANCED */
+    y = 476 + 40;
+    checkbox(L"Clear the shader cache at start", 470, y, 210, ID_CLEAR); checkbox(L"Frame statistics", 692, y, 180, ID_STATS); y += 28;
+    checkbox(L"Vulkan validation layer", 470, y, 210, ID_VALIDATION); checkbox(L"Menu input trace", 692, y, 180, ID_TRACE);
+    /* LOGS (full width) */
+    y = 592 + 34;
+    label(L"Log folder", 28, y, 90);
+    edit(settings.log_dir, 122, y, 440, ID_LOGDIR);
+    button(L"Browse...", 570, y, 88, 24, ID_LOGDIR_BROWSE);
+    button(L"Open logs", 666, y, 100, 24, ID_LOGS);
+    button(L"Open data", 772, y, 100, 24, ID_DATA); y += 28;
+    note(L"Empty: the data folder's logs. BB_LOG_DIR wins over it; a shared or network drive works.", 122, y, 750, 18);
+    /* Play / Stop / Steam, then the log of the run. */
+    y = 692;
+    button(L"PLAY", 16, y, 170, 40, ID_PLAY);
+    button(L"STOP", 196, y, 110, 40, ID_STOP);
+    button(L"Add to Steam", 744, y, 140, 40, ID_STEAM); y += 52;
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 16, y, 868, CLIENT_H - y - 16, ID_LOG);
+    SendMessageW(log_edit, WM_SETFONT, (WPARAM)font_log, TRUE);
+    SendMessageW(log_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sx(6), sx(6)));
+    dark_theme(log_edit, L"DarkMode_Explorer");
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
     {
         const struct { int id, count, selected; const wchar_t *const *names; } combos[] = {
@@ -1690,6 +2012,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
             SendMessageW(control(combos[c].id), CB_SETCURSEL, combos[c].selected, 0);
         }
     }
+    neo_user = settings.neo;
     set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_NEO, settings.neo); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads(); fill_host_addresses();
