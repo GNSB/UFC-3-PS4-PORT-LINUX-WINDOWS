@@ -232,8 +232,9 @@ public:
     /// `guest_rip`: the guest instruction that wrote (0: unknown), see BufferCache::NoteCpuWrite.
     /// ufc3: *step = true when the write is to be single-stepped instead (BB_WRITE_STEP).
     bool OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip = 0, bool* step = nullptr);
-    /// ufc3 (BB_WRITE_STEP): CPU bytes a single-stepped write changed on a GPU-written page.
-    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes);
+    /// ufc3 (BB_WRITE_STEP): CPU bytes a single-stepped write changed on a GPU-written page
+    /// (from_window: a closing write window's, BB_WRITE_WINDOW).
+    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);

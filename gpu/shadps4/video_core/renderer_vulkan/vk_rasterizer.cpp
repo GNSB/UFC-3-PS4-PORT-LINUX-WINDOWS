@@ -4367,8 +4367,8 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip, bool
     return true;
 }
 
-void Rasterizer::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes) {
-    buffer_cache.NoteSteppedWrite(addr, std::move(bytes));
+void Rasterizer::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window) {
+    buffer_cache.NoteSteppedWrite(addr, std::move(bytes), from_window);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {

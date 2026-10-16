@@ -58,8 +58,20 @@ public:
     /// Closes every open window (the submitting thread, before the GPU side sees the submission).
     static void CloseWriteWindows();
 
-    /// BB_WRITE_WINDOW_DIAG=1: audit a readback or a skipped upload against active/recent
-    /// window snapshots. Observational only; a matching page does not establish CPU ownership.
+    /// ufc3 (UFC-48): what a buffer readback beginning now may write over: the guest bytes, and
+    /// on a page open in a write window the bytes as the window opened (the CPU's since are kept
+    /// even if the window closes before the readback writes).
+    static void ReadbackSnapshot(VAddr addr, u8* out, u64 size);
+    /// ufc3 (UFC-48): writes a buffer readback's payload to guest memory through `write`, except
+    /// the bytes the CPU changed since the download began (`at_start`: ReadbackSnapshot then,
+    /// or null) or since their page's write window opened. Returns the bytes kept.
+    using ReadbackWriter = void (*)(void* context, VAddr addr, const u8* data, u64 size);
+    static u64 WriteReadback(VAddr addr, const u8* payload, const u8* at_start, u64 size,
+                             ReadbackWriter write, void* context);
+
+    /// BB_WRITE_WINDOW_DIAG=1: audit a readback (after it wrote) or a skipped upload against
+    /// active/recent window snapshots. Observational only; a matching page does not establish
+    /// CPU ownership.
     static void DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip);
     static void DumpWindowFault(void* context);
 

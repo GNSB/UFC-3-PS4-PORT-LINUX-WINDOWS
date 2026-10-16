@@ -192,7 +192,10 @@ public:
     /// the next binding.
     void NoteLateCommandWrite(VAddr addr, const void* data, u64 size);
     /// ufc3 (BB_WRITE_STEP): bytes a single-stepped CPU write changed beside GPU data.
-    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes);
+    /// from_window (BB_WRITE_WINDOW, UFC-48): a closing window's changed words. They are newer
+    /// than the GPU bytes they touch (WindowMerge): those stop being GPU-modified now, and the
+    /// words reach VRAM whole.
+    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window = false);
     /// bbport, without write tracking (any thread): the CPU wrote [addr, addr + size) next to data
     /// the GPU keeps in VRAM. Exactly those bytes are copied into VRAM from the game's memory at the
     /// next binding: no readback of the GPU's data, nothing uploaded over it.
@@ -418,6 +421,7 @@ private:
     std::mutex late_writes_mutex;
     std::vector<std::pair<VAddr, std::vector<u8>>> late_writes;
     std::vector<std::pair<VAddr, std::vector<u8>>> stepped_writes;
+    std::vector<std::pair<VAddr, std::vector<u8>>> window_writes; ///< UFC-48: CPU-owned
     std::vector<std::pair<VAddr, u64>> precise_uploads;
     std::atomic<bool> late_writes_pending{false};
     u64 bind_wait_tick = 0;                            ///< the next arena binds wait for it
