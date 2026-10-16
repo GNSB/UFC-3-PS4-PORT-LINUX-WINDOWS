@@ -52,6 +52,7 @@ cp packaging/linux/ufc3.conf.example packaging/linux/README-Linux.md LICENSE "$s
 cp out/VERSION "$stage/VERSION"
 cp scripts/*.py "$stage/scripts/"; cp tools/gen_import_names.py tools/ufc3_server.py tools/blaze_tdf.py tools/ufc3_auth.py tools/ufc3_games.py "$stage/tools/"
 find patches -maxdepth 1 -type f -name '*.xml' -exec cp {} "$stage/patches/" \;
+[ ! -d patches/experiments ] || cp -r patches/experiments "$stage/patches/"
 cp share/skip_movie.mkv "$stage/share/"
 cp out/windows/downloads/aerolib.inl "$stage/share/aerolib.inl" 2>/dev/null || cp out/aerolib.inl "$stage/share/aerolib.inl"
 cp gpu/third_party/imgui/LICENSE.txt "$stage/licenses/Dear-ImGui-LICENSE.txt"

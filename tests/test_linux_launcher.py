@@ -48,6 +48,36 @@ class LauncherSettingsTests(unittest.TestCase):
                 validate_host(address)
 
 
+class ResolutionTests(unittest.TestCase):
+    def test_4k_experiment_environment(self):
+        env = session_environment(dict(DEFAULTS, resolution='3840x2160'), Path('/tmp'), {})
+        self.assertEqual(env['BB_NEO'], '1')
+        self.assertEqual((env['BB_INTERNAL_WIDTH'], env['BB_INTERNAL_HEIGHT']), ('3840', '2160'))
+        self.assertTrue(env['BB_PATCHES_DIR'].endswith('patches/experiments/ufc45-4k'))
+        self.assertTrue(env['BB_PATCHES_CONFIG'].endswith('ufc45-4k/patches-4k.json'))
+
+    def test_2k_experiment_environment_and_user_exports_win(self):
+        env = session_environment(dict(DEFAULTS, resolution='2560x1440'), Path('/tmp'), {})
+        self.assertEqual(env['BB_NEO'], '1')
+        self.assertEqual((env['BB_INTERNAL_WIDTH'], env['BB_INTERNAL_HEIGHT']), ('2560', '1440'))
+        self.assertTrue(env['BB_PATCHES_DIR'].endswith('patches/experiments/ufc46-1440p'))
+        self.assertTrue(env['BB_PATCHES_CONFIG'].endswith('ufc46-1440p/patches-1440p.json'))
+        exported = session_environment(dict(DEFAULTS, resolution='2560x1440'), Path('/tmp'),
+                                       {'BB_INTERNAL_WIDTH': '1920', 'BB_PATCHES_DIR': '/custom'})
+        self.assertEqual(exported['BB_INTERNAL_WIDTH'], '1920')
+        self.assertEqual(exported['BB_PATCHES_DIR'], '/custom')
+
+    def test_1080p_is_untouched_and_resolution_persists(self):
+        env = session_environment(DEFAULTS, Path('/tmp'), {})
+        self.assertNotIn('BB_INTERNAL_WIDTH', env)
+        self.assertNotIn('BB_PATCHES_DIR', env)
+        self.assertEqual(env['BB_NEO'], '0')
+        with tempfile.TemporaryDirectory() as folder:
+            data = Path(folder)
+            save_settings(data, dict(DEFAULTS, resolution='3840x2160'))
+            self.assertEqual(load_settings(data)['resolution'], '3840x2160')
+
+
 class ServerLifecycleTests(unittest.TestCase):
     def setUp(self):
         addresses = local_addresses()

@@ -12,9 +12,13 @@ import time
 
 TCP_PORTS = (42230, 40443, 40080, 10041, 10744, 17502)
 QOS_PORT = 17502
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULTS = dict(game='', player='Player 1', language='1', mode='offline',
                 join_address='', host_address='', fps='120', fullscreen=False,
-                neo=False, skip_movies=True, present='Mailbox')
+                neo=False, skip_movies=True, present='Mailbox', resolution='1920x1080')
+# Experimental scene patches (UFC-45/UFC-46): resolution -> (patches folder, patches config).
+EXPERIMENTS = {'2560x1440': ('ufc46-1440p', 'patches-1440p.json'),
+               '3840x2160': ('ufc45-4k', 'patches-4k.json')}
 
 
 def data_dir():
@@ -112,11 +116,28 @@ def session_environment(settings, data, inherited=None):
         # Existing environment overrides keep their documented priority.
         if not override:
             env.pop('BB_ONLINE_SERVER', None)
+    resolution = settings.get('resolution', '1920x1080')
+    experiment = EXPERIMENTS.get(resolution)
     for key, value in dict(BB_USER_NAME=settings['player'], BB_LANGUAGE=settings['language'],
                            BB_FPS_LIMIT=settings['fps'], BB_PRESENT_MODE=settings['present'],
-                           BB_FULLSCREEN=str(int(settings['fullscreen'])), BB_NEO=str(int(settings['neo'])),
+                           BB_FULLSCREEN=str(int(settings['fullscreen'])),
+                           BB_NEO=str(int(settings['neo'] or experiment is not None)),
                            BB_SKIP_MOVIES=str(int(settings['skip_movies'])), BB_SAVE_LOG='1').items():
         env.setdefault(key, value)
+    # 1080p is the game's default and needs no variables; 720p and the experiments set the
+    # internal size, and the experiments also need PS4 Pro plus their scene patch (as in
+    # tools/ufc45-4k-test.sh). Variables already exported by the user keep priority.
+    if resolution == '1280x720':
+        env.setdefault('BB_INTERNAL_WIDTH', '1280')
+        env.setdefault('BB_INTERNAL_HEIGHT', '720')
+    elif experiment:
+        folder, config = experiment
+        patches = ROOT / 'patches' / 'experiments' / folder
+        width, height = resolution.split('x')
+        env.setdefault('BB_INTERNAL_WIDTH', width)
+        env.setdefault('BB_INTERNAL_HEIGHT', height)
+        env.setdefault('BB_PATCHES_DIR', str(patches))
+        env.setdefault('BB_PATCHES_CONFIG', str(patches / config))
     env['BB_DATA_DIR'] = str(data)
     return env
 
