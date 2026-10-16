@@ -922,6 +922,11 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(address, size); }
     });
     if (total_size_bytes == 0) {
+        // UFC-48: GPU-modified pages with no GPU bytes left (a write window's close took them
+        // all for the CPU) stop being GPU-modified here too. Left marked, the write fault that
+        // got here marked them CPU-modified as well: write-only protection (an assert on
+        // Windows), and a read fault came back here forever.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         return;
     }
     // UFC-48 (BB_WRITE_WINDOW): a page open in a write window takes CPU writes without a fault,

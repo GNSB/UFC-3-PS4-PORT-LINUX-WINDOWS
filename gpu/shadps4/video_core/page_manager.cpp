@@ -14,6 +14,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/page_watch_perms.h"
 #include "video_core/write_window_merge.h"
 #include <algorithm>
 #include <array>
@@ -541,18 +542,11 @@ struct PageManager::Impl {
         // And buffers cannot overlap, thus only 1 can exist per page.
         u8 num_read_watchers : 1;
 
-        Core::MemoryPermission WritePerm() const noexcept {
-            return num_write_watchers == 0 ? Core::MemoryPermission::Write
-                                           : Core::MemoryPermission::None;
-        }
-
-        Core::MemoryPermission ReadPerm() const noexcept {
-            return num_read_watchers == 0 ? Core::MemoryPermission::Read
-                                          : Core::MemoryPermission::None;
-        }
-
+        // ufc3 (UFC-48): never write-only (PageWatch::FromWatchers).
         Core::MemoryPermission Perms() const noexcept {
-            return ReadPerm() | WritePerm();
+            const auto access = PageWatch::FromWatchers(num_read_watchers, num_write_watchers);
+            return (access.read ? Core::MemoryPermission::Read : Core::MemoryPermission::None) |
+                   (access.write ? Core::MemoryPermission::Write : Core::MemoryPermission::None);
         }
 
         template <s32 delta, bool is_read>
