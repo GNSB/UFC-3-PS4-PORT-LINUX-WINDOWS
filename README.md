@@ -238,6 +238,7 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - **HeuZ** — Windows RTX 4090 logs that located the write-window crash; **pvict** (GitHub) —
   Portuguese testing with `BB_LANGUAGE` that motivated the Windows language selector.
   Thanks to everyone who sent Windows logs and reports.
+- **[Flawlessix](https://www.reddit.com/user/Flawlessix/)** (Reddit) — testing on AMD.
 
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
   [FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), Dear ImGui.
