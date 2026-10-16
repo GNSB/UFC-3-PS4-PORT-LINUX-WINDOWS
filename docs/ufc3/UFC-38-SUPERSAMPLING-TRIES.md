@@ -1,16 +1,18 @@
 # UFC-38 · Supersampling interno → salida 1080: alternativas try-1 / try-2 / try-3
 
-Anexo del informe CTR/UFC (UFC-31/37). Ticket UFC-38, Claude 3, 16 oct 2026. **Tercera pasada**: integra
-la prueba **try-1b** que hicieron el usuario y el Jefe (menú + captura en el ring) y reconcilia todo lo
-anterior con ella. **Solo documentación**: en esta pasada no ejecuté el juego, no compilé, no usé GDB, no
-creé parches, scripts ni configuraciones y no toqué el proceso que sigue corriendo. Leí directamente los
-artefactos de `logs/try1b-pro-options/` del repo principal; no copié ninguno al commit.
+Anexo del informe CTR/UFC (UFC-31/37). Ticket UFC-38, Claude 3, 16 oct 2026. **Cuarta pasada
+(comparativa final)**: integra la prueba **try-1b** (menú + captura en el ring con *Favor Resolution*) y su
+**control *Favor Performance*** hecho en la **misma ejecución** del juego, cambiando solo esa opción.
+**Solo documentación**: no ejecuté el juego, no compilé, no usé GDB, no creé parches, scripts ni
+configuraciones, no hice RE nueva y no toqué el proceso, que sigue corriendo. Leí directamente los artefactos
+de `logs/try1b-pro-options/` del repo principal; no copié ninguno al commit.
 
-**Resultado en una línea.** La opción existe: **VIDEO → RESOLUTION → *Favor Resolution*** (dos valores:
-*Favor Resolution* / *Favor Performance*). Con *Favor Resolution*, Pro y VideoOut 2160, el primer frame
-capturado en el ring renderiza la escena a **3200×1800** y el propio juego la reduce a la salida
-**1920×1080** en el composite final. Eso ya es supersampling 1800→1080 **sin parches**. Falta el control
-*Favor Performance*, la revisión visual, el coste y la estabilidad.
+**Resultado en una línea.** La opción existe: **VIDEO → RESOLUTION** con dos valores, *Favor Resolution*
+y *Favor Performance*. Con Pro + VideoOut 2160, en la misma sesión y cambiando solo esa opción, la escena
+pasa de **3200×1800** (*Resolution*, composite `e5b29094`) a **1920×1080** (*Performance*, composite
+`ddbe162b`). La salida es 1920×1080 sRGB en ambos casos. Es supersampling 1800→1080 **sin parches**,
+controlado por el menú. Siguen pendientes, cada uno por separado, la revisión visual, la estabilidad y el
+coste.
 
 Convenciones de certeza:
 **V** = releído por mí en esta pasada (captura, logs, imágenes, bytes, SPIR-V, código del repo) ·
@@ -28,10 +30,12 @@ Directorio: `/home/myzk/Projects/ufc3-native/logs/try1b-pro-options/` (repo prin
 | Artefacto | Qué contiene (leído por mí) |
 |---|---|
 | `menu-favor-resolution.png` (1834×747) | Pestaña **VIDEO**, única fila **RESOLUTION** = `‹ Favor Resolution ›`; ayuda: *"Select between rendering the game with a smoother framerate or at a higher resolution."* El usuario confirma que solo hay dos valores: *Favor Resolution* y *Favor Performance* |
-| `capture/frame_1792163000.txt` | SHA-256 `62833f1ea7673759b345b1daf9dc35872c84a63b86cf1a4f6c740c972474fb26` (V, coincide). 198 pases `#0..#197` (77 PASS, 121 COMPUTE). `presented buffer 0x109a470000` |
-| `ring-favor-resolution.png` (1920×1080) | Captura **solo de la ventana** del juego en combate: HUD (nombres, stamina, reloj 3:54, aviso de tutorial) y overlay `60 FPS 16.7 ms` del host |
-| `launch-capture.log` | `Frame capture: armed` → `Frame capture: 198 passes written to …/frame_1792163000.txt`; `PS4 Pro mode: 1`; `Window: 1920x1080 … the game's output 1920x1080 scaled to it`; `VideoOut: … frame limit 60 FPS`; `single-stepped writes … off (BB_WRITE_STEP)`; `Patches: 0 writes, 0 bytes applied`; `Settings: …/bbport.ini` (`show_fps=1`) |
-| `launch.log` | Sesión anterior (11:58) con la misma cabecera y sin captura |
+| `capture/frame_1792163000.txt` (12:03) | **Favor Resolution.** SHA-256 `62833f1ea7673759b345b1daf9dc35872c84a63b86cf1a4f6c740c972474fb26` (V, coincide). 198 pases `#0..#197` (77 PASS, 121 COMPUTE). `presented buffer 0x109a470000` |
+| `ring-favor-resolution.png` (1920×1080, 12:03) | Captura **solo de la ventana** del juego en combate: HUD (nombres, stamina, reloj 3:54, aviso de tutorial) y overlay `60 FPS 16.7 ms` del host |
+| `capture/frame_1792163382.txt` (12:09) | **Favor Performance.** SHA-256 `066c85a2ac8091b41fb46e385dfe5915f0fd8b34923248fc3932c62be08e4821` (V, coincide). 201 pases `#0..#200` (77 PASS, 124 COMPUTE). `presented buffer 0x1098490000` |
+| `ring-favor-performance.png` (1920×1080, 12:10) | Ventana del juego en **FIGHT NOW / PAUSE MENU** durante el round 1 (R1 4:18): retratos de los dos luchadores, estadísticas y overlay del host. No es una imagen de combate en vivo ni foto del menú de opciones (no hay `menu-favor-performance.png`) |
+| `launch-capture.log` = `20261016_120119.log` | **Una sola ejecución con las dos capturas**: `Frame capture: 198 passes written to …/frame_1792163000.txt` (línea 1168/1169) y `Frame capture: 201 passes written to …/frame_1792163382.txt` (3403/3404). `PS4 Pro mode: 1`; `Window: 1920x1080 … the game's output 1920x1080 scaled to it`; `VideoOut: … frame limit 60 FPS`; `single-stepped writes … off (BB_WRITE_STEP)`; `Patches: 0 writes, 0 bytes applied`; `Settings: …/bbport.ini` (`show_fps=1`) |
+| `launch.log` = `20261016_115827.log` | Sesión anterior (11:58) con la misma cabecera y sin captura |
 
 **Configuración declarada por el Jefe** (base `ufc3-online` `8de5098`, binarios Linux prebuilt originales):
 `BB_NEO=1`, `BB_INTERNAL_WIDTH/HEIGHT=3840/2160`, ventana 1920×1080, `BB_FPS_LIMIT=60`, `BB_WRITE_STEP=0`,
@@ -41,10 +45,17 @@ write windows 0, preupload 0, `BB_WRITE_LOG=0`, mods 0, `BB_CAPTURE_ON_FLIP=1`; 
 aislado. **No** imprime `BB_INTERNAL_*`, preupload, write log, mods ni el entorno online/FP. Esos valores
 quedan como D (declarados por el Jefe).
 
-**Dos sesiones (I).** Hay dos logs con cabecera idéntica (11:58 sin captura, 12:01 con captura), y la
-foto del menú es de las 12:00. Lo más probable es que la opción se eligiera en la primera sesión y quedara
-guardada en la copia aislada de `user/`. No verifiqué en la partida que el valor persistiera; lo que sí
-consta es que el usuario eligió *Favor Resolution* y avisó "on ring" antes del trigger.
+**Sesiones.** Hay dos logs con cabecera idéntica (11:58 sin captura, 12:01 con las dos capturas). La foto
+del menú es de las 12:00, así que *Favor Resolution* se eligió probablemente en la primera sesión y quedó
+guardada en la copia aislada de `user/` (I). **El contraste sí es de una sola ejecución (V por el log):**
+las dos capturas están en `20261016_120119.log`. Entre ellas, según el usuario, solo se cambió la opción a
+*Favor Performance* y se volvió a entrar al ring. La misma env vale para ambas: Neo 1, VO 3840×2160,
+ventana 1920×1080, límite 60, `BB_WRITE_STEP=0`, write windows 0, preupload 0, parches 0.
+
+**Límites del contraste.** Los dos frames no son la misma escena: el de *Resolution* es combate con HUD;
+la imagen de *Performance* muestra el menú de pausa dentro del round, y no verifiqué si el frame capturado
+(12:09) es ese menú o combate (los pases de escena 3D están igual en la captura). Sirve para comparar
+**resoluciones y cadena de composite**, no contenido ni coste.
 
 ### 0.2 Evidencia anterior (segunda pasada)
 
@@ -105,7 +116,7 @@ B10G11R11 y depth D32S8 a 3200×1800; tonemap RGBA8 `0x109ffe0000` a 3200×1800;
 No hay ningún target 3840×2160 (0 coincidencias de `3840x2160`; las 15 de `2160` son ruido de valores
 float en volcados de buffers). Las formas derivadas cambian de forma proporcional a 1080p
 (960→1600 = ½ anchura, 96→160 = 1/20, 1600×900 se mantiene como linear depth). La imagen del ring muestra
-el combate y el HUD sin recorte ni zoom aparentes (revisión visual de **una** imagen; ver §1.3).
+el combate y el HUD sin recorte ni zoom aparentes (revisión visual de **una** imagen; ver §1.4).
 
 ### 1.2 Qué demuestra y qué no
 
@@ -135,20 +146,73 @@ el combate y el HUD sin recorte ni zoom aparentes (revisión visual de **una** i
 - **No prueba H1 a nivel binario**: no se trazó qué setter (`0x4a0a60` u otro), qué campo
   (`R+0x92ec`, `LodManager+0x44`) ni qué modo (`G+0x90`) escribe la opción. Es coherente con H1 (I), no
   prueba.
-- **No es un contraste controlado**: falta el mismo frame con *Favor Performance* y la misma configuración
-  (§9).
+- **Por sí solo no era un contraste controlado**: el control *Favor Performance* está en §1.3.
 - **No caracteriza la calidad del filtro**: el filtro del sampler de `e5b29094` (lineal/punto, mips) no
   está inventariado; con razón 1,67 un solo tap bilineal promedia solo en parte (H).
 
-### 1.3 Pendientes que deja try-1b (no ejecutar ni pedir todos juntos)
+### 1.3 Control *Favor Performance* (misma ejecución, V)
 
-1. **Control *Favor Performance*** con la misma env y una captura en el ring: confirma que la opción es la
-   variable (esperado, H: escena 1920×1080 y composite `ddbe162b`). Es la próxima prueba (§9).
+Inventario hecho solo con las líneas `color`/`depth`/`samples`/`writes`/`note` de
+`frame_1792163382.txt`; no leí ni usé los volcados de floats de buffers. Las direcciones de muchos targets
+se repiten entre las dos capturas, con otro tamaño (mismo pool, I). Los números de pase difieren en 3
+(201 frente a 198 pases).
+
+| Papel | *Favor Resolution* (`…3000`) | *Favor Performance* (`…3382`) |
+|---|---|---|
+| Depth de escena `0x1085980000` (D32S8) | 3200×1800 | **1920×1080** (#131–138) |
+| Escena HDR `0x108e8c0000` (B10G11R11) | 3200×1800 | **1920×1080** (#132–139) |
+| Depth principal `0x10840a0000` (R32F → D32S8) | 3200×1800 | **1920×1080** (#138–175) |
+| Buffer auxiliar `0x1082920000` (RGBA8) | 3200×1800 | **1920×1080** |
+| Escena HDR final `0x107c770000` (B10G11R11) | 3200×1800 | **1920×1080** (#150–175) |
+| Linear depth `0x1073a80000` (R32F) | 1600×900 | 1600×900 (**no cambia**) |
+| Mip de linear depth / efectos ¼ / bloom | 800×450 | 960×540 |
+| Media anchura `0x1076d20000` (RGBA16F) | 1600×1800 | 960×1080 |
+| Tira 1/20 `0x1080f80000` y su reducción | 160×1800 → 160×90 | 96×1080 → 96×54 |
+| Tonemap (RGBA8) | `0x109ffe0000` 3200×1800 (#172) | `0x109f760000` **1920×1080** (#175) |
+| UI/HUD `0x109eee0000` + depth `0x109c468000` | 1920×1080 | 1920×1080 |
+| **Composite final** | **#197 `e5b29094`**, groups 240×135 | **#200 `ddbe162b`**, groups 240×135 |
+| Entradas del composite | UI 1920×1080 + escena 3200×1800 | **dos RGBA8 1920×1080** (`0x109f760000`, `0x109eee0000`) |
+| Salida (= presented buffer) | `0x109a470000` R8G8B8A8Srgb 1920×1080 | `0x1098490000` R8G8B8A8Srgb 1920×1080 |
+
+**Pase final #200 (V, literal):**
+```
+#200 COMPUTE dispatches 1, cs 00000000ddbe162b
+  samples 0x109f760000 R8G8B8A8Unorm 1920x1080      ← escena tonemapeada
+  samples 0x109eee0000 R8G8B8A8Unorm 1920x1080      ← UI
+  writes  0x1098490000 R8G8B8A8Srgb 1920x1080       ← = presented buffer
+  note: groups 240x135x1
+```
+
+**Búsqueda negativa (V).** En las líneas de target de `…3382` no aparece ningún 3200×1800, 3840×2160,
+1600×1800 ni 160×1800 (0 coincidencias). Todos los targets de escena, depth y tonemap están a 1920×1080.
+
+**Lectura.**
+- **Observado (V):** bajo Neo 1 + VO 2160 y en la misma ejecución, el menú cambia la escena 1800p ↔ 1080p
+  y el composite `e5b29094` ↔ `ddbe162b`. La salida queda en 1920×1080 sRGB en ambos casos. Con esto la
+  prueba del menú y el control quedan **cerrados a nivel de resolución**. **No hace falta 2U** para
+  desbloquear 1800 en esta build y config.
+- **Predicción cumplida (V):** la predicción de §9 de la pasada anterior (escena 1080 + `ddbe162b`) se cumplió.
+  Refuerza que el motor elige el composite según la relación escena/salida, `texelFetch` 1:1 cuando son
+  iguales y `textureLod` cuando la escena es mayor. Sigue siendo una inferencia sobre el criterio, no una
+  traza.
+- **Sin simetría asumida:** la cadena **no** escala de forma uniforme. La linear depth queda a 1600×900 en
+  las dos opciones, los buffers de ¼ pasan de 800×450 a 960×540 (más grandes en *Performance*) y la media
+  anchura y la tira 1/20 siguen a la escena. Hay varios buffers intermedios con reglas propias. No afirmo
+  ninguna proporción fija entre las dos opciones.
+- **No demuestra:** qué setter, campo o modo escribe la opción (H1 sigue siendo H; mapeo
+  *Performance* ↔ "high" / *Resolution* ↔ "ultra" sin trazar); 4K nativo ni checkerboard (no hay targets
+  3840×2160 en ninguna de las dos); FPS ni coste (sin benchmark; el overlay es instantáneo y no extraigo
+  métricas de las ventanas del log en que se capturaba, que están contaminadas por la propia captura);
+  causa de las corridas anteriores que se perdieron (Tests 1–3 a 1080, D).
+
+### 1.4 Pendientes después del control (no ejecutar ni pedir todos juntos)
+
+1. ~~Control *Favor Performance*~~ **Hecho (§1.3).**
 2. **Revisión visual**: una sola imagen de 1920×1080 con HUD y combate visibles no basta para prometer
    ausencia total de recorte, desalineación de UI o artefactos en cada pantalla. Hacen falta selección de
    luchador (retratos), entrada al octágono, repeticiones y menú de pausa.
-3. **Coste global** (FPS en combate, frametimes, VRAM, GPU): **NM**. Solo después del control y con el
-   método de Test 1. El juego describe la opción como "smoother framerate **or** higher resolution": no se
+3. **Coste global** (FPS en combate, frametimes, VRAM, GPU): **NM**. Con el método de Test 1, en una
+   corrida por opción y sin capturas activas. El juego describe la opción como "smoother framerate **or** higher resolution": no se
    asume 60 fps estables ni 30 fijos.
 4. **Estabilidad**: combate completo y sesión larga sin `Guest fault`, `STOP` ni OOM.
 5. **Retratos** (`T4Portrait`, comparación exacta de tamaños, `texture_cache.cpp:106–109`): sin verificar
@@ -193,7 +257,7 @@ comprimidos de UI, no en el eboot (I).
 
 - **1a · Estático:** hecho (§2).
 - **1b · Menú: HECHO, positivo** (§1). Opción presente y el primer frame con escena a 3200×1800 → salida
-  1080. Falta el control *Favor Performance* (§9).
+  1080. **Control *Favor Performance* hecho (§1.3)**: misma ejecución, escena 1080 y `ddbe162b`.
 - **1c · Sonda GDB de solo lectura: degradada a opcional.** Ya no es necesaria para obtener 1800p. Solo
   tendría sentido para confirmar H1 a nivel binario (qué setter/campo escribe la opción) o para forzar el
   modo sin menú (por ejemplo, para defaults del launcher). Sigue requiriendo autorización explícita y
@@ -256,12 +320,12 @@ justificaría para resoluciones que el juego no ofrece, y ni así antes de 2A.
 | Orden | Paso | Tipo | Estado | Riesgo | Corridas | Pasar al siguiente cuando… |
 |---|---|---|---|---|---|---|
 | ✔ | try-1b menú | diagnóstico / solución sin parche | **Hecho: opción confirmada + primer frame 3200×1800 → 1080** | Bajo | — | — |
-| 1 | **Control *Favor Performance*** (§9) | control de una variable | Pendiente | Bajo | 1 | Escena a 1080 con la misma env → la opción es la causa. Si sigue a 1800 → revisar persistencia o config |
-| 2 | Revisión visual + estabilidad con *Favor Resolution* | validación | Pendiente | Bajo | 1–2 | Sin recorte/HUD roto en pantallas clave y combate completo sin faults |
-| 3 | Benchmark *Favor Resolution* vs *Favor Performance* | medición (método Test 1) | Pendiente | Bajo | 2 (una por corrida) | Coste conocido; decidir si queda por defecto en el launcher |
-| 4 | try-1c sonda | diagnóstico opcional | Condicionado | Medio (GDB) | 1 | Solo si hace falta el mecanismo exacto (default sin menú) |
-| 5 | try-2U / 2A | variantes de parche | Diseño condicionado | Medio-alto | 1 c/u | Solo con una necesidad que el menú no cubra (§4) |
-| 6 | try-2B / 2C | variantes de parche | Sin motivo actual | — | — | — |
+| ✔ | Control *Favor Performance* (§1.3) | control de una variable, misma ejecución | **Hecho: escena 1080 + `ddbe162b`; menú controla 1800↔1080** | Bajo | — | — |
+| 1 | **Revisión visual + estabilidad con *Favor Resolution*** (§9) | validación | Pendiente (próxima) | Bajo | 1 | Sin recorte/HUD roto en pantallas clave y combate completo sin faults |
+| 2 | Benchmark *Favor Resolution* vs *Favor Performance* | medición (método Test 1) | Pendiente | Bajo | 2 (una por corrida) | Coste conocido; decidir si queda por defecto en el launcher |
+| 3 | try-1c sonda | diagnóstico opcional | Condicionado | Medio (GDB) | 1 | Solo si hace falta el mecanismo exacto (default sin menú) |
+| 4 | try-2U / 2A | variantes de parche | Diseño condicionado | Medio-alto | 1 c/u | Solo con una necesidad que el menú no cubra (§4). 2U ya no hace falta para 1800; 2A queda como alternativa de diseño para 4K nativo, no implementada |
+| 5 | try-2B / 2C | variantes de parche | Sin motivo actual | — | — | — |
 | — | try-3 | — | DESCARTADA | — | — | — |
 
 ---
@@ -273,9 +337,11 @@ justificaría para resoluciones que el juego no ofrece, y ni así antes de 2A.
 - mediana 16,67 ms, p95 16,98, p99 17,64, máximo 36,84 ms;
 - 6 intervalos > 25 ms, 0 > 50 ms, 0 compilaciones.
 
-try-1b **no es comparable** con este baseline: no hubo benchmark, la VO es distinta (2160) y el overlay es
-instantáneo. La comparación válida será *Favor Resolution* contra *Favor Performance* con la misma env de
-try-1b, en corridas separadas y con el mismo método de Test 1.
+try-1b y su control **no son comparables** con este baseline: no hubo benchmark, la VO es distinta (2160),
+el overlay es instantáneo y las ventanas `Frame stats` alrededor de cada captura incluyen el coste de la
+propia captura, así que no se usan. No hay mínimos de FPS de ninguna de las dos opciones. La comparación
+válida será *Favor Resolution* contra *Favor Performance* con la misma env, en corridas separadas, sin
+capturas y con el método de Test 1.
 
 ---
 
@@ -288,10 +354,16 @@ try-1b, en corridas separadas y con el mismo método de Test 1.
   Resolution* la escena está a 3200×1800.
 - "2A: composite `texelFetch` recorta": el juego usa `e5b29094` (`textureLod`) cuando la escena es mayor.
 - "1c es el paso siguiente": pasa a ser opcional.
+- "Falta el control *Favor Performance*": hecho en la misma ejecución (§1.3).
+- "Hace falta 2U para tener 1800": no en esta build/config; el menú lo controla.
 
 **Vigentes:**
-- Falta el control *Favor Performance* con la misma env (§9).
-- Revisión visual completa, estabilidad, coste global y retratos: NM (§1.3).
+- **Estabilidad y revisión visual** con *Favor Resolution* (pendiente propio, §9): NM.
+- **Rendimiento** (FPS en combate, frametimes, VRAM, GPU) de cada opción (pendiente propio, después): NM.
+- Retratos a 1800: sin verificar (§1.4).
+- Varios buffers intermedios no escalan igual entre opciones (§1.3): no hay un factor único documentado.
+- **4K nativo:** no observado en ninguna opción. 2A (2160) y el análisis de heap/VRAM quedan como
+  alternativas de diseño, no implementadas.
 - El filtro del composite `e5b29094` (sampler) no está inventariado: la calidad de la reducción 1,67:1 no
   está caracterizada.
 - H1 binaria (setter/campo/modo) sin traza; 1c requiere autorización y reescribir la sonda.
@@ -303,26 +375,22 @@ try-1b, en corridas separadas y con el mismo método de Test 1.
 
 ## 9. Próxima prueba sugerida (una sola; no ejecutada)
 
-**Control *Favor Performance*, misma env que try-1b, captura en el ring.** Va antes de cualquier benchmark.
+El control ya está hecho (§1.3); no se vuelve a pedir la comparación. La siguiente prueba es la
+**validación visual y de estabilidad con *Favor Resolution***, offline. El benchmark va después, en
+corridas propias.
 
-1. Misma configuración exacta de try-1b (§0.1), con la misma copia aislada de `user/` y el mismo
-   `bbport.ini`. La única variable es el menú.
-2. En VIDEO → RESOLUTION, poner **Favor Performance**. Foto del menú.
-3. Entrar a un combate equivalente (mismo modo/arena si se puede). En el ring, `capture.trigger` con
-   `BB_CAPTURE_ON_FLIP=1`.
-4. No medir rendimiento en esta corrida.
-5. Revisión posterior (Jefe o worker), solo del texto de la captura:
-   - dimensiones de escena, depth y tonemap;
-   - shader del pase final (esperado, H: `ddbe162b` con escena 1920×1080; si aparece `e5b29094` con escena
-     1080, también vale);
-   - que el buffer presentado siga a 1920×1080 sRGB.
+1. Misma env que §0.1 (Neo 1, VO 3840×2160, ventana 1920×1080, límite 60, write step 0, preupload 0,
+   parches 0), la misma copia aislada de `user/` y *Favor Resolution* en el menú. Sin `BB_ONLINE_SERVER`.
+2. Sin capturas de frame ni medición de rendimiento en esta corrida.
+3. Recorrer: selección de luchador (retratos), entrada al octágono, un combate completo, repetición y menú
+   de pausa. Una captura de pantalla por pantalla clave.
+4. Revisión posterior, solo del log y de las imágenes: `Guest fault`, `STOP`, OOM o cierres; recorte, zoom,
+   UI desalineada o retratos rotos.
 
 **Lectura:**
-- Escena a 1080 → la opción es la causa del 1800 (contraste de una variable).
-- Escena a 1800 con *Performance* → revisar si el valor persistió o si hay otra variable de por medio,
-  antes de seguir.
-
-Después, por separado: revisión visual y estabilidad, y luego el benchmark de las dos opciones (§6).
+- Limpio → pasar al benchmark de las dos opciones (§6, paso 2), una por corrida y con el método de Test 1.
+- Faults o artefactos solo con *Favor Resolution* → documentar la pantalla y decidir entre investigar
+  (1c, retratos) o dejar *Performance* por defecto. Sin parches.
 
 ---
 
@@ -330,8 +398,8 @@ Después, por separado: revisión visual y estabilidad, y luego el benchmark de 
 
 **Informe principal** (`/tmp/CTR_vs_UFC3_ANALYSIS.md` ya no existe; si se reconstruye o se mueve a `docs/`):
 - Referenciar este anexo.
-- La prioridad de resolución pasa a ser: **opción *Favor Resolution* (Pro + VO 2160) → control → validación
-  → benchmark**. Los parches quedan solo para necesidades que el menú no cubre.
+- La prioridad de resolución pasa a ser: **opción *Favor Resolution* (Pro + VO 2160) → control (hecho) →
+  validación → benchmark**. Los parches quedan solo para necesidades que el menú no cubre.
 - Corregir: el parche de mancelli no tiene efecto en Pro; `e5b29094` no es exclusivo del modo base.
 
 **UFC-40 (21:9).** Puede reutilizar el **contrato ya observado** del composite que escala: escena a W×H
@@ -344,13 +412,11 @@ ultrawide funcional**: no hay evidencia de cambio de aspecto, FOV, HUD anclado n
 
 ## 11. Acciones priorizadas
 
-1. **Jefe:** revisar esta tercera pasada. Si la aprueba, pedir al usuario **solo** el control *Favor
-   Performance* (§9).
-2. **Worker (después):** inventariar la captura de control y contrastarla con §1.1, sin volcar buffers.
-3. **Usuario (corrida aparte):** validación visual y estabilidad con *Favor Resolution* (§1.3, puntos 2,
-   4 y 5).
-4. **Después:** benchmark de *Favor Resolution* contra *Favor Performance* con el método de Test 1, una
-   opción por corrida. Con eso, decidir si el launcher la recomienda o deja Pro + VO 2160 como preset.
-5. **Solo si aparece una necesidad que el menú no cubre** (default sin interacción, otro tamaño): 1c y
-   luego 2U/2A, con autorización. try-3 sigue descartada. UFC-40 reutiliza el contrato de §10 sin
-   prometer 21:9.
+1. **Jefe:** revisar esta cuarta pasada. Prueba del menú y control cerrados a nivel de resolución.
+2. **Usuario (corrida aparte):** solo la validación visual y de estabilidad con *Favor Resolution* (§9).
+3. **Después, por separado:** benchmark de *Favor Resolution* contra *Favor Performance* con el método de
+   Test 1, una opción por corrida y sin capturas. Con eso, decidir si el launcher recomienda Pro + VO 2160
+   + *Favor Resolution* como preset.
+4. **Solo si aparece una necesidad que el menú no cubre** (default sin interacción, otro tamaño, 4K
+   nativo): 1c y luego 2U/2A, con autorización. 4K nativo sigue siendo diseño, no implementado. try-3
+   sigue descartada. UFC-40 reutiliza el contrato de §10 sin prometer 21:9.
