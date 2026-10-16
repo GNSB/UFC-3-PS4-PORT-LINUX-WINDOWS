@@ -277,6 +277,95 @@ class GameManagerTests(unittest.TestCase):
             ufc3_games.GAMES.clear()
             ufc3_games.SEARCHES.clear()
 
+    @staticmethod
+    def _search(account, peer_ip, weight_classes=None, **criteria):
+        """startMatchmakingScenario as UFC sends it (SCNA as blaze_tdf decodes it)."""
+        from blaze_tdf import MAP, UNION, Union
+        import ufc3_games
+
+        def network_address():
+            return Struct(IP=(INT, int.from_bytes(bytes(map(int, peer_ip.split('.'))), 'big')),
+                          MACI=(INT, 0), PORT=(INT, 3659))
+        def generic(values):
+            return ('generic', 2806890242, (STRING, values))
+        names = {'UFC_CLOCK_TYPE': ['abstain'], 'UFC_CUSTOM_FIGHTER': ['abstain'],
+                 'UFC_FIGHT_RULES': ['abstain'], 'UFC_MAX_ROUNDS': ['abstain'],
+                 'UFC_WEIGHT_CLASS': weight_classes or [str(i) for i in range(10)]}
+        names.update(criteria)
+        pnet = Union(2, 'VALU', STRUCT, Struct(INIP=(STRUCT, network_address()),
+                                              EXIP=(STRUCT, network_address()), MACI=(INT, 0)))
+        request = Struct(CMGD=(STRUCT, Struct(GVER=(STRING, '1.14'), PNET=(UNION, pnet))),
+                         SCNA=(MAP, (STRING, 12, [(k, generic(v)) for k, v in sorted(names.items())])),
+                         SCNM=(STRING, 'ufcH2HUnranked'))
+        return ufc3_games.matchmake(request, account, object(), peer_ip, lambda *_: None)
+
+    def _matched_games(self, host_classes, guest_classes, **guest_criteria):
+        """Both players' NotifyGameSetup payloads, decoded (empty if they were not matched)."""
+        from ufc3_auth import Account
+        import ufc3_games
+
+        ufc3_games.GAMES.clear()
+        ufc3_games.SEARCHES.clear()
+        self.addCleanup(ufc3_games.GAMES.clear)
+        self.addCleanup(ufc3_games.SEARCHES.clear)
+        host = Account(1000000001, 111, 'WindowsHost')
+        guest = Account(1000000002, 222, 'LinuxGuest')
+        self._search(host, '192.168.1.129', host_classes)
+        _, notifications = self._search(guest, '192.168.1.2', guest_classes, **guest_criteria)
+        out = []
+        for _, frame in notifications:
+            if frame.component == ufc3_games.GAME_MANAGER and frame.command == ufc3_games.NOTIFY_GAME_SETUP:
+                fields, consumed = decode_struct(frame.payload)
+                self.assertEqual(consumed, len(frame.payload))
+                out.append(fields['GAME'][1])
+        return out
+
+    def test_matched_game_has_the_attributes_ufc_reads(self):
+        games = self._matched_games(None, None)
+        self.assertEqual(len(games), 2)
+        for game in games:
+            attributes = dict(game['ATTR'][1][2])
+            # 0x358380 reads these six; all abstain except the weight class.
+            self.assertEqual(set(attributes), {'GameMode', 'MaxRounds', 'ClockType',
+                                               'CustomFighterOption', 'FightRules', 'WeightClass'})
+            self.assertEqual(attributes['GameMode'], '4')
+            self.assertIn(attributes['MaxRounds'], ('3', '5'))
+            self.assertIn(attributes['ClockType'], ('0', '1'))
+            self.assertIn(attributes['CustomFighterOption'], ('0', '1'))
+            self.assertEqual(attributes['FightRules'], '0')
+            self.assertIn(int(attributes['WeightClass']), range(10))
+
+    def test_weight_class_is_one_both_players_accept(self):
+        games = self._matched_games(['2', '5', '7'], ['5', '7', '9'])
+        self.assertEqual(len(games), 2)
+        for game in games:
+            self.assertIn(dict(game['ATTR'][1][2])['WeightClass'], ('5', '7'))
+        games = self._matched_games(['3'], None)
+        self.assertEqual({dict(g['ATTR'][1][2])['WeightClass'] for g in games}, {'3'})
+
+    def test_players_without_a_common_weight_class_are_not_matched(self):
+        import ufc3_games
+        self.assertEqual(self._matched_games(['0', '1'], ['8', '9']), [])
+        self.assertEqual(len(ufc3_games.SEARCHES), 2)
+        self.assertEqual(ufc3_games.GAMES, {})
+
+    def test_concrete_criteria_are_honoured(self):
+        games = self._matched_games(None, None, UFC_MAX_ROUNDS=['3'], UFC_CLOCK_TYPE=['0'],
+                                    UFC_CUSTOM_FIGHTER=['1'])
+        attributes = dict(games[0]['ATTR'][1][2])
+        self.assertEqual((attributes['MaxRounds'], attributes['ClockType'], attributes['CustomFighterOption']),
+                         ('3', '0', '1'))
+        # A value the server has no default for still passes through when the other abstains.
+        games = self._matched_games(None, None, UFC_FIGHT_RULES=['2'])
+        self.assertEqual({dict(g['ATTR'][1][2])['FightRules'] for g in games}, {'2'})
+
+    def test_game_data_has_no_tags_outside_ufcs_schema(self):
+        for game in self._matched_games(None, None):
+            for tag in ('GVER', 'HSES', 'IGNO', 'TCAP'):
+                self.assertNotIn(tag, game)
+            self.assertIn('HSES', game['PHST'][1])  # it belongs to HostInfo
+            self.assertEqual(game['VSTR'], (STRING, '1.14'))
+
 
 if __name__ == '__main__':
     unittest.main()
