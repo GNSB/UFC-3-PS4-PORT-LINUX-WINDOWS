@@ -58,6 +58,10 @@ public:
     /// Closes every open window (the submitting thread, before the GPU side sees the submission).
     static void CloseWriteWindows();
 
+    /// UFC-48: faults on pages already open in a window since the last call (protected again
+    /// while open; each such fault re-opens the page instead of retrying forever).
+    static u64 TakeWindowReprotects();
+
     /// ufc3 (UFC-48): what a buffer readback beginning now may write over: the guest bytes, and
     /// on a page open in a write window the bytes as the window opened (the CPU's since are kept
     /// even if the window closes before the readback writes).
@@ -73,6 +77,9 @@ public:
     /// active/recent window snapshots. Observational only; a matching page does not establish
     /// CPU ownership.
     static void DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip);
+    /// BB_WRITE_WINDOW_DIAG=1: a binding the GPU writes covers [address, +size) (after the
+    /// windows over it closed: their CPU bytes there are superseded, not lost to a readback).
+    static void DiagnoseGpuWrite(VAddr address, u64 size);
     static void DumpWindowFault(void* context);
 
     /// Register a range of mapped gpu memory.

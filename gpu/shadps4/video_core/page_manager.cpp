@@ -15,6 +15,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/page_watch_perms.h"
+#include "video_core/wait_watch.h"
 #include "video_core/write_window_merge.h"
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <bitset>
 #include <deque>
+#include <unordered_set>
 #ifndef _WIN32
 #include <sys/uio.h>
 #endif
@@ -56,6 +58,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <chrono>
 #include <mutex>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -311,8 +314,49 @@ struct WriteWindow {
     std::array<u8, TRACKER_BYTES_PER_PAGE> before;
     u64 audit_id = 0;
 };
-std::mutex windows_mutex;
+WaitWatch::Mutex windows_mutex{"windows_mutex"};
 std::vector<std::unique_ptr<WriteWindow>> open_windows;
+// UFC-48: faults on a page already open in a window (it had been protected again meanwhile).
+std::atomic<u64> window_reprotects{0};
+
+// UFC-48: a write faulting on one page over and over (a handler answering "retry" while the page
+// stays protected) froze the game with no line in the log. Reported once per streak: a guest
+// loop that legitimately single-steps one counter faults a few hundred times a second, a retry
+// loop hundreds of thousands.
+void NoteRepeatedWriteFault(VAddr addr, u64 rip) {
+    thread_local VAddr last_page = 0;
+    thread_local u64 last_rip = 0, repeats = 0;
+    thread_local std::chrono::steady_clock::time_point since;
+    const VAddr page = addr & ~VAddr(PM_PAGE_SIZE - 1);
+    if (page != last_page || rip != last_rip) {
+        last_page = page;
+        last_rip = rip;
+        repeats = 0;
+        return;
+    }
+    if (++repeats == 4096) {
+        since = std::chrono::steady_clock::now();
+    }
+    if (repeats != (u64{1} << 20)) {
+        return;
+    }
+    int open = -1; // unknown: windows_mutex busy
+    if (windows_mutex.try_lock()) {
+        open = 0;
+        for (const auto& window : open_windows) {
+            open |= window->page == page;
+        }
+        windows_mutex.unlock();
+    }
+    std::fprintf(stderr,
+                 "Write fault loop: thread %llu faulted %llu times in a row on page %#llx "
+                 "(address %#llx, rip %#llx) in %.1f s; page open in a write window: %s (UFC-48)\n",
+                 (unsigned long long)WaitWatch::ThreadId(), (unsigned long long)repeats,
+                 (unsigned long long)page, (unsigned long long)addr, (unsigned long long)rip,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count(),
+                 open < 0 ? "unknown" : open ? "yes" : "no");
+    std::fflush(stderr);
+}
 std::atomic<u32> open_window_count{0};
 thread_local bool want_window = false, fault_from_guest = false;
 constexpr std::size_t MaxWindows = 512;
@@ -334,7 +378,8 @@ bool WindowAuditEnabled() {
         if (on) {
             std::printf("Write window audit: on; 1024 active/recent snapshots, at most %u reports "
                         "per event kind (BB_WRITE_WINDOW_DIAG_MAX); readback-overwrite = a "
-                        "readback wrote over bytes the CPU changed in a closed window "
+                        "readback wrote over bytes the CPU changed in a closed window, and no GPU "
+                        "write claimed since; readback-after-gpu-write = one did (informational) "
                         "(BB_WRITE_WINDOW_DIAG)\n",
                         WindowAuditMax());
         }
@@ -351,11 +396,17 @@ struct WindowAuditRecord {
     std::array<u8, TRACKER_BYTES_PER_PAGE> snapshot;
     // UFC-48: the bytes the window changed (set at close; cleared once reported).
     std::bitset<TRACKER_BYTES_PER_PAGE> changed{};
+    // UFC-48: changed bytes the GPU claimed again after the close (a written binding over them,
+    // DiagnoseGpuWrite): a readback of those writes the GPU's newer value, not over the CPU's.
+    std::bitset<TRACKER_BYTES_PER_PAGE> reclaimed{};
 };
 std::mutex window_audit_mutex;
 std::deque<WindowAuditRecord> window_audit;
+// Pages of closed records with changed bytes (may hold stale pages: DiagnoseGpuWrite prunes).
+std::unordered_set<VAddr> window_audit_changed_pages;
 u64 window_audit_serial = 0;
-u32 window_audit_reopens = 0, window_audit_readbacks = 0, window_audit_skips = 0;
+u32 window_audit_reopens = 0, window_audit_readbacks = 0, window_audit_skips = 0,
+    window_audit_regpu = 0;
 
 // Called while windows_mutex is held, before the page is made writable. The audit's lock is
 // never held while acquiring windows_mutex, page locks, or the buffer cache's range lock.
@@ -405,12 +456,58 @@ void AuditWindowPhase(u64 id, const u8* after = nullptr, const u8* before = null
                     record.changed[i] = before[i] != after[i];
                 }
                 std::memcpy(record.snapshot.data(), after, PM_PAGE_SIZE);
+                if (record.changed.any()) {
+                    window_audit_changed_pages.insert(record.page);
+                }
             }
             break;
         }
     }
 }
 } // namespace
+
+void PageManager::DiagnoseGpuWrite(VAddr address, u64 size) {
+    if (!WindowAuditEnabled() || size == 0) {
+        return;
+    }
+    std::scoped_lock lk{window_audit_mutex};
+    if (window_audit_changed_pages.empty()) {
+        return;
+    }
+    const VAddr first = address & ~VAddr(PM_PAGE_SIZE - 1), end = address + size;
+    std::vector<VAddr> pages;
+    if ((end - first) / PM_PAGE_SIZE <= window_audit_changed_pages.size()) {
+        for (VAddr page = first; page < end; page += PM_PAGE_SIZE) {
+            if (window_audit_changed_pages.contains(page)) {
+                pages.push_back(page);
+            }
+        }
+    } else {
+        for (const VAddr page : window_audit_changed_pages) {
+            if (page + PM_PAGE_SIZE > address && page < end) {
+                pages.push_back(page);
+            }
+        }
+    }
+    for (const VAddr page : pages) {
+        bool any = false;
+        for (auto& r : window_audit) {
+            if (r.page != page || r.phase != WindowAuditRecord::Closed) {
+                continue;
+            }
+            const u64 from = std::max(address, page) - page;
+            const u64 to = std::min<VAddr>(end, page + PM_PAGE_SIZE) - page;
+            for (u64 o = from; o < to; ++o) {
+                r.reclaimed[o] = r.reclaimed[o] || r.changed[o];
+                r.changed[o] = false;
+            }
+            any |= r.changed.any();
+        }
+        if (!any) {
+            window_audit_changed_pages.erase(page);
+        }
+    }
+}
 
 void PageManager::DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip) {
     if (!WindowAuditEnabled() || data.empty()) {
@@ -434,8 +531,8 @@ void PageManager::DiagnoseWindowWrite(VAddr address, std::span<const u8> data, b
         }
         std::array<u8, PM_PAGE_SIZE> current;
         runtime_memory_read_backing(r.page, current.data(), PM_PAGE_SIZE);
-        u64 changed = 0, replaced = 0;
-        VAddr first = end;
+        u64 changed = 0, replaced = 0, regpu = 0, regpu_written = 0;
+        VAddr first = end, first_regpu = end;
         for (VAddr at = start; at < end; ++at) {
             const u64 offset = at - r.page;
             if (upload_skip) {
@@ -447,11 +544,18 @@ void PageManager::DiagnoseWindowWrite(VAddr address, std::span<const u8> data, b
             // UFC-48: called after the readback wrote. A byte the window changed that now holds
             // the payload, and not what the window left there: the CPU's write is gone.
             changed += r.changed[offset];
-            const bool overwritten = r.changed[offset] && current[offset] == data[at - address] &&
-                                     current[offset] != r.snapshot[offset];
+            const bool differs =
+                current[offset] == data[at - address] && current[offset] != r.snapshot[offset];
+            const bool overwritten = r.changed[offset] && differs;
             replaced += overwritten;
             if (overwritten && first == end) {
                 first = at;
+            }
+            // Bytes the GPU claimed again after the close: its newer value, not a lost CPU write.
+            regpu += r.reclaimed[offset];
+            if (r.reclaimed[offset] && differs) {
+                ++regpu_written;
+                first_regpu = std::min(first_regpu, at);
             }
         }
         // The snapshot follows readbacks (a readback over a readback is no CPU write lost).
@@ -459,9 +563,27 @@ void PageManager::DiagnoseWindowWrite(VAddr address, std::span<const u8> data, b
             for (VAddr at = start; at < end && !upload_skip; ++at) {
                 const u64 o = at - r.page;
                 r.changed[o] = r.changed[o] && current[o] == r.snapshot[o];
+                r.reclaimed[o] = r.reclaimed[o] && current[o] == r.snapshot[o];
                 r.snapshot[o] = current[o];
             }
         };
+        if (first == end && first_regpu != end && window_audit_regpu < WindowAuditMax()) {
+            // Informational (not readback-overwrite): shows these happen, and where.
+            ++window_audit_regpu;
+            u64 left = 0, guest = 0;
+            const u64 at = (first_regpu - r.page) & ~u64{7};
+            std::memcpy(&left, r.snapshot.data() + at, 8);
+            std::memcpy(&guest, current.data() + at, 8);
+            std::printf("Write window audit: readback-after-gpu-write id=%llu age=%llu "
+                        "page=%#llx range=%#llx+%llu opener=%#llx caller=+%#llx "
+                        "gpu_claimed=%llu written=%llu word=%#llx window_left=%#llx guest=%#llx\n",
+                        (unsigned long long)r.id, (unsigned long long)(window_audit_serial - r.id),
+                        (unsigned long long)r.page, (unsigned long long)start,
+                        (unsigned long long)(end - start), (unsigned long long)r.rip,
+                        (unsigned long long)r.caller, (unsigned long long)regpu,
+                        (unsigned long long)regpu_written, (unsigned long long)(r.page + at),
+                        (unsigned long long)left, (unsigned long long)guest);
+        }
         if (first == end || reports >= WindowAuditMax()) {
             follow();
             continue;
@@ -608,6 +730,7 @@ struct PageManager::Impl {
             const bool guest_store = rip >= GuestImage && rip < GuestImageEnd;
             fault_from_guest = guest_store;
             want_window = false;
+            NoteRepeatedWriteFault(addr, rip);
             const bool windows = WriteWindowsEnabled() && !is_gpu_thread;
             bool handled = rasterizer->OnWriteFault(addr, is_gpu_thread, rip,
                                                     guest_store || windows ? &step : nullptr);
@@ -684,8 +807,10 @@ struct PageManager::Impl {
             }
             runtime_memory_read_backing(page, slot->before[slot->count].data(), PM_PAGE_SIZE);
             slot->pages[slot->count++] = page;
-            self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
         }
+        // UFC-48: also when the page is open already: a second fault there means it was
+        // protected again meanwhile (the GPU thread's watchers), and the step would never end.
+        self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
         Common::SetTrapFlag(context, true);
         return true;
     }
@@ -698,7 +823,16 @@ struct PageManager::Impl {
         std::scoped_lock wl{windows_mutex};
         for (const auto& window : open_windows) {
             if (window->page == page) {
-                return true; // opened by another thread meanwhile: the write is retried
+                // Opened by another thread meanwhile, or protected again since it opened: the
+                // GPU thread's watchers re-protect a page whose GPU bit a readback cleared and a
+                // written binding set again. UFC-48: the write was retried with the page still
+                // protected and faulted here forever (a freeze, Career's fighter editor).
+                // windows_mutex, then the page's lock: as CloseWindows.
+                const size_t page_index = page >> PM_PAGE_BITS;
+                std::scoped_lock lk{self->locks[page_index / PAGES_PER_LOCK]};
+                self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
+                window_reprotects.fetch_add(1, std::memory_order_relaxed);
+                return true;
             }
         }
         if (open_windows.size() >= MaxWindows) {
@@ -1210,6 +1344,10 @@ void PageManager::CloseWriteWindows() {
     Impl::CloseWindows();
 }
 
+u64 PageManager::TakeWindowReprotects() {
+    return window_reprotects.exchange(0, std::memory_order_relaxed);
+}
+
 void PageManager::ReadbackSnapshot(VAddr addr, u8* out, u64 size) {
     Impl::ReadbackSnapshot(addr, out, size);
 }
@@ -1220,6 +1358,7 @@ u64 PageManager::WriteReadback(VAddr addr, const u8* payload, const u8* at_start
 }
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
+    WaitWatch::Start();
 #ifdef __linux__
     // bbport: dma-buf guest memory (BB_GUEST_GPU_MEMORY=1) cannot be write-protected by userfaultfd
     // (anonymous and shmem only): its registration would fail and writes go unseen.

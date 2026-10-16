@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/wait_watch.h"
 
 #include <mutex>
 #include <pthread.h>
@@ -336,7 +337,7 @@ std::atomic<u64> window_cpu_bytes{0}, readback_kept_bytes{0};
 // UFC-48: other threads write it too (a write window's close on the submitting thread, discard
 // locks), so the GPU thread reads it under this lock as well: a read without it walked a tree
 // node freed meanwhile (host fault in DownloadMemory, Career's fighter editor on Windows).
-std::shared_mutex gpu_ranges_mutex;
+WaitWatch::SharedMutex gpu_ranges_mutex{"gpu_ranges_mutex"};
 // ufc3 (BB_READBACK_INORDER=1, experimental, default off): readbacks run as ordered tasks on
 // the draw recording thread (Liverpool::SendInOrderCommand) instead of after a drain of the
 // command thread. Measured (run98): the command drains go, but the recording thread then waits
@@ -916,8 +917,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks || Vulkan::DrawPipe::OnStageB()) {
         flush_request();
     } else if (ReadbackInOrder()) {
+        WaitWatch::Scope wait{"a readback by the draw recording thread"};
         liverpool->SendInOrderCommand(flush_request);
     } else {
+        WaitWatch::Scope wait{"a readback by the GPU command thread"};
         liverpool->SendCommand<true>(std::move(flush_request));
     }
 }
@@ -1016,6 +1019,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     static FastReadback readback{instance};
     if (write_tick != 0 && readback.Available() && !BbToggle::Disabled(BbToggle::ReadbackQueue)) {
         if (!write_done) {
+            WaitWatch::Scope wait{"the GPU work a readback downloads"};
             scheduler.Wait(write_tick);
         }
         {
@@ -1035,7 +1039,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             copy.dstOffset += download.offset;
         }
         runtime.CopyBuffer(arena, download.buffer, copies);
-        scheduler.Finish();
+        {
+            WaitWatch::Scope wait{"the GPU work a readback downloads (Finish)"};
+            scheduler.Finish();
+        }
         download.buffer->Invalidate(download.offset, download.size);
         write_back(download.mapped, download.offset);
     }
@@ -1271,6 +1278,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     if (is_written) {
         { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Add(device_addr, size); }
+        PageManager::DiagnoseGpuWrite(device_addr, size);
         // ufc3 (BB_WATCH_GPU_WRITE=<hex address>[,<hex address>...]): written bindings over a page.
         static const std::vector<VAddr> watch = [] {
             std::vector<VAddr> pages;
@@ -2654,9 +2662,11 @@ void BufferCache::Maintain() {
                         step_no_other.exchange(0) / 5.0);
             if (const u64 opens = window_opens.exchange(0)) {
                 std::printf("Write windows: %.1f/s opened instead of a readback; CPU took over "
-                            "%llu GPU bytes, readbacks kept %llu CPU bytes (UFC-48)\n",
+                            "%llu GPU bytes, readbacks kept %llu CPU bytes; %llu faults on an "
+                            "open window (UFC-48)\n",
                             opens / 5.0, (unsigned long long)window_cpu_bytes.exchange(0),
-                            (unsigned long long)readback_kept_bytes.exchange(0));
+                            (unsigned long long)readback_kept_bytes.exchange(0),
+                            (unsigned long long)PageManager::TakeWindowReprotects());
             }
             if (const u64 locks = discard_locks.exchange(0)) {
                 std::printf("Discard locks: %.1f/s, %.1f KB/s of dead GPU bytes dropped, %.1f pages/s "
