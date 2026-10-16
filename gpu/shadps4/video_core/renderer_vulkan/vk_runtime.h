@@ -78,6 +78,8 @@ public:
                        std::span<const vk::BufferImageCopy> download_copies);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
+    /// Copy the origin rectangle of mip 0 between single-sample 2D color images.
+    void CopyImageMip0Region(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
