@@ -68,10 +68,10 @@ if [[ $BB_GAME_PROFILE == ufc3 ]]; then
     # submission: fights 105-113 -> 140-190 FPS on an RTX 4070, GROK_HANDOFF §17) are on here and
     # off in the Windows launcher: the crashes with them (the guest heap's free list corrupted
     # after a fight, guest fault at 0x1262a2a) were only reported on Windows (RX 9070, RTX 4090);
-    # on Linux (RTX 4070) 20-minute sessions played without a crash. Background pre-upload and
-    # single-stepped writes stay off on both: created/career fighters' skin, compressed by the
-    # game on the GPU, came out black or garbled.
-    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1} BB_PREUPLOAD=${BB_PREUPLOAD:-0} BB_WRITE_STEP=${BB_WRITE_STEP:-0}
+    # on Linux (RTX 4070) 20-minute sessions played without a crash. Pre-upload restores blood
+    # and sweat on hits (UFC-49); Linux also verified correct created/career skin with it on
+    # and single-stepped writes off. Keep single-stepped writes off for the skin regression.
+    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1} BB_PREUPLOAD=${BB_PREUPLOAD:-1} BB_WRITE_STEP=${BB_WRITE_STEP:-0}
     # The EA intro and the 2.5-minute first-start video play a short black clip instead.
     export BB_SKIP_MOVIES=${BB_SKIP_MOVIES:-1} BB_SKIP_MOVIE_FILE=${BB_SKIP_MOVIE_FILE:-$PWD/share/skip_movie.mkv}
     # Frame rate: the game asks for flip rate 1 (30 Hz) through its present-interval setter

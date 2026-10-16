@@ -486,10 +486,10 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_WRITE_WINDOW", L"0");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
-    /* Created fighters' skin is compressed by the game on the CPU into texture memory: with the
-     * background pre-upload or the single-stepped writes on, those textures came out black or
-     * garbled (career, fighter creation); with both off they draw correctly in fights. */
-    game_env(L"BB_PREUPLOAD", L"0"); game_env(L"BB_WRITE_STEP", L"0");
+    /* Pre-upload restores blood and sweat on hits (UFC-49). Linux verified correct created/
+     * career skin with pre-upload on and single-stepped writes off; Windows validation pending.
+     * Keep single-stepped writes off for the skin regression. The user's environment wins. */
+    game_env(L"BB_PREUPLOAD", L"1"); game_env(L"BB_WRITE_STEP", L"0");
     game_env(L"BB_COPY_GPU_BUFFERS", L"1");
     game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
