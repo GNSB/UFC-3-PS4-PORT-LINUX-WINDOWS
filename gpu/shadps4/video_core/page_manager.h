@@ -61,6 +61,14 @@ public:
     /// UFC-48: faults on pages already open in a window since the last call (protected again
     /// while open; each such fault re-opens the page instead of retrying forever).
     static u64 TakeWindowReprotects();
+    /// UFC-48: whether the write fault being handled on this thread comes from a site (instruction
+    /// and caller) barred from windows: one of its windows changed GPU-owned bytes. A window
+    /// cannot see a CPU write that leaves the stale guest value over GPU bytes (VRAM keeps the
+    /// GPU's); a site that writes over GPU data reads the page back first, as without windows.
+    static bool WindowSiteBarred();
+    /// UFC-48: GPU bytes left GPU-owned, since the last call, on pages where a window's CPU writes
+    /// took over others (the bytes a window cannot tell were rewritten unchanged).
+    static u64 TakeWindowAmbiguousBytes();
 
     /// ufc3 (UFC-48): what a buffer readback beginning now may write over: the guest bytes, and
     /// on a page open in a write window the bytes as the window opened (the CPU's since are kept
@@ -80,6 +88,14 @@ public:
     /// BB_WRITE_WINDOW_DIAG=1: a binding the GPU writes covers [address, +size) (after the
     /// windows over it closed: their CPU bytes there are superseded, not lost to a readback).
     static void DiagnoseGpuWrite(VAddr address, u64 size);
+    /// BB_WRITE_WINDOW_DIAG=1 (UFC-48): a binding the GPU reads (or writes) covers
+    /// [address, +size): notes whether it covers GPU-owned bytes a closed window left as they
+    /// were (the CPU may have rewritten them with the stale guest value: VRAM's is used).
+    static void DiagnoseGpuRead(VAddr address, u64 size, bool written);
+    /// The compute shader whose bindings this thread is about to obtain (0: none or a draw).
+    static void SetDiagShader(u64 hash);
+    /// GPU hang report: the recent DiagnoseGpuRead hits of the stuck shader.
+    static void ReportWindowHazards(u64 hash);
     static void DumpWindowFault(void* context);
 
     /// Register a range of mapped gpu memory.

@@ -11,8 +11,10 @@
 #include <cstring>
 #include <vector>
 #include "gpu/shadps4/video_core/write_window_merge.h"
+#include "gpu/shadps4/video_core/write_window_sites.h"
 
 using namespace VideoCore::WindowMerge;
+namespace WindowSites = VideoCore::WindowSites;
 
 namespace {
 constexpr std::uint64_t Page = 4096;
@@ -45,17 +47,20 @@ struct Model {
         return value;
     }
     // CloseWindows + NoteSteppedWrite + ProcessLateWrites; fixed = UFC-48, else as before it.
-    void CloseWindow(bool fixed) {
+    // Returns the GPU bytes the window took over.
+    std::uint64_t CloseWindow(bool fixed) {
         window = false;
+        std::uint64_t taken = 0;
         if (fixed) {
             ForEachChangedRun(before.data(), guest.data(), Page,
                               [&](std::uint64_t at, std::uint64_t n) {
                                   for (std::uint64_t i = at; i < at + n; ++i) {
+                                      taken += gpu[i];
                                       gpu[i] = false;
                                       vram[i] = guest[i];
                                   }
                               });
-            return;
+            return taken;
         }
         // Before UFC-48: changed 4-byte words, those with GPU bytes dropped (still GPU-owned).
         for (std::uint64_t w = 0; w < Page; w += 4) {
@@ -65,6 +70,17 @@ struct Model {
             }
             std::memcpy(vram.data() + w, guest.data() + w, 4);
         }
+        return taken;
+    }
+    // What the GPU reads at `at`: VRAM (every byte is resident in these cases).
+    std::uint32_t GpuRead32(std::uint64_t at) const {
+        std::uint32_t value = 0;
+        std::memcpy(&value, vram.data() + at, sizeof(value));
+        return value;
+    }
+    void CpuWrite32(std::uint64_t at, std::uint32_t value) {
+        assert(window);
+        std::memcpy(guest.data() + at, &value, sizeof(value));
     }
     // DownloadMemory: the GPU-modified bytes, captured now (ReadbackSnapshot), written later.
     struct Download {
@@ -187,6 +203,44 @@ void LinkSurvivesReadbackAcrossClose() {
     assert(m.Read(Node) == Next);
     assert(m.guest[0xc08] == 0xff);
 }
+// UFC-48 test 4 (GPU hang in cs 37aa67f4, per-vertex morph loops `for i < count`): memory the
+// GPU wrote (VRAM 1.0f, the guest still the zeros from before) is reused by the CPU for a table
+// of (start, count) pairs, through a window opened by a write beside the GPU bytes. Pairs equal
+// to the stale guest (0, 0) are no change: they stay GPU-owned and the GPU reads 0x3f800000 as a
+// count (a billion iterations). Pairs that changed show the window took over GPU bytes: the site.
+void EqualRewriteUnseen() {
+    Model m;
+    for (std::uint64_t at = 0x800; at < Page; at += 4) {
+        m.GpuWrites(at, 4, 0); // set below: 1.0f
+        const std::uint32_t one = 0x3f800000;
+        std::memcpy(m.vram.data() + at, &one, 4);
+    }
+    m.OpenWindow();
+    m.CpuWrite32(0x100, 7); // the fault: far from the GPU bytes
+    for (std::uint64_t at = 0x800; at < Page; at += 8) {
+        const bool morphs = at >= 0xc00; // the second half of the vertices have morph targets
+        m.CpuWrite32(at, morphs ? std::uint32_t(at) : 0);
+        m.CpuWrite32(at + 4, morphs ? 3 : 0);
+    }
+    const auto taken = m.CloseWindow(true);
+    assert(taken == 0x400);                      // the changed pairs: the site writes GPU data
+    assert(m.GpuRead32(0xc04) == 3);             // a changed count reaches VRAM
+    assert(m.gpu[0x804] && m.guest[0x804] == 0); // an unchanged one stays GPU-owned...
+    assert(m.GpuRead32(0x804) == 0x3f800000);    // ...and the GPU loops on 1.0f as a count
+}
+
+void BarredSites() {
+    WindowSites::Barred<2> barred;
+    const WindowSites::Site memcpy_a{0x80007ffb1620e2bbull, 0x11bd0b}, memcpy_b{0x80007ffb1620e2bbull, 0x431c4f},
+        allocator{0x1262c9f, 0xf409b};
+    assert(!barred.Bars(memcpy_a));
+    assert(barred.Add(memcpy_a) && !barred.Add(memcpy_a));
+    assert(barred.Bars(memcpy_a) && !barred.Bars(memcpy_b)); // same memcpy, another caller
+    assert(barred.Add(memcpy_b) && barred.Size() == 2 && !barred.Full());
+    assert(!barred.Bars(allocator));
+    assert(!barred.Add(allocator) && barred.Full()); // no room: every site reads back
+    assert(barred.Bars(allocator));
+}
 } // namespace
 
 int main() {
@@ -196,6 +250,8 @@ int main() {
     LinkSurvivesClose(true);
     LinkSurvivesReadbackInWindow();
     LinkSurvivesReadbackAcrossClose();
+    EqualRewriteUnseen();
+    BarredSites();
     std::puts("write window merge: ok");
     return 0;
 }

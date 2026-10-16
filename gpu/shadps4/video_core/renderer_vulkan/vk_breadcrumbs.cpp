@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <vector>
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
@@ -355,6 +356,13 @@ void Report(const char* title, const char* where) {
             PrintEntry(stream, id, "STUCK");
             std::fflush(stdout);
             DumpPrograms(stream, id);
+            // UFC-48 (BB_WRITE_WINDOW_DIAG): its bindings over bytes a write window left
+            // GPU-owned (a loop bound the CPU rewrote unseen, read from VRAM's old data).
+            const Entry& stuck = stream.ring[id & (RingSize - 1)];
+            if (stuck.id == id && (stuck.crumb.kind == Kind::Dispatch ||
+                                   stuck.crumb.kind == Kind::DispatchIndirect)) {
+                VideoCore::PageManager::ReportWindowHazards(stuck.crumb.hash[0]);
+            }
         }
         for (u64 next = id + 2; next <= std::min(last, id + 4); ++next) {
             PrintEntry(stream, next, "later");

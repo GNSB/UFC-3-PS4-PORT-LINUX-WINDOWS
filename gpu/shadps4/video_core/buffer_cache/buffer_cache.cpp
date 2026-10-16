@@ -330,6 +330,8 @@ std::atomic<u64> step_no_host{0}, step_no_near{0}, step_no_big{0}, step_no_burst
 std::atomic<u64> window_opens{0};
 // UFC-48: GPU-modified bytes a closing window's CPU words took over; readback bytes kept for the CPU.
 std::atomic<u64> window_cpu_bytes{0}, readback_kept_bytes{0};
+// UFC-48: faults of barred window sites; window bytes ProcessLateWrites could not put in VRAM.
+std::atomic<u64> window_barred_faults{0}, window_unuploaded_bytes{0};
 
 // ufc3 (BB_WRITE_STEP): gpu_modified_ranges is written on the GPU side; faulting threads read
 // it under this lock to decide a single step themselves (a command to the GPU thread drains the
@@ -667,8 +669,20 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
         out();
         return false;
     }
-    const bool windows = PageManager::WriteWindowsEnabled();
-    const bool from_guest = !windows || PageManager::FaultFromGuest();
+    const bool windows_on = PageManager::WriteWindowsEnabled();
+    const bool from_guest = !windows_on || PageManager::FaultFromGuest();
+    // UFC-48: a write site whose window rewrote GPU bytes reads back, as with windows off (a
+    // window cannot tell a CPU write of the stale guest value over GPU bytes from no write).
+    const bool windows = windows_on && !PageManager::WindowSiteBarred();
+    if (windows_on && !windows) {
+        window_barred_faults.fetch_add(1, std::memory_order_relaxed);
+        if (!from_guest) {
+            step_no_host.fetch_add(1, std::memory_order_relaxed); // a host copy: never stepped
+            why = 0;
+            out();
+            return false;
+        }
+    }
     const VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
     constexpr u64 Margin = 16;
     const VAddr near_begin = std::max(page, device_addr - std::min(device_addr - page, Margin));
@@ -1173,6 +1187,7 @@ void PrintBufferStats() {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     BB_SECTION(ObtainBuffer);
+    PageManager::DiagnoseGpuRead(device_addr, size, is_written);
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
@@ -2276,14 +2291,14 @@ void BufferCache::NotePreciseUpload(VAddr addr, u64 size) {
     late_writes_pending.store(true, std::memory_order_release);
 }
 
-void BufferCache::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window) {
+u64 BufferCache::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window) {
     if (bytes.empty()) {
-        return;
+        return 0;
     }
+    u64 taken = 0;
     if (from_window) {
         // UFC-48: now, before the window's lock is released (CloseWindows): a readback from here
         // on leaves these bytes to the CPU.
-        u64 taken = 0;
         {
             std::unique_lock rl{gpu_ranges_mutex};
             gpu_modified_ranges.ForEachInRange(addr, bytes.size(),
@@ -2297,6 +2312,16 @@ void BufferCache::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_
     std::scoped_lock lk{late_writes_mutex};
     (from_window ? window_writes : stepped_writes).emplace_back(addr, std::move(bytes));
     late_writes_pending.store(true, std::memory_order_release);
+    return taken;
+}
+
+std::vector<std::pair<VAddr, VAddr>> BufferCache::GpuModifiedRangesIn(VAddr addr, u64 size) const {
+    std::vector<std::pair<VAddr, VAddr>> ranges;
+    std::shared_lock rl{gpu_ranges_mutex};
+    gpu_modified_ranges.ForEachInRange(addr, size, [&](VAddr a, VAddr b) {
+        ranges.emplace_back(std::max(a, addr), std::min<VAddr>(b, addr + size));
+    });
+    return ranges;
 }
 
 void BufferCache::ProcessLateWrites() {
@@ -2361,6 +2386,7 @@ void BufferCache::ProcessLateWrites() {
         const u64 first = addr >> block_shift, last = (addr + size - 1) >> block_shift;
         if (((addr | size) & 3) != 0 || !resident_ranges.Contains(first, last + 1) ||
             in_place_blocks.Overlaps(first, last + 1)) {
+            window_unuploaded_bytes.fetch_add(size, std::memory_order_relaxed);
             continue; // not in VRAM: the next upload of the page reads the guest's bytes
         }
         const auto* arena = GetArena(first, last);
@@ -2662,11 +2688,19 @@ void BufferCache::Maintain() {
                         step_no_other.exchange(0) / 5.0);
             if (const u64 opens = window_opens.exchange(0)) {
                 std::printf("Write windows: %.1f/s opened instead of a readback; CPU took over "
-                            "%llu GPU bytes, readbacks kept %llu CPU bytes; %llu faults on an "
-                            "open window (UFC-48)\n",
+                            "%llu GPU bytes (%llu GPU bytes left GPU-owned beside them), readbacks "
+                            "kept %llu CPU bytes; %llu faults on an open window; %llu window bytes "
+                            "not in VRAM; %.1f faults/s of barred sites read back (UFC-48)\n",
                             opens / 5.0, (unsigned long long)window_cpu_bytes.exchange(0),
+                            (unsigned long long)PageManager::TakeWindowAmbiguousBytes(),
                             (unsigned long long)readback_kept_bytes.exchange(0),
-                            (unsigned long long)PageManager::TakeWindowReprotects());
+                            (unsigned long long)PageManager::TakeWindowReprotects(),
+                            (unsigned long long)window_unuploaded_bytes.exchange(0),
+                            window_barred_faults.exchange(0) / 5.0);
+            } else if (const u64 barred = window_barred_faults.exchange(0)) {
+                std::printf("Write windows: none opened; %.1f faults/s of barred sites read back "
+                            "(UFC-48)\n",
+                            barred / 5.0);
             }
             if (const u64 locks = discard_locks.exchange(0)) {
                 std::printf("Discard locks: %.1f/s, %.1f KB/s of dead GPU bytes dropped, %.1f pages/s "

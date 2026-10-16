@@ -194,8 +194,10 @@ public:
     /// ufc3 (BB_WRITE_STEP): bytes a single-stepped CPU write changed beside GPU data.
     /// from_window (BB_WRITE_WINDOW, UFC-48): a closing window's changed words. They are newer
     /// than the GPU bytes they touch (WindowMerge): those stop being GPU-modified now, and the
-    /// words reach VRAM whole.
-    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window = false);
+    /// words reach VRAM whole. Returns the GPU bytes a window's words took over (0 otherwise).
+    u64 NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window = false);
+    /// UFC-48: the GPU-modified ranges in [addr, addr + size), clipped (gpu_ranges_mutex).
+    std::vector<std::pair<VAddr, VAddr>> GpuModifiedRangesIn(VAddr addr, u64 size) const;
     /// bbport, without write tracking (any thread): the CPU wrote [addr, addr + size) next to data
     /// the GPU keeps in VRAM. Exactly those bytes are copied into VRAM from the game's memory at the
     /// next binding: no readback of the GPU's data, nothing uploaded over it.

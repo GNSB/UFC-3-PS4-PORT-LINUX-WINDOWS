@@ -17,12 +17,17 @@
 #include "video_core/page_watch_perms.h"
 #include "video_core/wait_watch.h"
 #include "video_core/write_window_merge.h"
+#include "video_core/write_window_sites.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <bitset>
+#include <chrono>
 #include <deque>
+#include <mutex>
+#include <set>
+#include <thread>
 #include <unordered_set>
 #ifndef _WIN32
 #include <sys/uio.h>
@@ -313,11 +318,21 @@ struct WriteWindow {
     VAddr page;
     std::array<u8, TRACKER_BYTES_PER_PAGE> before;
     u64 audit_id = 0;
+    WindowSites::Site site; ///< UFC-48: the write that opened it
 };
 WaitWatch::Mutex windows_mutex{"windows_mutex"};
 std::vector<std::unique_ptr<WriteWindow>> open_windows;
 // UFC-48: faults on a page already open in a window (it had been protected again meanwhile).
 std::atomic<u64> window_reprotects{0};
+// UFC-48: write sites whose window changed GPU-owned bytes (WindowSites). Leaf lock: checked
+// on every fault that would open a window, updated by CloseWindows under windows_mutex.
+std::mutex barred_mutex;
+WindowSites::Barred<256> barred_sites;
+std::atomic<bool> any_barred{false};
+// UFC-48: GPU bytes left GPU-owned on pages where a window took over others (frame stats).
+std::atomic<u64> window_ambiguous_bytes{0};
+// UFC-48 (BB_WRITE_WINDOW_DIAG): the compute shader whose bindings this thread obtains.
+thread_local u64 diag_shader = 0;
 
 // UFC-48: a write faulting on one page over and over (a handler answering "retry" while the page
 // stays protected) froze the game with no line in the log. Reported once per streak: a guest
@@ -399,14 +414,31 @@ struct WindowAuditRecord {
     // UFC-48: changed bytes the GPU claimed again after the close (a written binding over them,
     // DiagnoseGpuWrite): a readback of those writes the GPU's newer value, not over the CPU's.
     std::bitset<TRACKER_BYTES_PER_PAGE> reclaimed{};
+    // UFC-48: GPU-owned bytes the window left GPU-owned (not changed in the guest): the CPU may
+    // have rewritten them with the stale guest value, and the GPU reads VRAM's. `taken`: GPU
+    // bytes the window's changes took over on the page (a site writing over GPU data).
+    std::bitset<TRACKER_BYTES_PER_PAGE> ambiguous{};
+    u64 taken = 0;
 };
 std::mutex window_audit_mutex;
 std::deque<WindowAuditRecord> window_audit;
 // Pages of closed records with changed bytes (may hold stale pages: DiagnoseGpuWrite prunes).
 std::unordered_set<VAddr> window_audit_changed_pages;
+// UFC-48: pages of closed records with ambiguous bytes, ordered (bindings look up a range).
+std::set<VAddr> window_audit_ambiguous_pages;
+std::atomic<bool> window_audit_any_ambiguous{false};
 u64 window_audit_serial = 0;
 u32 window_audit_reopens = 0, window_audit_readbacks = 0, window_audit_skips = 0,
-    window_audit_regpu = 0;
+    window_audit_regpu = 0, window_audit_gpu_reads = 0;
+
+// UFC-48: bindings over ambiguous bytes, newest last (ReportWindowHazards on a GPU hang).
+struct GpuReadHit {
+    u64 shader, address, size, id, age, rip, caller, ambiguous, taken, word_at, word;
+    VAddr page;
+    bool written;
+};
+std::array<GpuReadHit, 512> gpu_read_hits{};
+u64 gpu_read_hit_count = 0;
 
 // Called while windows_mutex is held, before the page is made writable. The audit's lock is
 // never held while acquiring windows_mutex, page locks, or the buffer cache's range lock.
@@ -443,7 +475,10 @@ u64 AuditWindowOpen(const WriteWindow& window, u64 tid) {
 }
 
 // `before`: the window's snapshot, with the bytes readbacks wrote meanwhile (WriteReadback).
-void AuditWindowPhase(u64 id, const u8* after = nullptr, const u8* before = nullptr) {
+// `ambiguous`: the page's GPU-owned bytes after the close; `taken`: GPU bytes the window took.
+void AuditWindowPhase(u64 id, const u8* after = nullptr, const u8* before = nullptr,
+                      const std::bitset<TRACKER_BYTES_PER_PAGE>* ambiguous = nullptr,
+                      u64 taken = 0) {
     if (!id) {
         return;
     }
@@ -459,6 +494,12 @@ void AuditWindowPhase(u64 id, const u8* after = nullptr, const u8* before = null
                 if (record.changed.any()) {
                     window_audit_changed_pages.insert(record.page);
                 }
+                record.taken = taken;
+                if (ambiguous && ambiguous->any()) {
+                    record.ambiguous = *ambiguous;
+                    window_audit_ambiguous_pages.insert(record.page);
+                    window_audit_any_ambiguous.store(true, std::memory_order_relaxed);
+                }
             }
             break;
         }
@@ -471,6 +512,25 @@ void PageManager::DiagnoseGpuWrite(VAddr address, u64 size) {
         return;
     }
     std::scoped_lock lk{window_audit_mutex};
+    // UFC-48: a GPU write over ambiguous bytes makes VRAM's value the newer one.
+    const VAddr end_all = address + size;
+    for (auto it = window_audit_ambiguous_pages.lower_bound(address & ~VAddr(PM_PAGE_SIZE - 1));
+         it != window_audit_ambiguous_pages.end() && *it < end_all;) {
+        const VAddr page = *it;
+        const u64 from = std::max(address, page) - page;
+        const u64 to = std::min<VAddr>(end_all, page + PM_PAGE_SIZE) - page;
+        bool any = false;
+        for (auto& r : window_audit) {
+            if (r.page != page || r.phase != WindowAuditRecord::Closed) {
+                continue;
+            }
+            for (u64 o = from; o < to; ++o) {
+                r.ambiguous[o] = false;
+            }
+            any |= r.ambiguous.any();
+        }
+        it = any ? std::next(it) : window_audit_ambiguous_pages.erase(it);
+    }
     if (window_audit_changed_pages.empty()) {
         return;
     }
@@ -507,6 +567,104 @@ void PageManager::DiagnoseGpuWrite(VAddr address, u64 size) {
             window_audit_changed_pages.erase(page);
         }
     }
+}
+
+void PageManager::SetDiagShader(u64 hash) {
+    diag_shader = hash;
+}
+
+void PageManager::DiagnoseGpuRead(VAddr address, u64 size, bool written) {
+    if (size == 0 || !window_audit_any_ambiguous.load(std::memory_order_relaxed) ||
+        !WindowAuditEnabled()) {
+        return;
+    }
+    std::scoped_lock lk{window_audit_mutex};
+    const VAddr end = address + size;
+    for (auto it = window_audit_ambiguous_pages.lower_bound(address & ~VAddr(PM_PAGE_SIZE - 1));
+         it != window_audit_ambiguous_pages.end() && *it < end; ++it) {
+        const VAddr page = *it;
+        const u64 from = std::max(address, page) - page;
+        const u64 to = std::min<VAddr>(end, page + PM_PAGE_SIZE) - page;
+        // The newest closed record of the page with ambiguous bytes in the binding.
+        for (auto r = window_audit.rbegin(); r != window_audit.rend(); ++r) {
+            if (r->page != page || r->phase != WindowAuditRecord::Closed || r->ambiguous.none()) {
+                continue;
+            }
+            u64 count = 0, first = to;
+            for (u64 o = from; o < to; ++o) {
+                if (r->ambiguous[o]) {
+                    ++count;
+                    first = std::min(first, o);
+                }
+            }
+            if (count == 0) {
+                break;
+            }
+            GpuReadHit hit{.shader = diag_shader, .address = address, .size = size, .id = r->id,
+                           .age = window_audit_serial - r->id, .rip = r->rip, .caller = r->caller,
+                           .ambiguous = count, .taken = r->taken,
+                           .word_at = page + (first & ~u64{7}), .word = 0, .page = page,
+                           .written = written};
+            runtime_memory_read_backing(hit.word_at, &hit.word, sizeof(hit.word));
+            gpu_read_hits[gpu_read_hit_count++ % gpu_read_hits.size()] = hit;
+            // Live only where the window took over GPU bytes (a site writing over GPU data); the
+            // rest (GPU data beside CPU data, every frame of a fight) goes to the hang report.
+            if (r->taken != 0 && window_audit_gpu_reads < WindowAuditMax()) {
+                ++window_audit_gpu_reads;
+                std::printf("Write window audit: gpu-reads-ambiguous cs=%016llx binding=%#llx+%llu "
+                            "written=%d page=%#llx id=%llu age=%llu opener=%#llx caller=+%#llx "
+                            "window_took=%llu ambiguous=%llu word=%#llx guest=%#llx\n",
+                            (unsigned long long)hit.shader, (unsigned long long)address,
+                            (unsigned long long)size, written ? 1 : 0, (unsigned long long)page,
+                            (unsigned long long)hit.id, (unsigned long long)hit.age,
+                            (unsigned long long)hit.rip, (unsigned long long)hit.caller,
+                            (unsigned long long)hit.taken, (unsigned long long)count,
+                            (unsigned long long)hit.word_at, (unsigned long long)hit.word);
+            }
+            break;
+        }
+    }
+}
+
+void PageManager::ReportWindowHazards(u64 hash) {
+    if (!WindowAuditEnabled()) {
+        return;
+    }
+    // A hung GPU leaves the other threads waiting, none inside the audit; still, never block here.
+    std::unique_lock lk{window_audit_mutex, std::defer_lock};
+    for (int i = 0; i < 100 && !lk.try_lock(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!lk.owns_lock()) {
+        std::printf("    write window audit: busy\n");
+        return;
+    }
+    u64 shown = 0, total = 0;
+    const u64 kept = std::min<u64>(gpu_read_hit_count, gpu_read_hits.size());
+    for (u64 n = 0; n < kept; ++n) {
+        const auto& hit = gpu_read_hits[(gpu_read_hit_count - 1 - n) % gpu_read_hits.size()];
+        if (hit.shader != hash) {
+            continue;
+        }
+        ++total;
+        if (shown++ >= 16) {
+            continue;
+        }
+        std::printf("    write window audit: cs %016llx bound %#llx+%llu (written %d) over %llu "
+                    "GPU-owned bytes window id=%llu left unchanged on page %#llx (age %llu, "
+                    "opener %#llx caller +%#llx, the window took over %llu GPU bytes there); "
+                    "guest %#llx at %#llx\n",
+                    (unsigned long long)hit.shader, (unsigned long long)hit.address,
+                    (unsigned long long)hit.size, hit.written ? 1 : 0,
+                    (unsigned long long)hit.ambiguous, (unsigned long long)hit.id,
+                    (unsigned long long)hit.page, (unsigned long long)hit.age,
+                    (unsigned long long)hit.rip, (unsigned long long)hit.caller,
+                    (unsigned long long)hit.taken, (unsigned long long)hit.word,
+                    (unsigned long long)hit.word_at);
+    }
+    std::printf("    write window audit: %llu of the last %llu bindings over bytes a window left "
+                "GPU-owned were this shader's (UFC-48)\n",
+                (unsigned long long)total, (unsigned long long)kept);
 }
 
 void PageManager::DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip) {
@@ -840,6 +998,7 @@ struct PageManager::Impl {
         }
         auto window = std::make_unique<WriteWindow>();
         window->page = page;
+        window->site = {current_fault_rip, current_fault_caller};
         runtime_memory_read_backing(page, window->before.data(), PM_PAGE_SIZE);
         window->audit_id = AuditWindowOpen(*window, StepTid());
         open_windows.push_back(std::move(window));
@@ -873,13 +1032,62 @@ struct PageManager::Impl {
             }
             runtime_memory_read_backing(page, after.data(), PM_PAGE_SIZE);
             // The CPU's words win over GPU bytes they touch (WindowMerge, from_window).
+            u64 taken = 0;
             WindowMerge::ForEachChangedRun(
                 window->before.data(), after.data(), PM_PAGE_SIZE, [&](u64 at, u64 size) {
-                    rasterizer->NoteSteppedWrite(
+                    taken += rasterizer->NoteSteppedWrite(
                         page + at, std::vector<u8>(after.data() + at, after.data() + at + size),
                         true);
                 });
-            AuditWindowPhase(window->audit_id, after.data(), window->before.data());
+            // UFC-48: what is still GPU-owned was not changed in the guest. Where the window took
+            // over GPU bytes (the site writes over GPU data) the CPU may have rewritten some of
+            // these with their stale guest value: no diff can tell, VRAM's value stays. Such a
+            // site reads back from now on (WindowSites); a GPU hang on a loop bound read from
+            // there (UFC-48 test 4: cs 37aa67f4, per-vertex morph counts) is what this prevents.
+            const bool audit = window->audit_id != 0;
+            std::bitset<TRACKER_BYTES_PER_PAGE> ambiguous;
+            if (taken != 0 || audit) {
+                u64 left = 0;
+                for (const auto& [a, b] : rasterizer->GpuModifiedRangesIn(page, PM_PAGE_SIZE)) {
+                    left += b - a;
+                    for (VAddr at = a; at < b && audit; ++at) {
+                        ambiguous[at - page] = true;
+                    }
+                }
+                if (taken != 0) {
+                    window_ambiguous_bytes.fetch_add(left, std::memory_order_relaxed);
+                    BarWindowSite(window->site, page, taken, left);
+                }
+            }
+            AuditWindowPhase(window->audit_id, after.data(), window->before.data(), &ambiguous,
+                             taken);
+        }
+    }
+
+    static void BarWindowSite(const WindowSites::Site& site, VAddr page, u64 taken, u64 left) {
+        if (site.rip == 0) {
+            return;
+        }
+        bool added, full;
+        {
+            std::scoped_lock bl{barred_mutex};
+            added = barred_sites.Add(site);
+            full = barred_sites.Full();
+            any_barred.store(true, std::memory_order_release);
+        }
+        if (added) {
+            std::printf("Write windows: site %s (from +%#llx) changed %llu GPU-owned bytes of page "
+                        "%#llx in a window (%llu left GPU-owned beside them); its writes to GPU "
+                        "pages read back from now on (UFC-48)\n",
+                        SiteName(site.rip).c_str(), (unsigned long long)site.caller,
+                        (unsigned long long)taken, (unsigned long long)page,
+                        (unsigned long long)left);
+        } else if (full) {
+            static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+            if (!reported.test_and_set()) {
+                std::printf("Write windows: more barred sites than the table holds; no more "
+                            "windows (UFC-48)\n");
+            }
         }
     }
 
@@ -1346,6 +1554,18 @@ void PageManager::CloseWriteWindows() {
 
 u64 PageManager::TakeWindowReprotects() {
     return window_reprotects.exchange(0, std::memory_order_relaxed);
+}
+
+bool PageManager::WindowSiteBarred() {
+    if (!any_barred.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::scoped_lock bl{barred_mutex};
+    return barred_sites.Bars({current_fault_rip, current_fault_caller});
+}
+
+u64 PageManager::TakeWindowAmbiguousBytes() {
+    return window_ambiguous_bytes.exchange(0, std::memory_order_relaxed);
 }
 
 void PageManager::ReadbackSnapshot(VAddr addr, u8* out, u64 size) {
