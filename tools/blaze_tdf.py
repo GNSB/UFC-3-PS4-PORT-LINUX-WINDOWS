@@ -127,10 +127,14 @@ def _decode_value(t: int, data: bytes, pos: int):
         return decode_int(data, pos)
     if t in (STRING, BLOB):
         n, pos = decode_int(data, pos)
+        if n < 0 or pos + n > len(data) or (t == STRING and n == 0):
+            raise ValueError('invalid or truncated TDF string/blob')
         raw = data[pos:pos + n]
         pos += n
         if t == STRING:
-            return raw[:-1].decode('utf-8', 'replace') if raw.endswith(b'\0') else raw.decode('utf-8', 'replace'), pos
+            if not raw.endswith(b'\0'):
+                raise ValueError('unterminated TDF string')
+            return raw[:-1].decode('utf-8', 'strict'), pos
         return raw, pos
     if t == STRUCT:
         if pos < len(data) and data[pos] == 2:  # struct with a version prefix (heat2 "has base")
@@ -139,6 +143,8 @@ def _decode_value(t: int, data: bytes, pos: int):
     if t == LIST:
         elem_type = data[pos]; pos += 1
         n, pos = decode_int(data, pos)
+        if n < 0 or n > len(data) - pos:
+            raise ValueError('invalid TDF list length')
         items = []
         for _ in range(n):
             item, pos = _decode_value(elem_type, data, pos)
@@ -147,6 +153,8 @@ def _decode_value(t: int, data: bytes, pos: int):
     if t == MAP:
         key_type, value_type = data[pos], data[pos + 1]; pos += 2
         n, pos = decode_int(data, pos)
+        if n < 0 or n > len(data) - pos:
+            raise ValueError('invalid TDF map length')
         pairs = []
         for _ in range(n):
             k, pos = _decode_value(key_type, data, pos)
@@ -216,7 +224,11 @@ def decode_struct(data: bytes, pos: int = 0, nested: bool = False):
         t = data[pos + 3]
         pos += 4
         value, pos = _decode_value(t, data, pos)
+        if tag in out:
+            raise ValueError('duplicate TDF tag')
         out[tag] = (t, value)
+    if nested:
+        raise ValueError('unterminated TDF struct')
     return out, pos
 
 

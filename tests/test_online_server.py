@@ -232,6 +232,37 @@ class BlazeSessionTests(unittest.IsolatedAsyncioTestCase):
                     post = await read_frame(reader)
                     self.assertEqual((post.msg_type, post.component, post.command, post.msg_num), (REPLY, 9, 8, 43))
                     self.assertEqual(decode_struct(post.payload)[0]['UROP'][1]['UID'], (INT, account.id))
+                    # Failures use Fire2 metadata, preserve correlation, and keep TCP usable.
+                    from blaze_tdf import ERROR_REPLY, MAP, GENERIC, encode_tag, encode_int
+                    import tempfile
+                    import struct
+                    prefix = encode_struct(Struct(CMGD=(STRUCT, Struct(GVER=(STRING, '1.14'))),
+                                                  SCNM=(STRING, 'ufcH2HUnranked')))
+                    # A fully decoded criterion with an invalid generic value.
+                    invalid = prefix + encode_tag('SCNA') + bytes([MAP, STRING, GENERIC]) + encode_int(1)
+                    invalid += encode_int(len('UFC_WEIGHT_CLASS') + 1) + b'UFC_WEIGHT_CLASS\0' + b'\0'
+                    # A truncated generic after otherwise valid fields must never enter the queue.
+                    truncated = invalid[:-1] + b'\1'
+                    with tempfile.TemporaryDirectory() as raw_dir, patch.object(ufc3_server, 'RAW_DIR', raw_dir):
+                        for number, command, payload in ((44, 0x10, invalid), (45, 0x10, truncated),
+                                                         (46, 0xD, b''), (47, 0xFFFF, b'')):
+                            writer.write(Frame(4, command, number, MESSAGE, payload).encode())
+                            await writer.drain()
+                            failure = await read_frame(reader)
+                            self.assertEqual((failure.msg_type, failure.component, failure.command, failure.msg_num),
+                                             (ERROR_REPLY, 4, command, number))
+                            self.assertEqual(failure.payload, b'')
+                            expected = 0x40010000 if number < 46 else 0x40030000
+                            self.assertEqual(decode_struct(failure.metadata)[0]['ERRC'], (INT, expected))
+                            encoded = failure.encode()
+                            self.assertEqual(struct.unpack('>IHHH', encoded[:10]),
+                                             (0, len(failure.metadata), 4, command))
+                            self.assertEqual(encoded[13], 0x60)  # Fire2 ERROR_REPLY, not an empty success.
+                            self.assertFalse(ufc3_server.ufc3_games.SEARCHES)
+                    writer.write(Frame(9, 8, 48, MESSAGE).encode())
+                    await writer.drain()
+                    self.assertEqual((await read_frame(reader)).msg_type, REPLY)
+
                 finally:
                     await ufc3_server.close_writer(writer)
                 await asyncio.wait_for(completed.wait(), 2)
@@ -365,6 +396,364 @@ class GameManagerTests(unittest.TestCase):
                 self.assertNotIn(tag, game)
             self.assertIn('HSES', game['PHST'][1])  # it belongs to HostInfo
             self.assertEqual(game['VSTR'], (STRING, '1.14'))
+
+
+class RoomLifecycleTests(unittest.TestCase):
+    class Writer:
+        def __init__(self):
+            self.closed = False
+            self.frames = []
+
+        def is_closing(self):
+            return self.closed
+
+        def write(self, data):
+            self.frames.extend(read_frames(bytearray(data)))
+
+        def close(self):
+            self.closed = True
+
+    def setUp(self):
+        import ufc3_games as gm
+        from ufc3_auth import Account
+        self.gm = gm
+        gm.GAMES.clear()
+        gm.SEARCHES.clear()
+        self.addCleanup(gm.GAMES.clear)
+        self.addCleanup(gm.SEARCHES.clear)
+        self.accounts = [Account(100 + i, i + 1, f'Player{i}') for i in range(3)]
+        self.writers = [self.Writer() for _ in self.accounts]
+
+    def call(self, command, who=0, **fields):
+        return self.gm.handle(command, Struct(fields), self.accounts[who], self.writers[who],
+                              '192.168.1.10', lambda *_: None)
+
+    def room(self, join=True):
+        body, _ = self.call(self.gm.CREATE_GAME)
+        gid = decode_struct(body)[0]['GID'][1]
+        game = self.gm.GAMES[gid]
+        if join:
+            self.call(self.gm.JOIN_GAME, 1, GID=(INT, gid))
+        return game
+
+    def connect(self, game):
+        from blaze_tdf import OBJID
+        notes = []
+        for who, target in ((0, 1), (1, 0)):
+            _, out = self.call(self.gm.MESH_ENDPOINTS_CONNECTED, who, GID=(INT, game.gid),
+                               TCG=(OBJID, (self.gm.USER_SESSIONS, 2, self.accounts[target].id)))
+            notes += out
+        return notes
+
+    def search(self, who, version='1.14', scenario='ufcH2HUnranked', **extra):
+        body, notes = self.call(self.gm.START_MATCHMAKING_SCENARIO, who,
+                                CMGD=(STRUCT, Struct(GVER=(STRING, version))),
+                                SCNM=(STRING, scenario), **extra)
+        return decode_struct(body)[0]['MSID'][1], notes
+
+    @staticmethod
+    def bodies(notes, command):
+        return [decode_struct(frame.payload)[0] for _, frame in notes if frame.command == command]
+
+    def test_guest_leaves_without_tcp_close_and_can_join_again(self):
+        from blaze_tdf import OBJID
+        game = self.room()
+        self.connect(game)
+        _, notes = self.call(self.gm.LEAVE_GAME_BY_GROUP, 1, GID=(INT, game.gid),
+                             PID=(INT, self.accounts[1].id), REAS=(INT, 8), CNTX=(INT, 42),
+                             BTPL=(OBJID, (self.gm.USER_SESSIONS, 2, self.accounts[1].id)))
+        self.assertEqual(game.players, [game.host])
+        self.assertEqual(game.links, set())
+        self.assertFalse(self.writers[1].closed)
+        removed = self.bodies(notes, self.gm.NOTIFY_PLAYER_REMOVED)
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(removed[0]['REAS'], (INT, 8))
+        self.assertEqual(removed[0]['CNTX'], (INT, 42))
+        self.call(self.gm.JOIN_GAME, 1, GID=(INT, game.gid))
+        self.assertEqual(game.find(self.accounts[1].id).slot, 1)
+
+    def test_host_leaves_notifies_both_and_both_can_search_again(self):
+        game = self.room()
+        self.connect(game)
+        _, notes = self.call(self.gm.REMOVE_PLAYER, GID=(INT, game.gid), PID=(INT, self.accounts[0].id),
+                             REAS=(INT, 7))
+        self.assertEqual(self.gm.GAMES, {})
+        self.assertEqual(game.players, [])
+        self.assertEqual(game.links, set())
+        removed = self.bodies(notes, self.gm.NOTIFY_GAME_REMOVED)
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(removed[0]['REAS'], (INT, 4))  # UFC HOST_LEAVING, not Blaze3's 2.
+        self.search(0)
+        self.search(1)
+        self.assertEqual(len(self.gm.GAMES), 1)
+
+    def test_host_kick_removes_target_and_destroy_removes_room(self):
+        game = self.room()
+        self.connect(game)
+        self.call(self.gm.REMOVE_PLAYER, GID=(INT, game.gid), PID=(INT, self.accounts[1].id), REAS=(INT, 9))
+        self.assertEqual(game.players, [game.host])
+        body, notes = self.call(self.gm.DESTROY_GAME, GID=(INT, game.gid), REAS=(INT, 0))
+        self.assertEqual(decode_struct(body)[0]['GID'], (INT, game.gid))
+        self.assertEqual(self.bodies(notes, self.gm.NOTIFY_GAME_REMOVED)[0]['REAS'], (INT, 0))
+        self.assertFalse(self.gm.GAMES)
+
+    def test_transport_disconnect_cleans_roster_and_old_socket_cannot_remove_new_room(self):
+        game = self.room()
+        self.connect(game)
+        notes = self.gm.leave(self.accounts[1].id, lambda *_: None, writer=self.writers[1])
+        self.assertEqual(game.players, [game.host])
+        self.assertEqual(self.bodies(notes, self.gm.NOTIFY_PLAYER_REMOVED)[0]['REAS'], (INT, 3))
+        old_writer = self.writers[1]
+        self.writers[1] = self.Writer()
+        self.call(self.gm.JOIN_GAME, 1, GID=(INT, game.gid))
+        self.assertEqual(self.gm.leave(self.accounts[1].id, lambda *_: None, writer=old_writer), [])
+        self.assertEqual(len(game.players), 2)
+        self.writers[0].closed = True
+        notes = self.gm.expire(lambda *_: None)
+        self.assertFalse(self.gm.GAMES)
+        self.assertTrue(self.bodies(notes, self.gm.NOTIFY_GAME_REMOVED))
+        self.assertTrue(all(writer is self.writers[1] for writer, _ in notes))
+
+    def test_mesh_loss_removes_target_and_links(self):
+        from blaze_tdf import OBJID
+        for command in (self.gm.MESH_ENDPOINTS_DISCONNECTED, self.gm.MESH_ENDPOINTS_CONNECTION_LOST):
+            with self.subTest(command=command):
+                game = self.room()
+                self.connect(game)
+                _, notes = self.call(command, GID=(INT, game.gid),
+                                     TCG=(OBJID, (self.gm.USER_SESSIONS, 2, self.accounts[1].id)))
+                self.assertEqual(game.players, [game.host])
+                self.assertFalse(game.links)
+                self.assertEqual(self.bodies(notes, self.gm.NOTIFY_PLAYER_REMOVED)[0]['REAS'], (INT, 2))
+                self.gm.GAMES.clear()
+
+    def test_invalid_gid_authority_and_transition_do_not_mutate(self):
+        from blaze_tdf import MAP, OBJID
+        game = self.room()
+        cases = [
+            (self.gm.ADVANCE_GAME_STATE, 0, {'GID': (INT, 9999), 'GSTA': (INT, self.gm.PRE_GAME)}),
+            (self.gm.ADVANCE_GAME_STATE, 1, {'GSTA': (INT, self.gm.PRE_GAME)}),
+            (self.gm.ADVANCE_GAME_STATE, 2, {'GSTA': (INT, self.gm.PRE_GAME)}),
+            (self.gm.ADVANCE_GAME_STATE, 0, {'GID': (STRING, str(game.gid)), 'GSTA': (INT, self.gm.PRE_GAME)}),
+            (self.gm.ADVANCE_GAME_STATE, 0, {'GSTA': (INT, self.gm.IN_GAME)}),
+            (self.gm.ADVANCE_GAME_STATE, 0, {'GSTA': (INT, 0x999)}),
+            (self.gm.FINALIZE_GAME_CREATION, 1, {}),
+            (self.gm.DESTROY_GAME, 1, {}),
+            (self.gm.SET_GAME_SETTINGS, 1, {'GSET': (INT, 42)}),
+            (self.gm.SET_GAME_ATTRIBUTES, 1, {'ATTR': (MAP, (STRING, STRING, [('x', 'y')]))}),
+            (self.gm.REMOVE_PLAYER, 1, {'PID': (INT, self.accounts[0].id)}),
+            (self.gm.REMOVE_PLAYER, 0, {'PID': (INT, 9999)}),
+            (self.gm.MESH_ENDPOINTS_CONNECTED, 0, {'TCG': (INT, self.accounts[1].id)}),
+            (self.gm.MESH_ENDPOINTS_CONNECTED, 0, {'TCG': (OBJID, (4, 2, self.accounts[1].id))}),
+            (self.gm.MESH_ENDPOINTS_CONNECTED, 0, {'TCG': (OBJID, (self.gm.USER_SESSIONS, 1, self.accounts[1].id))}),
+            (self.gm.MESH_ENDPOINTS_CONNECTED, 0, {'TCG': (OBJID, (self.gm.USER_SESSIONS, 2, 9999))}),
+        ]
+        before = game.setup(game.host)
+        for command, who, fields in cases:
+            with self.subTest(command=command, who=who, fields=fields):
+                request = {'GID': (INT, game.gid)} | fields
+                with self.assertRaises(self.gm.GameError):
+                    self.call(command, who, **request)
+                self.assertEqual(game.setup(game.host), before)
+                self.assertFalse(game.links)
+                self.assertFalse(game.finalized)
+
+    def test_states_timestamps_and_mesh_completion_are_consistent_and_once_only(self):
+        game = self.room()
+        self.assertEqual(game.host.state, self.gm.ACTIVE_CONNECTED)
+        self.assertGreater(game.host.joined_at, 0)
+        self.assertEqual(game.players[1].joined_at, 0)
+        self.call(self.gm.ADVANCE_GAME_STATE, GID=(INT, game.gid), GSTA=(INT, self.gm.PRE_GAME))
+        self.call(self.gm.FINALIZE_GAME_CREATION, GID=(INT, game.gid))
+        with self.assertRaises(self.gm.GameError):
+            self.call(self.gm.ADVANCE_GAME_STATE, GID=(INT, game.gid), GSTA=(INT, self.gm.IN_GAME))
+        notes = self.connect(game)
+        done = self.bodies(notes, self.gm.NOTIFY_PLAYER_JOIN_COMPLETED)
+        self.assertEqual(len(done), 2)
+        self.assertGreater(done[0]['TIME'][1], 0)
+        self.assertEqual(done[0]['TIME'], game.players[1].replicated(game)['TIME'])
+        self.assertEqual(self.connect(game), [])
+        self.assertEqual(self.call(self.gm.FINALIZE_GAME_CREATION, GID=(INT, game.gid)), (b'', []))
+        for state in (self.gm.IN_GAME, self.gm.POST_GAME, self.gm.PRE_GAME):
+            self.call(self.gm.ADVANCE_GAME_STATE, GID=(INT, game.gid), GSTA=(INT, state))
+            self.assertEqual(game.state, state)
+
+    def test_no_duplicate_full_or_unknown_game_join_and_failed_join_preserves_membership(self):
+        game = self.room()
+        for who, gid in ((1, game.gid), (2, game.gid), (1, 9999)):
+            with self.subTest(who=who, gid=gid), self.assertRaises(self.gm.GameError):
+                self.call(self.gm.JOIN_GAME, who, GID=(INT, gid))
+        self.assertEqual(len(game.players), 2)
+        with self.assertRaises(self.gm.GameError):
+            self.call(self.gm.CREATE_GAME, GMCD=(STRUCT, Struct(PMAX=(INT, 3))))
+        self.assertIs(self.gm.game_of(self.accounts[0].id), game)
+
+    def test_direct_join_cancels_waiting_search_only_after_join_is_validated(self):
+        msid, _ = self.search(1)
+        game = self.room(False)
+        with self.assertRaises(self.gm.GameError):
+            self.call(self.gm.JOIN_GAME, 1, GID=(INT, 9999))
+        self.assertEqual(self.gm.SEARCHES[0].msid, msid)
+        _, notes = self.call(self.gm.JOIN_GAME, 1, GID=(INT, game.gid))
+        self.assertFalse(self.gm.SEARCHES)
+        self.assertEqual(len(game.players), 2)
+        self.assertEqual(self.bodies(notes, self.gm.NOTIFY_MATCHMAKING_FAILED)[0]['MSID'], (INT, msid))
+        self.search(2)
+        self.assertEqual(len(self.gm.GAMES), 1)
+        self.assertEqual(len(self.gm.SEARCHES), 1)
+
+    def test_versions_are_isolated_and_unknown_scenario_rejected(self):
+        self.search(0, version='1.14')
+        self.search(1, version='1.15')
+        self.assertFalse(self.gm.GAMES)
+        self.assertEqual(len(self.gm.SEARCHES), 2)
+        with self.assertRaises(self.gm.GameError):
+            self.search(2, scenario='ranked')
+        self.assertEqual(len(self.gm.SEARCHES), 2)
+        self.search(2, version='1.14')
+        self.assertEqual(len(self.gm.GAMES), 1)
+        self.assertEqual(len(self.gm.SEARCHES), 1)
+
+    def test_malformed_unknown_duplicate_and_conflicting_criteria_fail_closed(self):
+        from blaze_tdf import MAP, GENERIC
+        generic = lambda values: ('generic', 2806890242, (STRING, values))
+        bad = [ (INT, 0), (MAP, (STRING, STRING, [])),
+                (MAP, (STRING, GENERIC, [('UNKNOWN', generic(['0']))])),
+                (MAP, (STRING, GENERIC, [('UFC_WEIGHT_CLASS', None)])),
+                (MAP, (STRING, GENERIC, [('UFC_WEIGHT_CLASS', generic(['abstain', '0']))])),
+                (MAP, (STRING, GENERIC, [('UFC_WEIGHT_CLASS', generic(['0'])),
+                                       ('UFC_WEIGHT_CLASS', generic(['1']))])) ]
+        game = self.room(False)
+        for scna in bad:
+            with self.subTest(scna=scna), self.assertRaises(self.gm.GameError):
+                self.search(0, SCNA=scna)
+            self.assertIs(self.gm.game_of(self.accounts[0].id), game)
+            self.assertFalse(self.gm.SEARCHES)
+
+    def test_cancel_is_owned_by_msid_and_account_and_does_not_cancel_replacement(self):
+        first, _ = self.search(0)
+        for who, msid in ((1, first), (0, first + 100)):
+            with self.assertRaises(self.gm.GameError):
+                self.call(self.gm.CANCEL_MATCHMAKING_SCENARIO, who, MSID=(INT, msid))
+        _, notes = self.call(self.gm.CANCEL_MATCHMAKING_SCENARIO, MSID=(INT, first))
+        self.assertEqual(self.bodies(notes, self.gm.NOTIFY_MATCHMAKING_FAILED)[0]['RSLT'], (INT, 4))
+        second, _ = self.search(0)
+        with self.assertRaises(self.gm.GameError):
+            self.call(self.gm.CANCEL_MATCHMAKING_SCENARIO, MSID=(INT, first))
+        self.assertEqual(self.gm.SEARCHES[0].msid, second)
+
+    def test_cancel_pending_match_cleans_both_but_validated_match_is_finished(self):
+        for who in (0, 1):
+            first, _ = self.search(0)
+            second, _ = self.search(1)
+            _, notes = self.call(self.gm.CANCEL_MATCHMAKING_SCENARIO, who, MSID=(INT, (first, second)[who]))
+            self.assertFalse(self.gm.GAMES)
+            self.assertEqual(len(self.bodies(notes, self.gm.NOTIFY_GAME_REMOVED)), 2)
+            failures = self.bodies(notes, self.gm.NOTIFY_MATCHMAKING_FAILED)
+            self.assertEqual(sorted(f['RSLT'][1] for f in failures), [4, 5])
+        first, _ = self.search(0)
+        self.search(1)
+        game = next(iter(self.gm.GAMES.values()))
+        notes = self.connect(game)
+        self.assertEqual(len(self.bodies(notes, self.gm.NOTIFY_MATCHMAKING_CONNECTION_VALIDATED)), 2)
+        self.assertEqual([p.search for p in game.players], [0, 0])
+        with self.assertRaises(self.gm.GameError):
+            self.call(self.gm.CANCEL_MATCHMAKING_SCENARIO, MSID=(INT, first))
+        self.assertIn(game.gid, self.gm.GAMES)
+
+    def test_idle_search_timeout_and_closed_writer_cleanup(self):
+        with patch('ufc3_games.time.monotonic', return_value=100):
+            msid, _ = self.search(0)
+            self.search(1, version='other')
+        self.writers[1].closed = True
+        notes = self.gm.expire(lambda *_: None, now=161)
+        self.assertFalse(self.gm.SEARCHES)
+        self.assertEqual(len(notes), 1)
+        failure = self.bodies(notes, self.gm.NOTIFY_MATCHMAKING_FAILED)[0]
+        self.assertEqual(failure['MSID'], (INT, msid))
+        self.assertEqual(failure['RSLT'], (INT, 3))
+        self.assertEqual(self.gm.expire(lambda *_: None, now=200), [])
+
+    def test_matched_and_direct_join_timeouts(self):
+        self.search(0)
+        self.search(1)
+        game = next(iter(self.gm.GAMES.values()))
+        notes = self.gm.expire(lambda *_: None, now=max(p.deadline for p in game.players) + 1)
+        self.assertFalse(self.gm.GAMES)
+        self.assertEqual(len(self.bodies(notes, self.gm.NOTIFY_MATCHMAKING_FAILED)), 2)
+        game = self.room()
+        notes = self.gm.expire(lambda *_: None, now=game.players[1].deadline + 1)
+        self.assertEqual(game.players, [game.host])
+        self.assertEqual(self.bodies(notes, self.gm.NOTIFY_PLAYER_REMOVED)[0]['REAS'], (INT, 0))
+
+    def test_real_wire_criteria_decode_completely_and_match(self):
+        from blaze_tdf import MAP, GENERIC, encode_struct, encode_tag, encode_int
+        request = Struct(CMGD=(STRUCT, Struct(GVER=(STRING, '1.14'))),
+                         SCNM=(STRING, 'ufcH2HUnranked'))
+        # UFC's untagged GenericTdfType contains a list<string> (tdf id 2806890242).
+        values = ['2', '5']
+        raw = encode_struct(request)
+        raw += encode_tag('SCNA') + bytes([MAP, STRING, GENERIC]) + encode_int(1)
+        name = b'UFC_WEIGHT_CLASS\0'
+        raw += encode_int(len(name)) + name + b'\1' + encode_int(2806890242)
+        raw += bytes([STRING]) + encode_int(len(values))
+        for value in values:
+            raw += encode_int(2) + value.encode() + b'\0'
+        raw += b'\0'
+        decoded, consumed = decode_struct(raw)
+        self.assertEqual(consumed, len(raw))
+        self.assertEqual(self.gm.scenario_criteria(decoded), {'UFC_WEIGHT_CLASS': values})
+        for who in (0, 1):
+            self.gm.handle(self.gm.START_MATCHMAKING_SCENARIO, decoded, self.accounts[who],
+                           self.writers[who], '192.168.1.10', lambda *_: None)
+        game = next(iter(self.gm.GAMES.values()))
+        self.assertIn(dict(game.attributes)['WeightClass'], values)
+
+    def test_host_settings_and_attributes_keep_ufc_notification_shapes(self):
+        from blaze_tdf import MAP
+        game = self.room()
+        _, notes = self.call(self.gm.SET_GAME_SETTINGS, GID=(INT, game.gid), GSET=(INT, 42))
+        self.assertEqual(game.gset, 42)
+        self.assertEqual(self.bodies(notes, self.gm.NOTIFY_GAME_SETTINGS_CHANGE)[0]['ATTR'], (INT, 42))
+        self.call(self.gm.SET_GAME_ATTRIBUTES, GID=(INT, game.gid),
+                  ATTR=(MAP, (STRING, STRING, [('WeightClass', '5')])))
+        self.call(self.gm.SET_GAME_ATTRIBUTES, GID=(INT, game.gid),
+                  ATTR=(MAP, (STRING, STRING, [('ClockType', '0')])))
+        self.assertEqual(dict(game.attributes), {'WeightClass': '5', 'ClockType': '0'})
+
+    def test_truncated_nested_tdf_duplicate_tags_and_bad_lengths_are_rejected(self):
+        from blaze_tdf import encode_struct, encode_tag, encode_int, LIST, MAP
+        struct = encode_struct(Struct(CMGD=(STRUCT, Struct(GVER=(STRING, '1.14')))))
+        string = encode_struct(Struct(SCNM=(STRING, 'ufcH2HUnranked')))
+        invalid = [struct[:-1], string[:-1], string + string,
+                   encode_tag('SCNA') + bytes([MAP, STRING, INT]) + encode_int(-1),
+                   encode_tag('PROS') + bytes([LIST, INT]) + encode_int(-1)]
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises((ValueError, IndexError)):
+                decode_struct(raw)
+
+    def test_legacy_matchmaking_is_explicitly_rejected(self):
+        with self.assertRaises(self.gm.GameError) as error:
+            self.call(self.gm.START_MATCHMAKING)
+        self.assertEqual(error.exception.code, self.gm.ERR_COMMAND_NOT_FOUND)
+        self.assertFalse(self.gm.GAMES)
+        self.assertFalse(self.gm.SEARCHES)
+
+
+class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_maintenance_expires_without_client_requests(self):
+        tick = asyncio.Event()
+        def expire(log):
+            tick.set()
+            return []
+        with patch.object(ufc3_server.ufc3_games, 'expire', side_effect=expire):
+            worker = asyncio.create_task(ufc3_server.game_maintenance())
+            try:
+                await asyncio.wait_for(tick.wait(), 2)
+            finally:
+                worker.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await worker
 
 
 if __name__ == '__main__':
