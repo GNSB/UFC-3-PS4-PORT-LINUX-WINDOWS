@@ -30,6 +30,8 @@ your own dump of the game and its 1.14 update.
   Portuguese (Portugal), Polish, Russian, Japanese, Chinese (Traditional). The game ships no
   European Portuguese text: for Portuguese pick **Portuguese (Brazil)**. A `BB_LANGUAGE` set
   before the launcher (e.g. `set BB_LANGUAGE=17` in a `.bat`) wins over this choice.
+- **Online server** — the IP (or host name) of the PC that runs the online server, e.g.
+  `192.168.1.20`. Empty (the default) plays offline. See *Online (experimental)* below.
 - **Controls...** — keyboard keys (click, then press the key) and gamepad buttons for every PS4
   input. The keyboard and a gamepad work together.
 - **Game resolution** — 720p / 1080p, what the game renders.
@@ -45,10 +47,12 @@ your own dump of the game and its 1.14 update.
 
 ## Online (experimental)
 
-Off by default. The launcher has no field for it yet: to try it, start `UFC3.exe` from a `.bat`
-with `set BB_ONLINE_SERVER=192.168.1.20` (the address of the PC that runs the server). The host
-runs `python3 tools/ufc3_server.py --bind 0.0.0.0` on Linux and its own game with
-`BB_ONLINE_SERVER=127.0.0.1`. Use a different player name on each PC. Login reaches the shared
+Off by default. To try it, type the address of the PC that runs the server (e.g.
+`192.168.1.20`) in the launcher's **Online server** field and press **Play**; the launcher's log
+shows `UFC 3: online server <address>`. Clearing the field goes back to offline. A `.bat` with
+`set BB_ONLINE_SERVER=192.168.1.20` before starting `UFC3.exe` still works and wins over the
+field. The host runs `python3 tools/ufc3_server.py --bind 0.0.0.0` on Linux and its own game
+with `BB_ONLINE_SERVER=127.0.0.1`. Use a different player name on each PC. Login reaches the shared
 server; **a fight between the two PCs does not work yet**, and FighterNet and inviting a friend
 are not finished.
 

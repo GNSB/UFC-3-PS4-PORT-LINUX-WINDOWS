@@ -2,7 +2,7 @@
  * which cannot be produced from Linux for the bundled Python; this one is built by the cross
  * toolchain with no dependency beyond Windows). GPL-2.0-or-later.
  *
- * Window: the game folder (picker; the game check decides), the game language, the controller for port 1, the
+ * Window: the game folder (picker; the game check decides), the game language, the online server, the controller for port 1, the
  * game patches (written to bbport.ini as the in-game menu does), PS4 Pro mode, fullscreen,
  * the developer switches (frame statistics, Vulkan validation, clear the shader cache, menu
  * trace), Play/Stop, the log of the run, and buttons for the logs and data folders. Settings
@@ -43,6 +43,7 @@ static wchar_t python[PATHW], game_exe[PATHW], caps_exe[PATHW];
 /* ---- settings (<data>\sacredfire.ini) ---- */
 typedef struct {
     wchar_t game[PATHW], gamepad[128], player[32];
+    wchar_t online_server[256]; /* BB_ONLINE_SERVER: the online server's address; empty: offline */
     int neo, fullscreen, clear_cache, validation, frame_stats, menu_trace;
     /* UFC 3, as the GoW3R launcher's Video panel: the PS4 output size, the frame-rate cap,
      * the swapchain present mode; show_fps mirrors bbport.ini. */
@@ -97,7 +98,7 @@ static const wchar_t *const managed_env[] = {
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
     L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
     L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
-    L"BB_LANGUAGE",
+    L"BB_LANGUAGE", L"BB_ONLINE_SERVER",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
 static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
@@ -155,6 +156,7 @@ static void settings_load(void) {
         if (!wcscmp(line, L"game")) wcsncpy(settings.game, value, PATHW - 1);
         else if (!wcscmp(line, L"gamepad")) wcsncpy(settings.gamepad, value, 127);
         else if (!wcscmp(line, L"player")) wcsncpy(settings.player, value, 16);
+        else if (!wcscmp(line, L"online_server")) wcsncpy(settings.online_server, value, 255);
         else if (!wcscmp(line, L"neo")) settings.neo = _wtoi(value);
         else if (!wcscmp(line, L"fullscreen")) settings.fullscreen = _wtoi(value);
         else if (!wcscmp(line, L"clear_cache")) settings.clear_cache = _wtoi(value);
@@ -177,7 +179,7 @@ static void settings_save(void) {
     wchar_t path[PATHW]; settings_path(path);
     FILE *f = _wfopen(path, L"w, ccs=UTF-8");
     if (!f) return;
-    fwprintf(f, L"player=%ls\n", settings.player);
+    fwprintf(f, L"player=%ls\nonline_server=%ls\n", settings.player, settings.online_server);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
                 L"resolution=%d\nfps_limit=%ls\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\nlanguage=%ls\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
@@ -466,6 +468,7 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_GAMEPAD", settings.gamepad[0] ? settings.gamepad : NULL);
     game_env(L"BB_USER_NAME", settings.player[0] ? settings.player : NULL); /* the PS4 user name the game shows */
     game_env(L"BB_LANGUAGE", language_ids[settings.language]); /* a BB_LANGUAGE set before the launcher (a .bat) wins */
+    game_env(L"BB_ONLINE_SERVER", settings.online_server[0] ? settings.online_server : NULL); /* unset: offline */
     /* The fight scene renders black without precise readbacks of linear images (shadPS4 issue
      * #4375, UFC 4, same engine); precise readbacks deadlock against the GPU write twins, so
      * those stay off. The game asks for flip rate 1 (30 Hz); its simulation follows the real
@@ -508,6 +511,10 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
          env_or(L"BB_INTERNAL_WIDTH", L"?"), env_or(L"BB_INTERNAL_HEIGHT", L"?"), env_or(L"BB_FPS_LIMIT", L"?"),
          env_or(L"BB_PRESENT_MODE", L"?"), env_or(L"BB_FULLSCREEN", L"0"));
     logw(L"UFC 3: player name \"%ls\", language %ls (BB_LANGUAGE)\n", env_or(L"BB_USER_NAME", L"Player 1"), env_or(L"BB_LANGUAGE", L"1"));
+    {
+        const wchar_t *server = env_or(L"BB_ONLINE_SERVER", L"");
+        if (server[0]) logw(L"UFC 3: online server %ls (BB_ONLINE_SERVER)\n", server); else logw(L"UFC 3: offline (no BB_ONLINE_SERVER)\n");
+    }
     logw(L"UFC 3: window %ls, FSR 1.0 %ls, RCAS %ls (attenuation %ls), readbacks %ls (2 = precise)\n",
          env_or(L"BB_WINDOW_SIZE", L"= output"), env_or(L"BB_FSR1", L"0"), env_or(L"BB_RCAS", L"?"), env_or(L"BB_RCAS_ATTENUATION", L"?"), env_or(L"BB_READBACKS", L"?"));
     if (settings.clear_cache || !wcscmp(env_or(L"BB_CLEAR_SHADER_CACHE", L"0"), L"1")) {
@@ -714,7 +721,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_ONLINE, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -951,6 +958,14 @@ static void read_controls(void) {
         settings.player[k] = 0;
         SetWindowTextW(control(ID_PLAYER), settings.player);
     }
+    {
+        /* An IP or a host name (a :port is ignored by the game): no spaces. */
+        wchar_t server[256]; GetWindowTextW(control(ID_ONLINE), server, 256);
+        int k = 0;
+        for (int i = 0; server[i] && k < 255; ++i) if (server[i] > 0x20) settings.online_server[k++] = server[i];
+        settings.online_server[k] = 0;
+        SetWindowTextW(control(ID_ONLINE), settings.online_server);
+    }
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
     settings.fullscreen = checked(ID_FULLSCREEN); settings.neo = checked(ID_NEO); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
@@ -1090,9 +1105,9 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
                     .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"UFC3NativeLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
     RegisterClassW(&wc);
     const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
-    /* The client area is 760x640 at 96 DPI: the window is created, measured, and resized by the
+    /* The client area is 760x828 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(794);
+    const int client_w = sx(760), client_h = sx(828);
     main_window = CreateWindowExW(0, wc.lpszClassName, L"EA SPORTS UFC 3 - native PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
@@ -1116,6 +1131,9 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     SendMessageW(control(ID_PLAYER), EM_SETLIMITTEXT, 16, 0); y += 34;
     make(L"STATIC", L"Game language (the game's text and menus):", 0, 12, y + 4, 330, 18, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 344, y, 200, 300, ID_LANGUAGE); y += 34;
+    make(L"STATIC", L"Online server (IP of the host; empty = offline):", 0, 12, y + 4, 330, 18, 0);
+    make(L"EDIT", settings.online_server, WS_BORDER | ES_AUTOHSCROLL, 344, y, 200, 24, ID_ONLINE);
+    SendMessageW(control(ID_ONLINE), EM_SETLIMITTEXT, 255, 0); y += 34;
     make(L"STATIC", L"Controller for player 1 (in-game menu: L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 520, 200, ID_GAMEPAD);
     make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 540, y, 88, 24, ID_RESCAN);
@@ -1149,7 +1167,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 794 - y - 12, ID_LOG);
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 828 - y - 12, ID_LOG);
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
     {
         const struct { int id, count, selected; const wchar_t *const *names; } combos[] = {
