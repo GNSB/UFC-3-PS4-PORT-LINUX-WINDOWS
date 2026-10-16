@@ -283,6 +283,14 @@ if (WIN32)
     target_include_directories(content-test PRIVATE ${BB_SRC} ${BB_SRC}/src)
     target_link_libraries(content-test PRIVATE Zydis::Zydis onecore bcrypt -pthread)
     add_dependencies(windows-tests content-test)
+    # ufc3 online (UFC-25): the deterministic rcp/rsqrt patch.
+    add_executable(deterministic-fp-test EXCLUDE_FROM_ALL ${BB_SRC}/tests/test_deterministic_fp.c ${BB_SRC}/src/runtime_fp.c ${BB_SRC}/src/platform/platform_win.c)
+    set_target_properties(deterministic-fp-test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    target_compile_options(deterministic-fp-test PRIVATE ${BB_C_WARNINGS} -UNDEBUG)
+    target_compile_definitions(deterministic-fp-test PRIVATE ${BB_WIN_DEFS})
+    target_include_directories(deterministic-fp-test PRIVATE ${BB_SRC} ${BB_SRC}/src)
+    target_link_libraries(deterministic-fp-test PRIVATE Zydis::Zydis onecore bcrypt -pthread)
+    add_dependencies(windows-tests deterministic-fp-test)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.

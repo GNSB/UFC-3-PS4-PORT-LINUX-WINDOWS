@@ -44,6 +44,20 @@ uintptr_t runtime_thread_resolve(const char *name);
 void runtime_thread_report(void);
 void runtime_set_main_tls(const void *data, uint64_t filesz, uint64_t memsz, uint64_t align);
 void runtime_thread_attach_main(void);
+/* ufc3 online (UFC-25, runtime_fp.c): BB_DETERMINISTIC_FP (default: on with BB_ONLINE_SERVER).
+ * The guest's approximate reciprocals are patched to a rule that is the same on every CPU, and
+ * guest threads get the PS4's MXCSR (0x9fc0) and x87 control word (0x037f). */
+int runtime_fp_deterministic(void);
+void runtime_fp_thread_setup(void);
+uint32_t runtime_fp_rcp(uint32_t x);
+uint32_t runtime_fp_rsqrt(uint32_t x);
+typedef struct { uint64_t functions, found, patched, unpatched, displaced, stub_bytes; } RuntimeFpStats;
+/* Patches every (v)rcpps/(v)rsqrtps/(v)rcpss/(v)rsqrtss in the executable segments; `pointers`
+ * are image offsets of code addresses stored in data (they are never displaced). `map_near`
+ * gives writable memory within 2 GiB of the image; it is made executable here. */
+uint64_t runtime_fp_patch_image(unsigned char *image, uint64_t size, const uint64_t *seg_address, const uint64_t *seg_size,
+                                const uint64_t *seg_flags, uint64_t segments, const uint64_t *pointers, uint64_t pointer_count,
+                                void *(*map_near)(size_t), RuntimeFpStats *stats);
 int32_t *runtime_errno(void);
 uintptr_t runtime_sema_resolve(const char *name);
 uintptr_t runtime_eventflag_resolve(const char *name);

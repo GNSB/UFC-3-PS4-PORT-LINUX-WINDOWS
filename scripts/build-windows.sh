@@ -39,7 +39,7 @@ if [[ $stage == all || $stage == --runtime || $stage == --tests ]]; then
     if [[ $stage == --tests ]]; then
         ninja -C "$root/build" -j "${BB_JOBS:-$(nproc)}" windows-tests > "$root/tests-build.log" 2>&1 || { grep -v '^\[' "$root/tests-build.log" | tail -40 >&2; echo "build-windows: test build failed (log: $root/tests-build.log)" >&2; exit 1; }
         mkdir -p "$root/tests"
-        for exe in abi_probe tls_probe memory_probe file_probe runtime-test sema-test eventflag-test content-test; do cp "$root/build/$exe.exe" "$root/tests/"; done
+        for exe in abi_probe tls_probe memory_probe file_probe runtime-test sema-test eventflag-test content-test deterministic-fp-test; do cp "$root/build/$exe.exe" "$root/tests/"; done
         echo "build-windows: tests in $root/tests"
         exit 0
     fi

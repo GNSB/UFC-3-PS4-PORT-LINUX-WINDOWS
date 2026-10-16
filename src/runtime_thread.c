@@ -71,6 +71,7 @@ static void attach(GuestThread *t) {
     t->tls_block=block; t->tcb=tcb;
     platform_thread_publish_tcb(tcb);
     current=t;
+    runtime_fp_thread_setup(); /* BB_DETERMINISTIC_FP: Orbis' MXCSR and x87 control word */
 }
 static GuestThread *new_thread(void) {
     GuestThread *t=calloc(1,sizeof(*t));

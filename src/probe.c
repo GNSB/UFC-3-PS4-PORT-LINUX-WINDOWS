@@ -83,6 +83,8 @@ static void *allocate(size_t size) {
     if (!p) fail("host memory allocation failed");
     return p;
 }
+/* Stubs the image jumps to with rel32: low memory, mapped after the image (runtime_low_map). */
+static void *map_near_image(size_t size) { return runtime_low_map(size, PROT_READ | PROT_WRITE); }
 /* ELF segment flags (1 execute, 2 write, 4 read) to a host protection. */
 static void protect(void *p, size_t size, unsigned flags) {
     int mode = ((flags & 4) ? PROT_READ : 0) | ((flags & 2) ? PROT_WRITE : 0) | ((flags & 1) ? PROT_EXEC : 0);
@@ -443,6 +445,21 @@ int main(int argc, char **argv) {
 #else
     (void)tls_loads;
 #endif
+    /* ufc3 online (UFC-25): approximate reciprocals that give the same bits on every CPU. */
+    if (runtime_fp_deterministic()) {
+        uint64_t *addresses = calloc(ns, sizeof(uint64_t)), *sizes = calloc(ns, sizeof(uint64_t)), *flags = calloc(ns, sizeof(uint64_t));
+        uint64_t *pointers = calloc(nr ? nr : 1, sizeof(uint64_t)), pointer_count = 0;
+        if (!addresses || !sizes || !flags || !pointers) fail("allocation failed");
+        for (uint64_t i = 0; i < ns; ++i) { addresses[i] = segments[i].address; sizes[i] = segments[i].size; flags[i] = segments[i].flags; }
+        for (uint64_t i = 0; i < nr; ++i) if (!relocs[i].kind) pointers[pointer_count++] = relocs[i].value;
+        RuntimeFpStats fp;
+        const uint64_t start = platform_monotonic_ns();
+        runtime_fp_patch_image(image, size, addresses, sizes, flags, ns, pointers, pointer_count, map_near_image, &fp);
+        printf("Deterministic FP (BB_DETERMINISTIC_FP): %" PRIu64 " of %" PRIu64 " rcp/rsqrt instructions patched in %" PRIu64 " functions "
+               "(%" PRIu64 " kept as the CPU computes them), %" PRIu64 " KiB of stubs, %.0f ms; guest threads use MXCSR 0x9fc0\n",
+               fp.patched, fp.found, fp.functions, fp.unpatched, fp.stub_bytes / 1024, (double)(platform_monotonic_ns() - start) / 1e6);
+        free(addresses); free(sizes); free(flags); free(pointers);
+    }
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
@@ -478,6 +495,7 @@ int main(int argc, char **argv) {
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks (platform_enter_guest_main). */
+    runtime_fp_thread_setup(); /* also when no linked module attached the main thread */
     platform_enter_guest_main(image+entry,&params,(void *)guest_exit);
     fail("entry unexpectedly returned");
 }
