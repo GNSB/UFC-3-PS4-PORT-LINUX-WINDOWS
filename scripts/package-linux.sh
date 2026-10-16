@@ -30,7 +30,7 @@ if [[ ! -f $work/sdl-build/libSDL3.so.0 ]]; then
 fi
 stage=$work/stage/UFC3Native
 rm -rf "$work/stage"
-mkdir -p "$stage/bin/gpu" "$stage/bin/lib" "$stage/scripts" "$stage/tools" "$stage/share" "$stage/patches" "$stage/licenses"
+mkdir -p "$stage/bin/gpu" "$stage/bin/lib" "$stage/scripts" "$stage/tools" "$stage/share" "$stage/patches" "$stage/licenses" "$stage/launcher"
 install -m755 out/sacredfire out/bb-gpu-capabilities "$stage/bin/"
 install -m755 out/gpu/libbbgpu.so "$stage/bin/gpu/"
 strip --strip-debug "$stage/bin/sacredfire" "$stage/bin/bb-gpu-capabilities" "$stage/bin/gpu/libbbgpu.so"
@@ -46,10 +46,11 @@ set_rpath '$ORIGIN/gpu:$ORIGIN/lib' "$stage/bin/sacredfire"
 set_rpath '$ORIGIN/lib' "$stage/bin/bb-gpu-capabilities"
 set_rpath '$ORIGIN/../lib' "$stage/bin/gpu/libbbgpu.so"
 for f in "$stage"/bin/lib/*.so*; do set_rpath '$ORIGIN' "$f"; done
-install -m755 run.sh packaging/linux/ufc3.sh "$stage/"
+install -m755 run.sh packaging/linux/ufc3.sh packaging/linux/UFC3.sh "$stage/"
+cp launcher/ufc3_launcher.py launcher/ufc3_online.py "$stage/launcher/"
 cp packaging/linux/ufc3.conf.example packaging/linux/README-Linux.md LICENSE "$stage/"
 cp out/VERSION "$stage/VERSION"
-cp scripts/*.py "$stage/scripts/"; cp tools/gen_import_names.py "$stage/tools/"
+cp scripts/*.py "$stage/scripts/"; cp tools/gen_import_names.py tools/ufc3_server.py tools/blaze_tdf.py tools/ufc3_auth.py tools/ufc3_games.py "$stage/tools/"
 find patches -maxdepth 1 -type f -name '*.xml' -exec cp {} "$stage/patches/" \;
 cp share/skip_movie.mkv "$stage/share/"
 cp out/windows/downloads/aerolib.inl "$stage/share/aerolib.inl" 2>/dev/null || cp out/aerolib.inl "$stage/share/aerolib.inl"
