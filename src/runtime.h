@@ -78,6 +78,8 @@ uintptr_t runtime_kernel_resolve(const char *name);
 void runtime_kernel_thread_exit(void);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
+/* ufc3: online play (BB_ONLINE_SERVER); 0 for every name when it is not set. */
+uintptr_t runtime_net_resolve(const char *name);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 int runtime_file_mount(const char *guest, const char *host);

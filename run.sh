@@ -23,10 +23,11 @@ if [[ -z ${BB_PREBUILT:-} && -z ${BB_IN_NIX_SHELL:-} ]] && ! { command -v pkg-co
     args=''; if (( $# )); then args=$(printf '%q ' "$@"); fi
     exec env BB_IN_NIX_SHELL=1 nix-shell shell.nix --run "bash run.sh $args"
 fi
-# BB_SAVE_LOG=1 (launcher: "Save the log and statistics to a file"): this run's output and its
-# per-frame statistics also go to $data/logs/<time>.log, .frames.csv and .readbacks.csv.
+# BB_LOG_DIR overrides the default $data/logs folder. BB_SAVE_LOG=1
+# (launcher: "Save the log and statistics to a file"): this run's output and per-frame
+# statistics also go there as <time>.log, .frames.csv and .readbacks.csv.
 if [[ ${BB_SAVE_LOG:-} == 1 ]]; then
-    logs=$data/logs
+    logs=${BB_LOG_DIR:-$data/logs}
     mkdir -p "$logs"
     printf -v stamp '%(%Y%m%d_%H%M%S)T' -1
     export BB_FRAME_STATS=1 BB_FRAME_LOG=${BB_FRAME_LOG:-$logs/$stamp.frames.csv}

@@ -98,4 +98,10 @@ if [[ ${1:-} == --test ]]; then
     out/content-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_eventflag.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/eventflag-test
     out/eventflag-test
+    # ufc3 online: the PS4 network ABI (without the local server) and the Blaze/EASO server.
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_online_net.c src/runtime_net.c -o out/online-net-test
+    out/online-net-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc -Wl,--gc-sections -ffunction-sections tests/test_time_conversion.c -o out/time-conversion-test
+    out/time-conversion-test
+    python3 -m unittest discover -s tests -p test_online_server.py
 fi

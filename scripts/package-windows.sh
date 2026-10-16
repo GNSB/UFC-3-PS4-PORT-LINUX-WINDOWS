@@ -75,7 +75,7 @@ PY
 pth=$(ls "$stage"/python/python*._pth | head -1)
 printf 'python%s.zip\n.\n..\\scripts\n..\\tools\n' "$(basename "$pth" | sed 's/python\([0-9]*\)\._pth/\1/')" > "$pth"
 mkdir -p "$stage/scripts"; cp scripts/*.py "$stage/scripts/"
-cp tools/gen_import_names.py "$stage/tools/"
+cp tools/gen_import_names.py tools/ufc3_server.py tools/blaze_tdf.py tools/ufc3_auth.py tools/ufc3_games.py "$stage/tools/"
 # Community patches only: not the disabled CTR file, not shader dumps taken from the game.
 mkdir -p "$stage/patches"
 find patches -maxdepth 1 -type f -name '*.xml' -exec cp {} "$stage/patches/" \;
