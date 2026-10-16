@@ -352,3 +352,130 @@ Qué buscar:
 - Si se congela igual: las líneas `Wait over 5 s` (qué hilo espera qué y quién lo tiene) o
   `Write fault loop` dicen cuál de las dos cosas es; sin ninguna de las dos, el bloqueo está
   fuera de los locks vigilados (mandar el log igual).
+
+## Quinta pasada: GPU hang en el editor (cs 37aa67f4) y readback-after-gpu-write
+
+Prueba 4 con `UFC3-WRITE-WINDOWS-TEST.exe` de 6a06366
+(`~/ufcCOntext/external-logs/UFC48-test4-win-20261016_180706.log`, 923 líneas). Mejoras
+confirmadas: 0 `readback-overwrite`, 0 faults sobre una window abierta, sin host fault ni assert.
+Final nuevo: en el editor (draws del shader dither/pelo, líneas 869–894) `GPU wait stuck`, el
+dispatch `#1648052 cs 0000000037aa67f4, 82x1x1 groups` no termina (895–920), el watchdog de
+UFC-48 sólo muestra hilos esperando ese trabajo GPU (12,3 s) y `Device lost during submit` → exit 23.
+
+### Qué es cs 37aa67f4
+
+Está en los dumps de shaders de Linux (`user/shader/dumps/cs_0x0000000037aa67f4*`, también en
+`logs/try1b-pro-options`, `ufc45-4k`, `ufc46-1440p`): `spirv-cross` del `.spv` muestra un shader
+de morph targets por vértice (64 hilos por grupo; 82 grupos = 5248 vértices). Cuatro bucles
+`for (i = 0; int(i) < int(count); ++i)` cuyos `count` (y `start`) salen de tablas `(start, count)`
+de 8 bytes por vértice (bindings 1, 4, 6 y 8, 41 816 B cada una = 5227 vértices), sólo lectura;
+escribe un buffer de 4 MiB (binding 10). Un `count` con basura (p. ej. `0x3f800000`, un float
+1.0 leído como entero: mil millones de vueltas por hilo) es un bucle que no termina en tiempo:
+TDR → device lost. Los índices fuera de rango no cuelgan (lecturas robustas devuelven 0): sólo
+el `count` puede. En las capturas de Linux (pelea, `BB_WRITE_STEP` apagado: sin steps ni
+windows) ese mismo dispatch corre sin colgarse; la tabla del binding 1 es toda ceros allí.
+
+### Causa (por código; el log no tiene los bytes del dispatch)
+
+El hueco es el «límite conocido» de la primera pasada, ahora con un efecto peor: una window no
+puede ver una escritura de la CPU que deja **el mismo valor** que el guest viejo sobre bytes en
+`gpu_modified_ranges` (R). Ese grano no cambia en el diff, sigue en R, y la GPU lee el valor de
+VRAM (no hay upload de bytes R). Para que pase hacen falta las dos cosas que el editor tiene y
+la pelea no:
+
+1. la CPU escribe dentro de una window sobre memoria que la GPU escribió (reuso de heap: el
+   editor recicla memoria de texturas y salidas GPU con cada cambio de pelo/cabeza; la window
+   abre por un primer write a más de 16 bytes de R y después el `memcpy`/bucle sigue hasta R);
+2. lo que escribe coincide con el guest viejo (ceros sobre ceros: una tabla `(0, 0)` de vértices
+   sin morphs sobre memoria que estaba en cero antes de que la GPU la escribiera).
+
+Medido en los logs: en la Quick Fight de la prueba 1 (~410 windows/s) **todas** las líneas dicen
+`CPU took over 0 GPU bytes`; en el editor (pruebas 2–4) la CPU pisa bytes GPU dentro de windows
+todo el tiempo (14–98 KB cada 5 s). Ningún diff sirve: decidir de quién es un grano igual exige
+saber si la CPU escribió, y eso sólo lo da un fault (readback antes de escribir). Tampoco sirve
+un «veneno» en los bytes R al abrir: la CPU puede leerlos durante la window (el allocator lee sus
+nodos en páginas con bindings que la GPU marcó escritos sin escribirlos) y leería el veneno.
+
+El modelo está en `write-window-merge-test` (`EqualRewriteUnseen`): pares que cambian llegan a
+VRAM, los `(0, 0)` quedan GPU-owned y la GPU lee `0x3f800000` como `count`.
+
+**Qué no queda probado:** que las tablas del dispatch colgado estuvieran en una página así. El
+log no tiene sus direcciones en el editor (las de Linux son de pelea), ni hay bytes de VRAM. Lo
+prueba el diagnóstico nuevo (abajo) en la próxima corrida.
+
+### readback-after-gpu-write (los ~20 de 677–854)
+
+Se cuentan cuando un binding **escrito** cubre después bytes que la window cambió, y el readback
+trae un valor distinto del que dejó la CPU (`written` ≈ `gpu_claimed`: 4028/4058, 3884/3894…).
+Si el binding reclamara bytes que el shader no escribe, la VRAM tendría el valor de la CPU
+(`ProcessLateWrites` lo sube en el `Maintain` del siguiente paquete, antes de ese dispatch) y el
+readback traería ese mismo valor: no contaría como `written`. Que casi todos cuenten significa
+que la VRAM tenía otro valor: o la GPU los escribió (válido), o el upload de la window no llegó a
+VRAM (bloque no residente o in-place). Para separar las dos cosas el log de stats ahora dice
+`N window bytes not in VRAM`: con 0 ahí, los readback-after-gpu-write son escrituras GPU reales.
+Las páginas son de texturas del editor que el juego llena con `memcpy` y la GPU reescribe como
+storage (`[T6a] ... (GPU-written, storage): through memory`), y `0x10013fd000` es la página del
+allocator con contadores GPU de 4 bytes (`cs ba6b230b` liga `0x10013fde80+4` como escrito).
+Esto no es el hang: el hang necesita bytes que **nadie** reclamó (siguen R sin cambio).
+
+### Arreglo (de4e15e)
+
+**Sitios vetados** (`write_window_sites.h`, `page_manager.cpp`, `buffer_cache.cpp`
+`DecideWriteStep`). Al cerrar una window, si sus cambios tomaron bytes GPU (`NoteSteppedWrite`
+ahora devuelve cuántos), su sitio (instrucción que hizo fault + llamador, los mismos de «Write
+fault sites») queda vetado: sus faults siguientes sobre páginas GPU van por readback (o step si
+es código del juego con pocos bytes GPU y no cerca: el step es exacto), como con windows
+apagadas. Sitios que sólo escriben al lado de datos GPU conservan sus windows: en pelea son todos
+(0 bytes tomados). Una línea por sitio vetado: `Write windows: site X (from +Y) changed N
+GPU-owned bytes of page P in a window (M left GPU-owned beside them); its writes to GPU pages
+read back from now on`. Tabla de 256 sitios; llena, no se abren más windows.
+
+Límite: la **primera** window de cada sitio sigue expuesta (es la que delata al sitio), y un
+sitio que sólo reescribe valores iguales nunca se delata. Reduce la exposición del editor a una
+window por sitio; no la elimina. Si el diagnóstico prueba la causa y esto no alcanza, la opción
+exacta es no abrir windows para copias de host (`memcpy`) sobre páginas con más de 256 bytes GPU
+(medir antes su costo en pelea) o apagar las windows fuera de pelea.
+
+**Stats** (`Write windows:`): `(Y GPU bytes left GPU-owned beside them)` = bytes R que quedaron
+en páginas donde la window tomó otros (la exposición); `Z window bytes not in VRAM`; `W faults/s
+of barred sites read back`.
+
+**Diagnóstico (`BB_WRITE_WINDOW_DIAG=1`, lo pone el launcher de prueba).**
+- Cada window cerrada guarda los bytes de su página que siguen en R después del cierre
+  (`ambiguous`) y cuántos tomó. Un binding escrito posterior los limpia (la GPU los reescribe).
+- `PageManager::DiagnoseGpuRead` en cada `ObtainBuffer`: si el binding cubre bytes ambiguos,
+  anota el hit con el shader de cómputo que lo liga (`SetDiagShader` en `DispatchRecord` y
+  `DispatchIndirectRecord`) en un anillo de 512. Si la window tomó bytes GPU en esa página
+  imprime `Write window audit: gpu-reads-ambiguous cs=... binding=... page=... opener=...
+  caller=... window_took=N ambiguous=M word=... guest=...` (tope `BB_WRITE_WINDOW_DIAG_MAX`).
+- En un hang, debajo del `STUCK` de un dispatch: `write window audit: cs H bound A+S ... over N
+  GPU-owned bytes window id=... left unchanged on page P ...` por cada binding reciente de ese
+  shader sobre bytes ambiguos, y el total. Si cs 37aa67f4 vuelve a colgar con líneas así sobre
+  sus tablas de 41 816 B, la causa queda probada; si no hay ninguna, las windows no tocaron sus
+  buffers y la causa es otra.
+
+### Compilación
+
+- Linux: `ufc3-build` → exit 0 (PGO off, LTO ON, `ufc3-v0.1.4-32-g5695dcb-dirty` antes del
+  commit; mismo código). `write-window-merge-test` (con `EqualRewriteUnseen` y `BarredSites`),
+  `page-watch-perms-test` y `label-guard-test` pasan.
+- Windows: `scripts/build-windows.sh --runtime` (bajo el lock de `ufc3-build`) → exit 0,
+  `ufc3-v0.1.4-33-gde4e15e`; `scripts/package-windows.sh` limpio. Launcher de prueba con los
+  comandos de ninja de `SacredFire.exe` más `-DUFC3_WRITE_WINDOWS_TEST`, sin debug info, en el zip
+  como `UFC3-WRITE-WINDOWS-TEST.exe` con `README-UFC48.txt`.
+- Paquete: `~/UFC3Native-windows-ufc48-de4e15e.zip` (+ `.sha256`).
+
+### Una prueba
+
+`UFC3-WRITE-WINDOWS-TEST.exe`: Career → editor de luchador → cambiar pelo y cabeza varias veces
+(ida y vuelta a la categoría cabeza) → primera pelea de Career completa; después Quick Fight con
+peleadores de fábrica, pelea completa. Mandar el log entero, también si se cuelga.
+
+Qué buscar:
+- `Write windows: site ... read back from now on`: qué sitios se vetan y cuándo (si alguno se veta
+  en pelea, comparar FPS con la prueba 1).
+- Sin `GPU wait stuck`/`Device lost`. Si vuelve: las líneas `write window audit: cs ...` bajo el
+  `STUCK` (ver arriba) dicen si fue esto.
+- `gpu-reads-ambiguous`: qué shaders leen bytes expuestos y dónde.
+- `window bytes not in VRAM` = 0 → los `readback-after-gpu-write` son escrituras GPU reales.
+- `readback-overwrite` sigue en 0; FPS de pelea como en la prueba 1.
