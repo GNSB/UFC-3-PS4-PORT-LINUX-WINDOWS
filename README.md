@@ -56,7 +56,8 @@ and saves. What works today:
 - Some long hairstyles leave a slightly lighter line at the base of the neck.
 - Portuguese (Portugal) (`BB_LANGUAGE=7`) is listed but the game has no text for it: pick
   Portuguese (Brazil) (`17`).
-- No online play yet.
+- No online play yet: the online code is experimental (see *Online (experimental)*); login
+  reaches a local server, a fight between two PCs does not.
 
 ## Requirements
 
@@ -116,6 +117,25 @@ BB_GAME_DIR=/path/PS4/CUSA06534-merged bash run.sh  # defaults to orig/CUSA06534
 
 `run.sh` detects the `ufc3` profile and applies the game's defaults; any variable can be
 overridden on the command line (`BB_FPS_LIMIT=0 bash run.sh`).
+
+## Online (experimental)
+
+Off unless `BB_ONLINE_SERVER` is set: without it the console stays offline, as in 0.1.4. With it,
+the game's EA servers are replaced by a local server (`tools/ufc3_server.py`) that one player
+runs. Login and the lobby reach that server; **a fight between two PCs does not work yet**, and
+FighterNet and friend invitations are unfinished.
+
+```bash
+python3 tools/ufc3_server.py --bind 0.0.0.0            # on the hosting PC (Linux)
+BB_ONLINE_SERVER=127.0.0.1 bash run.sh                 # the host's own game
+BB_ONLINE_SERVER=192.168.1.20 bash run.sh              # another Linux PC: the host's address
+```
+
+On Windows there is no launcher field for it yet: start `UFC3.exe` from a `.bat` with
+`set BB_ONLINE_SERVER=192.168.1.20`. The server listens on TCP 42230, 40443, 40080, 10041 and
+10744 and UDP 17502 (the game's 443/80 go to +40000); the games talk to each other over UDP 3659.
+Give each PC a different player name. `BB_NET_LOG=0` silences the network log (on by default in
+this mode). Details: [`docs/ufc3/ONLINE_IMPLEMENTATION.md`](docs/ufc3/ONLINE_IMPLEMENTATION.md).
 
 ## Building the Windows zip (on Linux)
 

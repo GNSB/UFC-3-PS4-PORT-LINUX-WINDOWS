@@ -43,6 +43,15 @@ your own dump of the game and its 1.14 update.
 - **FPS limit** — 60 / 90 / 120 / 144 / 240 / Unlimited.
 - In game: **Insert** or **L3+R3** opens the overlay menu.
 
+## Online (experimental)
+
+Off by default. The launcher has no field for it yet: to try it, start `UFC3.exe` from a `.bat`
+with `set BB_ONLINE_SERVER=192.168.1.20` (the address of the PC that runs the server). The host
+runs `python3 tools/ufc3_server.py --bind 0.0.0.0` on Linux and its own game with
+`BB_ONLINE_SERVER=127.0.0.1`. Use a different player name on each PC. Login reaches the shared
+server; **a fight between the two PCs does not work yet**, and FighterNet and inviting a friend
+are not finished.
+
 ## Problems
 
 If the game crashes, send the newest `.log` from `%LOCALAPPDATA%\UFC3Native\logs` (the

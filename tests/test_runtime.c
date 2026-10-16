@@ -198,7 +198,8 @@ static void localtime_conversion_abi(void) {
          * The old four-argument import writes to address 0xffffffff here. */
         assert(convert(1705320000,hints[i],&utc.value,tz.value,&dst.value)==0);
         assert(utc.value==INT64_C(1705320000)+(int64_t)tz.value[0]*60);
-        assert(tz.value[1]!=INT32_MIN && dst.value==tz.value[1]);
+        /* The last output is the DST offset in seconds (shadPS4's dst_sec), not a flag. */
+        assert(tz.value[1]!=INT32_MIN && dst.value==(tz.value[1] ? 3600 : 0));
         assert(utc.canary==0xabcdef && tz.canary==0x123456 && dst.canary==0x654321);
         assert(convert(1705320000,hints[i],&utc.value,NULL,NULL)==0);
         assert((uint32_t)convert(1705320000,hints[i],NULL,NULL,NULL)==0x80020016);
