@@ -124,7 +124,11 @@ class Game:
         self.links = set()  # (reporting player id, connected player id) from meshEndpointsConnected
 
     def data(self) -> Struct:
-        """ReplicatedGameData."""
+        """ReplicatedGameData.
+
+        Only members of UFC's ReplicatedGameData: GVER, HSES, IGNO and TCAP belong to other
+        classes or older schemas (CommonGameRequestData, HostInfo) and are not sent.
+        """
         # HostInfo (UFC reflection): CONG connection group, CSID connection slot, HPID, HSES, HSLT.
         h = self.host.account.id
         host = Struct(CONG=(INT, h), CSID=(INT, self.host.slot), HPID=(INT, h), HSES=(INT, h),
@@ -138,14 +142,12 @@ class Game:
             GID=(INT, self.gid), GMRG=(INT, 0), GNAM=(STRING, self.host.account.name),
             GPVH=(INT, 0x1A2B3C4D), GSET=(INT, self.gset), GSID=(INT, self.gid),
             GSTA=(INT, self.state), GTYP=(STRING, self.gtype), GURL=(STRING, ''),
-            GVER=(STRING, self.version),
-            HNET=(LIST, (UNION, [self.host.pnet])), HSES=(INT, self.host.account.id),
-            IGNO=(INT, 0), MCAP=(INT, self.capacity),
+            HNET=(LIST, (UNION, [self.host.pnet])), MCAP=(INT, self.capacity),
             NQOS=(STRUCT, Struct(DBPS=(INT, 0), NATT=(INT, 0), UBPS=(INT, 0))),
             NRES=(INT, 0), NTOP=(INT, self.topology), PGID=(STRING, self.uuid),
             PGSR=(BLOB, b''), PHST=(STRUCT, host), PRES=(INT, self.presence),
             PSAS=(STRING, 'local'), QCAP=(INT, 0), SEED=(INT, self.gid * 7919),
-            TCAP=(INT, 0), THST=(STRUCT, host),
+            THST=(STRUCT, host),
             TIDS=(LIST, (INT, [65534])), UUID=(STRING, self.uuid),
             VOIP=(INT, self.voip), VSTR=(STRING, self.version))
 
@@ -362,17 +364,65 @@ SEARCHES = []  # players waiting in startMatchmakingScenario, oldest first
 
 # Game settings for a Quick Fight made by matchmaking, as UFC's own Quick Fight session creates
 # them (createGame from the host: gameType4, GameMode 4, peer-to-peer full mesh, 2 seats).
+# Its attributes are filled per match by match_attributes().
 MATCH_GAME = Struct(
     CMGD=(STRUCT, Struct(GGTY=(INT, 0), GVER=(STRING, '1.14'))),
-    GMCD=(STRUCT, Struct(ATTR=(MAP, (STRING, STRING, [('GameMode', '4'), ('MaxRounds', '5')])),
+    GMCD=(STRUCT, Struct(ATTR=(MAP, (STRING, STRING, [])),
                          GSET=(INT, 295940), NTOP=(INT, 130), PMAX=(INT, 2), PMIN=(INT, 1),
                          PRES=(INT, 1), VOIP=(INT, 0))),  # VOIP_DISABLED: no voice mesh to wait for
     GTYP=(STRING, 'gameType4'))
 
+# Attributes of a matched game. The game reads all six when the fight is set up (0x358380:
+# GameMode, MaxRounds, ClockType, CustomFighterOption, FightRules, WeightClass); a missing one
+# stays at its "any" value (-1) and the pregame screen gets no weight class. The search sends a
+# criterion per setting (scenario attributes UFC_*), either the values the player accepts or
+# "abstain" (the UI's "any", -1; 0x381f00). Values are the UI's enums (OnlineChallengeHelper in
+# inxp_ui_40.big, "values need to match onlinegamedefines.h"):
+#   WeightClass   0 fly, 1 bantam, 2 feather, 3 light, 4 welter, 5 middle, 6 light heavy,
+#                 7 heavy, 8 women's bantam, 9 women's straw (sent as the bits of a mask)
+#   MaxRounds     3 or 5            ClockType   0 real time, 1 accelerated
+#   CustomFighterOption  0 not allowed, 1 allowed
+#   FightRules    no UI enum; 0 is the game's own default (0x3540a0 and the pregame model)
+# A value both players accept is used (the first player's first); when both abstain, the first
+# entry of the list below: MaxRounds 5 as UFC's own Quick Fight session creates it, ClockType 1
+# (the game's default), no created fighters (the other PC does not have them).
+MATCH_CRITERIA = (
+    ('WeightClass', 'UFC_WEIGHT_CLASS', [str(i) for i in range(10)]),
+    ('MaxRounds', 'UFC_MAX_ROUNDS', ['5', '3']),
+    ('ClockType', 'UFC_CLOCK_TYPE', ['1', '0']),
+    ('CustomFighterOption', 'UFC_CUSTOM_FIGHTER', ['0', '1']),
+    ('FightRules', 'UFC_FIGHT_RULES', ['0']),
+)
+
+
+def scenario_criteria(request) -> dict:
+    """The search's criteria: UFC_* name -> list of accepted values (None: abstain)."""
+    out = {}
+    scna = request.get('SCNA', (MAP, (STRING, 0, [])))[1]
+    for name, value in scna[2] if isinstance(scna, tuple) and len(scna) == 3 else []:
+        values = None
+        if isinstance(value, tuple) and len(value) == 3 and isinstance(value[2], tuple):
+            values = [str(v) for v in value[2][1]]
+        out[name] = None if not values or 'abstain' in values else values
+    return out
+
+
+def match_attributes(first: dict, second: dict):
+    """The matched game's attributes for two searches' criteria, or None if they do not overlap."""
+    attributes = [('GameMode', '4')]
+    for attribute, criterion, defaults in MATCH_CRITERIA:
+        wanted = [c[criterion] for c in (first, second) if c.get(criterion) is not None]
+        common = [v for v in (wanted[0] if wanted else defaults) if all(v in w for w in wanted)]
+        if not common:
+            return None
+        attributes.append((attribute, common[0]))
+    return sorted(attributes)
+
 
 class Search:
-    def __init__(self, account, writer, pnet, msid, scenario):
+    def __init__(self, account, writer, pnet, msid, scenario, criteria=None):
         self.account, self.writer, self.pnet, self.msid, self.scenario = account, writer, pnet, msid, scenario
+        self.criteria = criteria or {}
 
 
 def drop_search(account_id, log):
@@ -400,15 +450,25 @@ def matchmake(request, account, writer, peer_ip, log):
     if game_of(account.id):
         notes += leave(account.id, log)  # Quick Fight's own private session
     drop_search(account.id, log)
-    other = next((s for s in SEARCHES if s.account.id != account.id), None)
+    criteria = scenario_criteria(request)
+    other, attributes = None, None
+    for search in SEARCHES:
+        if search.account.id != account.id:
+            attributes = match_attributes(search.criteria, criteria)
+            if attributes:
+                other = search
+                break
     if not other:
-        SEARCHES.append(Search(account, writer, pnet, msid, scenario))
+        SEARCHES.append(Search(account, writer, pnet, msid, scenario, criteria))
         log(f'matchmaking {msid}: {account.name} searching {scenario or "(scenario)"} '
-            f'(address {describe_pnet(pnet)}); waiting for an opponent')
+            f'(address {describe_pnet(pnet)}, criteria {criteria}); waiting for an opponent')
         return encode_struct(Struct(MSID=(INT, msid))), notes
     SEARCHES.remove(other)
     settings = Struct(MATCH_GAME)
     settings['CMGD'] = (STRUCT, Struct(GGTY=(INT, 0), GVER=(STRING, version)))
+    gmcd = Struct(MATCH_GAME['GMCD'][1])
+    gmcd['ATTR'] = (MAP, (STRING, STRING, attributes))
+    settings['GMCD'] = (STRUCT, gmcd)
     host = Player(other.account, other.writer, other.pnet, 0)
     host.state = ACTIVE_CONNECTED
     game = Game(settings, host)
@@ -417,7 +477,7 @@ def matchmake(request, account, writer, peer_ip, log):
     game.players.append(guest)
     GAMES[game.gid] = game
     log(f'matchmaking: {other.account.name} (host, {describe_pnet(other.pnet)}) vs {account.name} '
-        f'({describe_pnet(pnet)}) in new game {game.gid}')
+        f'({describe_pnet(pnet)}) in new game {game.gid}, attributes {dict(attributes)}')
     for to, who in ((host, guest), (guest, host)):
         notes.append((to.writer, Frame(USER_SESSIONS, 2, 0, NOTIFICATION, user_added(who.account, who.pnet))))
         notes.append((to.writer, Frame(USER_SESSIONS, 5, 0, NOTIFICATION, user_updated(who.account))))
