@@ -97,7 +97,14 @@ junto a sus datos CPU están a más de 16 bytes (gate de `DecideWriteStep`).
 
 ## Compilación
 
-Ver informe del ticket (resultado de `ufc3-build` y `scripts/build-windows.sh --runtime`).
+- Linux: `ufc3-build` → exit 0 (PGO off, LTO ON). `write-window-merge-test` y
+  `label-guard-test` (UFC-47) pasan.
+- Windows: `scripts/build-windows.sh --runtime` (toolchain/sysroot/deps/downloads enlazados del
+  checkout principal, bajo el lock de `ufc3-build`) → exit 0, `ufc3-v0.1.4-25-gdfc7705`.
+  `scripts/package-windows.sh` limpio. El launcher de prueba se compiló aparte con los mismos
+  comandos de ninja más `-DUFC3_WRITE_WINDOWS_TEST`, se le quitó la info de debug y se agregó al
+  zip como `UFC3-WRITE-WINDOWS-TEST.exe` junto con `README-UFC48.txt`.
+- Paquete: `~/UFC3Native-windows-ufc48-dfc7705.zip` (+ `.sha256`).
 
 ## Una prueba
 
