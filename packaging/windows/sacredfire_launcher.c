@@ -6,8 +6,12 @@
  * (Offline, Join server: the host's address, Host server: this PC runs tools\ufc3_server.py for
  * the session, see "Host server" below), the controller for port 1, the game patches (written to bbport.ini as the in-game menu does), PS4 Pro mode, fullscreen,
  * the developer switches (frame statistics, Vulkan validation, clear the shader cache, menu
- * trace), Play/Stop, the log of the run, and buttons for the logs and data folders. Settings
- * are kept in <data>\sacredfire.ini.
+ * trace), the log folder (empty: <data>\logs; BB_LOG_DIR wins over the window), Play/Stop, the
+ * log of the run, and buttons for the logs and data folders. Settings are kept in
+ * <data>\sacredfire.ini.
+ * Built with -DUFC3_DIAGNOSTIC_PACKAGE (the UFC-42 diagnostic test), the launcher keeps its
+ * data beside the exe in diagnostic-data and forces the write windows with their audit
+ * (BB_WRITE_STEP=1, BB_WRITE_WINDOW=1, BB_WRITE_WINDOW_DIAG=1, BB_WRITE_LOG=0), no .cmd needed.
  * Play does what run.sh does on Linux: the preparation scripts with the bundled Python
  * (python\python.exe, the official embeddable package; game_check, prepare, link_libc,
  * link_modules, gen_import_names with the bundled aerolib.inl, content_profile, patches),
@@ -60,6 +64,9 @@ typedef struct {
     int display;
     int skip_movies; /* the EA intro and the first-start video replaced by a short black clip */
     int language;    /* index into languages[] */
+    /* The folder the run logs (and the frame/readback CSVs) go to; empty: <data>\logs.
+     * BB_LOG_DIR wins over it. */
+    wchar_t log_dir[PATHW];
 } Settings;
 static Settings settings = {.resolution = 1, .fps_mode = 5, .present_mode = 2, .upscaler = 0, .sharpness = 2, .skip_movies = 1};
 /* Choices of the Video panel (index = the saved value). */
@@ -106,7 +113,7 @@ static const wchar_t *const managed_env[] = {
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
     L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
     L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
-    L"BB_LANGUAGE", L"BB_ONLINE_SERVER",
+    L"BB_LANGUAGE", L"BB_ONLINE_SERVER", L"BB_FRAME_LOG", L"BB_READBACK_LOG",
 };
 static wchar_t managed_value[sizeof(managed_env) / sizeof(managed_env[0])][1024];
 static int managed_given[sizeof(managed_env) / sizeof(managed_env[0])];
@@ -154,6 +161,17 @@ static const wchar_t *env_or(const wchar_t *name, const wchar_t *fallback) {
     DWORD n = GetEnvironmentVariableW(name, value, 1024);
     return n && n < 1024 ? value : fallback;
 }
+/* The folder the logs go to: BB_LOG_DIR when set and not empty, else the window's "Log folder"
+ * (settings.log_dir), else <data>\logs; made absolute. A mapped drive or a UNC share
+ * (\\server\share) is fine as long as Windows can reach it. */
+static void effective_log_dir(wchar_t *out_path) {
+    wchar_t chosen[PATHW];
+    const wchar_t *env = env_or(L"BB_LOG_DIR", NULL);
+    if (env && env[0]) { wcsncpy(chosen, env, PATHW - 1); chosen[PATHW - 1] = 0; }
+    else if (settings.log_dir[0]) { wcsncpy(chosen, settings.log_dir, PATHW - 1); chosen[PATHW - 1] = 0; }
+    else join(chosen, PATHW, data, L"logs");
+    if (!GetFullPathNameW(chosen, PATHW, out_path, NULL)) { wcsncpy(out_path, chosen, PATHW - 1); out_path[PATHW - 1] = 0; }
+}
 static void read_version(char *version, size_t n) {
     wchar_t path[PATHW]; join(path, PATHW, root, L"VERSION");
     snprintf(version, n, "unknown version");
@@ -193,6 +211,7 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"upscaler")) settings.upscaler = clampi(_wtoi(value), COUNT(upscaler_names));
         else if (!wcscmp(line, L"sharpness")) settings.sharpness = clampi(_wtoi(value), COUNT(sharpness_names));
         else if (!wcscmp(line, L"skip_movies")) settings.skip_movies = _wtoi(value);
+        else if (!wcscmp(line, L"log_dir")) wcsncpy(settings.log_dir, value, PATHW - 1);
         else if (!wcscmp(line, L"display")) settings.display = clampi(_wtoi(value), COUNT(display_names));
         else if (!wcscmp(line, L"language")) { const int i = language_index_of(value); if (i >= 0) settings.language = i; }
     }
@@ -207,10 +226,10 @@ static void settings_save(void) {
     fwprintf(f, L"player=%ls\nonline_mode=%ls\nonline_server=%ls\nhost_address=%ls\n", settings.player,
              online_mode_ids[settings.online_mode], settings.join_address, settings.host_address);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
-                L"resolution=%d\nfps_limit=%ls\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\nlanguage=%ls\n",
+                L"resolution=%d\nfps_limit=%ls\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\nlanguage=%ls\nlog_dir=%ls\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
              settings.frame_stats, settings.menu_trace, settings.resolution, fps_limits[settings.fps_mode], settings.present_mode,
-             settings.upscaler, settings.sharpness, settings.display, settings.skip_movies, language_ids[settings.language]);
+             settings.upscaler, settings.sharpness, settings.display, settings.skip_movies, language_ids[settings.language], settings.log_dir);
     fclose(f);
 }
 /* bbport.ini: "key=value" lines (UTF-8), shared with the in-game menu. */
@@ -836,6 +855,16 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_FULLSCREEN", settings.fullscreen ? L"1" : NULL);
     game_env(L"BB_VK_VALIDATION", settings.validation ? L"1" : NULL);
     game_env(L"BB_FRAME_STATS", settings.frame_stats ? L"1" : NULL);
+    if (settings.frame_stats) {
+        /* As run.sh: with the frame statistics on, the per-frame and readback CSVs of the
+         * session go beside the run's log (the effective log folder). */
+        wchar_t logs[PATHW], csv[PATHW]; effective_log_dir(logs); ensure_directory(logs);
+        SYSTEMTIME now; GetLocalTime(&now);
+        _snwprintf(csv, PATHW, L"%ls\\%04u%02u%02u_%02u%02u%02u.frames.csv", logs, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+        csv[PATHW - 1] = 0; game_env(L"BB_FRAME_LOG", csv);
+        _snwprintf(csv, PATHW, L"%ls\\%04u%02u%02u_%02u%02u%02u.readbacks.csv", logs, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+        csv[PATHW - 1] = 0; game_env(L"BB_READBACK_LOG", csv);
+    }
     game_env(L"BB_MENU_TRACE", settings.menu_trace ? L"1" : NULL);
     game_env(L"BB_GAMEPAD", settings.gamepad[0] ? settings.gamepad : NULL);
     game_env(L"BB_USER_NAME", settings.player[0] ? settings.player : NULL); /* the PS4 user name the game shows */
@@ -871,6 +900,14 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
      * garbled (career, fighter creation); with both off they draw correctly in fights. */
     game_env(L"BB_PREUPLOAD", L"0"); game_env(L"BB_WRITE_STEP", L"0");
     game_env(L"BB_COPY_GPU_BUFFERS", L"1");
+#ifdef UFC3_DIAGNOSTIC_PACKAGE
+    /* The diagnostic variant (UFC-42) runs the write windows with their audit, forced, as the
+     * .cmd of the diagnostic package did. */
+    SetEnvironmentVariableW(L"BB_WRITE_STEP", L"1");
+    SetEnvironmentVariableW(L"BB_WRITE_WINDOW", L"1");
+    SetEnvironmentVariableW(L"BB_WRITE_WINDOW_DIAG", L"1");
+    SetEnvironmentVariableW(L"BB_WRITE_LOG", L"0");
+#endif
     game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
     game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);
@@ -930,6 +967,9 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     for (int i = 0; i < extra_count; ++i) append_argument(line, 32768, extra[i]);
     char version[64]; read_version(version, sizeof(version));
     logf("SacredFire %s (Windows)\n", version);
+#ifdef UFC3_DIAGNOSTIC_PACKAGE
+    logw(L"Windows diagnostic test: write windows and their audit are on (BB_WRITE_STEP=1, BB_WRITE_WINDOW=1, BB_WRITE_WINDOW_DIAG=1, BB_WRITE_LOG=0).\n");
+#endif
     if (stop_requested) return 130;
     if (settings.online_mode == ONLINE_HOST) {
         uint32_t ip; wchar_t message[1024];
@@ -1112,7 +1152,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_ONLINE, ID_MODE, ID_HOST, ID_HOSTSCAN, ID_COPYHOST, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_ONLINE, ID_MODE, ID_HOST, ID_HOSTSCAN, ID_COPYHOST, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE, ID_LOGDIR, ID_LOGDIR_BROWSE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -1396,19 +1436,20 @@ static void read_controls(void) {
     settings.sharpness = clampi((int)SendMessageW(control(ID_SHARPNESS), CB_GETCURSEL, 0, 0), COUNT(sharpness_names));
     settings.display = clampi((int)SendMessageW(control(ID_DISPLAY), CB_GETCURSEL, 0, 0), COUNT(display_names));
     settings.language = clampi((int)SendMessageW(control(ID_LANGUAGE), CB_GETCURSEL, 0, 0), COUNT(language_names));
+    GetWindowTextW(control(ID_LOGDIR), settings.log_dir, PATHW); trimw(settings.log_dir);
     const int show_fps = checked(ID_SHOWFPS);
     ini_set("show_fps", show_fps ? "1" : "0"); /* written always: the game's own default is off */
     settings.show_fps = show_fps;
     settings_save();
 }
-static int pick_folder(wchar_t *out_path) {
+static int pick_folder(const wchar_t *title, wchar_t *out_path) {
     int ok = 0;
     IFileOpenDialog *dialog = NULL;
     if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog, (void **)&dialog))) {
         DWORD options = 0;
         dialog->lpVtbl->GetOptions(dialog, &options);
         dialog->lpVtbl->SetOptions(dialog, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-        dialog->lpVtbl->SetTitle(dialog, L"The game folder (CUSA06534; CUSA06534-patch beside it is merged automatically)");
+        dialog->lpVtbl->SetTitle(dialog, title);
         if (SUCCEEDED(dialog->lpVtbl->Show(dialog, main_window))) {
             IShellItem *item = NULL;
             if (SUCCEEDED(dialog->lpVtbl->GetResult(dialog, &item))) {
@@ -1423,16 +1464,31 @@ static int pick_folder(wchar_t *out_path) {
     }
     return ok;
 }
-/* <data>\logs\<time>.log for a run of the game; <data>\logs\launcher.log while the window is open. */
+/* <logs>\<time>.log for a run of the game; <logs>\launcher.log while the window is open, with
+ * <logs> the effective log folder (effective_log_dir). A folder that cannot be written falls
+ * back to <data>\logs with a visible note. */
 static void open_log_file(const wchar_t *fixed_name) {
     wchar_t logs[PATHW], log_path[PATHW];
-    join(logs, PATHW, data, L"logs"); ensure_directory(logs);
+    effective_log_dir(logs); ensure_directory(logs);
     SYSTEMTIME now; GetLocalTime(&now);
     if (fixed_name) join(log_path, PATHW, logs, fixed_name);
     else _snwprintf(log_path, PATHW, L"%ls\\%04u%02u%02u_%02u%02u%02u.log", logs, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
     log_path[PATHW - 1] = 0;
     if (log_file) fclose(log_file);
     log_file = _wfopen(log_path, fixed_name ? L"ab" : L"wb");
+    if (!log_file) {
+        wchar_t fallback[PATHW]; join(fallback, PATHW, data, L"logs");
+        if (wcscmp(fallback, logs)) {
+            logw(L"Log folder \"%ls\" is not writable; ", logs);
+            ensure_directory(fallback);
+            if (fixed_name) join(log_path, PATHW, fallback, fixed_name);
+            else _snwprintf(log_path, PATHW, L"%ls\\%04u%02u%02u_%02u%02u%02u.log", fallback, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+            log_path[PATHW - 1] = 0;
+            log_file = _wfopen(log_path, fixed_name ? L"ab" : L"wb");
+            if (log_file) logw(L"the log goes to %ls instead.\n", log_path);
+            else logw(L"the fallback %ls is not writable either.\n", log_path);
+        }
+    }
     logw(L"Log: %ls\n", log_file ? log_path : L"(not writable)");
 }
 static const wchar_t *const *play_extra; static int play_extra_count;
@@ -1445,7 +1501,7 @@ static DWORD WINAPI play_thread(LPVOID p) {
 static void set_running(int on) {
     running = on;
     EnableWindow(control(ID_PLAY), !on); EnableWindow(control(ID_STOP), on);
-    for (int id = ID_GAME; id <= ID_TRACE; ++id) EnableWindow(control(id), !on);
+    for (int id = ID_GAME; id <= ID_LOGDIR_BROWSE; ++id) EnableWindow(control(id), !on);
     EnableWindow(control(ID_STEAM), !on);
     online_controls();
 }
@@ -1456,7 +1512,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         if (id == ID_MODE && HIWORD(wparam) == CBN_SELCHANGE) online_controls();
         else if (id == ID_HOSTSCAN && !running) fill_host_addresses();
         else if (id == ID_COPYHOST) copy_host_address();
-        else if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(folder)) SetWindowTextW(control(ID_GAME), folder); }
+        else if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(L"The game folder (CUSA06534; CUSA06534-patch beside it is merged automatically)", folder)) SetWindowTextW(control(ID_GAME), folder); }
+        else if (id == ID_LOGDIR_BROWSE && !running) {
+            wchar_t folder[PATHW];
+            if (pick_folder(L"The log folder (empty: the data folder's logs)", folder)) {
+                SetWindowTextW(control(ID_LOGDIR), folder);
+                wcsncpy(settings.log_dir, folder, PATHW - 1); settings.log_dir[PATHW - 1] = 0;
+                settings_save();
+                open_log_file(L"launcher.log"); /* the log follows the new folder at once */
+            }
+        }
         else if (id == ID_RESCAN) { gamepads_refresh(); fill_gamepads(); logw(L"Controllers: %d found\n", gamepad_count); }
         else if (id == ID_CONTROLS && !running) controls_open();
         else if (id == ID_PLAY && !running) {
@@ -1474,7 +1539,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             add_to_steam();
         } else if (id == ID_LOGS || id == ID_DATA) {
             wchar_t folder[PATHW];
-            if (id == ID_LOGS) join(folder, PATHW, data, L"logs"); else { wcsncpy(folder, data, PATHW - 1); folder[PATHW - 1] = 0; }
+            if (id == ID_LOGS) effective_log_dir(folder); else { wcsncpy(folder, data, PATHW - 1); folder[PATHW - 1] = 0; }
             ensure_directory(folder);
             ShellExecuteW(window, L"open", folder, NULL, NULL, SW_SHOWNORMAL);
         }
@@ -1531,10 +1596,15 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
                     .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"UFC3NativeLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
     RegisterClassW(&wc);
     const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
-    /* The client area is 760x878 at 96 DPI: the window is created, measured, and resized by the
+    /* The client area is 760x912 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(878);
-    main_window = CreateWindowExW(0, wc.lpszClassName, L"EA SPORTS UFC 3 - native PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
+    const int client_w = sx(760), client_h = sx(912);
+#ifdef UFC3_DIAGNOSTIC_PACKAGE
+    const wchar_t *window_title = L"EA SPORTS UFC 3 - native PC port (Windows diagnostic test)";
+#else
+    const wchar_t *window_title = L"EA SPORTS UFC 3 - native PC port";
+#endif
+    main_window = CreateWindowExW(0, wc.lpszClassName, window_title, style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
     open_log_file(L"launcher.log");
@@ -1594,12 +1664,15 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Frame statistics", BS_AUTOCHECKBOX, 24, y + 20, 160, 20, ID_STATS);
     make(L"BUTTON", L"Vulkan validation layer", BS_AUTOCHECKBOX, 200, y + 20, 200, 20, ID_VALIDATION);
     make(L"BUTTON", L"Menu input trace", BS_AUTOCHECKBOX, 420, y + 20, 200, 20, ID_TRACE); y += 58;
+    make(L"STATIC", L"Log folder (empty: the data folder's logs; BB_LOG_DIR wins; a shared drive works):", 0, 12, y + 4, 330, 30, 0);
+    make(L"EDIT", settings.log_dir, WS_BORDER | ES_AUTOHSCROLL, 344, y, 304, 24, ID_LOGDIR);
+    make(L"BUTTON", L"Browse...", BS_PUSHBUTTON, 660, y, 88, 24, ID_LOGDIR_BROWSE); y += 34;
     make(L"BUTTON", L"Play", BS_DEFPUSHBUTTON, 12, y, 120, 30, ID_PLAY);
     make(L"BUTTON", L"Stop", BS_PUSHBUTTON, 140, y, 90, 30, ID_STOP);
     make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 878 - y - 12, ID_LOG);
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 912 - y - 12, ID_LOG);
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
     {
         const struct { int id, count, selected; const wchar_t *const *names; } combos[] = {
@@ -1623,6 +1696,9 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     set_running(0);
     char version[64]; read_version(version, sizeof(version));
     logf("SacredFire %s (Windows). Data: ", version); logw(L"%ls\n", data);
+#ifdef UFC3_DIAGNOSTIC_PACKAGE
+    logw(L"Windows diagnostic test: the data stays beside the exe in diagnostic-data; write windows and their audit are on for every run.\n");
+#endif
     logw(L"Controllers: %d found; window scale %d%%\n", gamepad_count, (int)(scale * 100));
     ShowWindow(main_window, SW_SHOW);
     MSG msg;
@@ -1662,17 +1738,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         else if (!wcscmp(argv[i], L"--help") || !wcscmp(argv[i], L"-h")) {
             logw(L"SacredFire.exe [--play] [--game <folder>] [game options]\n"
                  L"  Without --play: the launcher window. --play starts the game with the saved settings.\n"
-                 L"  BB_DATA_DIR, BB_GAME_DIR, BB_TIMEOUT and the other variables of run.sh apply.\n");
+                 L"  BB_DATA_DIR, BB_GAME_DIR, BB_LOG_DIR, BB_TIMEOUT and the other variables of run.sh apply.\n");
             return 0;
         } else if (extra_count < 64) extra[extra_count++] = argv[i];
     }
     const wchar_t *data_env = env_or(L"BB_DATA_DIR", NULL);
     if (data_env) { if (!GetFullPathNameW(data_env, PATHW, data, NULL)) { fail(L"BB_DATA_DIR is not a usable path"); return 2; } }
+#ifdef UFC3_DIAGNOSTIC_PACKAGE
+    else join(data, PATHW, root, L"diagnostic-data"); /* the diagnostic run keeps its data beside the exe */
+#else
     else {
         PWSTR local = NULL;
         if (FAILED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local))) { fail(L"no %LOCALAPPDATA%"); return 2; }
         join(data, PATHW, local, L"UFC3Native"); CoTaskMemFree(local);
     }
+#endif
     ensure_directory(data);
     join(python, PATHW, root, L"python\\python.exe");
     join(game_exe, PATHW, root, L"bin\\sacredfire-game.exe");
