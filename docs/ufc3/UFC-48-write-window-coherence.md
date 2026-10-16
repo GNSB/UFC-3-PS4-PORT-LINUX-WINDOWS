@@ -232,3 +232,123 @@ otras partes varias veces (más de 4) → primera pelea de Career completa; desp
 peleadores de fábrica, pelea completa. Mandar el log entero. Esperado: sin `Host fault`, sin el
 assert; `Write windows: ... CPU took over X GPU bytes` y 0 `readback-overwrite`; FPS de pelea
 como en la prueba anterior (el lock compartido es por readback, no por draw).
+
+## Cuarta pasada: congelamiento en el editor y readback-overwrite que quedan
+
+Prueba 3 con `UFC3-WRITE-WINDOWS-TEST.exe` de bb4e938
+(`~/ufcCOntext/external-logs/UFC48-test3-win-20261016_174330.log`, 924 líneas): el host fault
+de `+0x13c123` ya no aparece. El juego se **congeló** en el editor de Career (salir de la
+categoría cabeza y volver a entrar): música sí, imagen e input no. El log termina en draws del
+shader dither (pelo) y `open(/temp0/createplayer/cap_20002)`, sin STOP/fault/assert y sin
+`GPU wait not met` (UFC-47). Además 7 `readback-overwrite` (líneas 732, 840, 842, 845, 863,
+882, 885).
+
+### Congelamiento
+
+**El log no lo prueba** (ninguna línea después de que empieza; las stats salen del hilo GPU
+cada 5 s y paran cuando el juego deja de enviar trabajo). Por código, la causa más probable es
+un **fault reintentado para siempre**, no un deadlock entre los locks nuevos:
+
+- `OpenWindow`, si la página ya está en `open_windows`, devolvía «abierta por otro hilo,
+  reintentá» **sin tocar la protección**. Pero una página con window abierta puede volver a
+  quedar protegida: un readback que la cubre le quita el bit GPU (`UnmarkRegionAsGpuModified`,
+  también el retorno vacío nuevo de 9dcb459) y un binding escrito del hilo GPU se lo vuelve a
+  poner (`ForEachUploadRange` → `ChangeRegionState<GPU>` → `UpdatePageWatchers` →
+  `Protect(None)`). El siguiente write de la CPU hace fault, `DecideWriteStep` vuelve a pedir
+  window (bytes GPU en la página, no cerca del write), `OpenWindow` la encuentra abierta y el
+  write se reintenta sobre la página protegida: bucle infinito en el handler. El hilo del juego
+  queda girando (imagen e input colgados), el audio es otro hilo, el GPU no recibe más trabajo
+  (sin stats, sin `GPU wait`). Encaja con el síntoma; el editor tiene justo esa mezcla
+  (~300 windows/s, ~450–1000 readbacks/s, bindings escritos cada frame en páginas con bytes de
+  CPU al lado, p. ej. `0x10013fd000`).
+- `ArmStep` tenía la misma forma: con la página ya en el slot no la volvía a abrir.
+- Locks revisados (sin ciclo encontrado): `windows_mutex` → lock de página → `Protect`
+  (`CloseWindows`, `OpenWindow`), `windows_mutex` → `gpu_ranges_mutex` (cierre), lock de región
+  del tracker → `gpu_ranges_mutex` (`DownloadMemory`, `SynchronizeMemory`), `keep_gpu_mutex` →
+  `gpu_ranges_mutex`. Nadie toma `gpu_ranges_mutex` y después uno de los otros, ni lo toma dos
+  veces en el mismo hilo, ni toca memoria del guest con él tomado.
+
+**Arreglo (`page_manager.cpp`).** `OpenWindow` con la página ya abierta la vuelve a poner
+`ReadWrite` (bajo el lock de la página, después de `windows_mutex`, como `CloseWindows`) y lo
+cuenta; `ArmStep` igual. La semántica de la window no cambia: al cerrar, `Protect(Perms())`
+restaura la protección que piden los watchers.
+
+**Diagnóstico por defecto (no sólo en la build de prueba).**
+- `wait_watch.h/.cpp` (nuevo): `windows_mutex` y `gpu_ranges_mutex` pasan a
+  `WaitWatch::Mutex`/`SharedMutex` (mismos locks; anotan dueño y sitio, y sólo registran la
+  espera si el `try_lock` falla). También se registran las esperas de un fault por un readback
+  del hilo GPU (`ReadMemory` → `SendCommand<true>`/`SendInOrderCommand`) y las del readback por
+  la GPU (`scheduler.Wait`/`Finish` en `DownloadMemory`). Un hilo vigía revisa cada segundo; una
+  espera de más de 5 s imprime
+  `Wait over 5 s (UFC-48; ... module base ...); waits in progress:` y una línea por espera en
+  curso: `thread N waits for <qué> for X s (at +off); held by thread M (taken at +off)`, y al
+  terminar `Wait over 5 s ended: ...`. Los `+off` se simbolizan con `llvm-symbolizer` sobre el
+  `sacredfire-game.exe` con debug info de este commit.
+- `NoteRepeatedWriteFault`: un hilo que hace fault 2^20 veces seguidas en la misma página con
+  el mismo `rip` imprime una vez `Write fault loop: thread N faulted ... on page ... in X s;
+  page open in a write window: yes/no/unknown`. Un loop del juego que hace step sobre un
+  contador legítimamente son cientos por segundo (horas para llegar); un reintento infinito son
+  cientos de miles por segundo.
+- La línea de stats `Write windows:` agrega `N faults on an open window` (cada uno habría sido
+  un reintento sobre una página protegida).
+
+### readback-overwrite con window_changed > 0
+
+Los 7 pasan por `DownloadMemory` → `WriteReadback` (el audit sólo corre ahí). No es un readback
+que esquive el merge: `WriteReadback` sólo protege bytes de windows **abiertas** o cambiados
+desde que **empezó** el readback, y eso es correcto. Lo que el audit no tenía en cuenta es que
+después del cierre la GPU puede volver a escribir esos bytes: un binding escrito
+(`ObtainBuffer(is_written)`) hace `gpu_modified_ranges.Add` sobre el rango entero, y el
+siguiente readback trae el valor de la GPU, **más nuevo** que el de la CPU. El audit seguía
+marcando esos bytes como «cambiados por la window» indefinidamente (`age` 509–953 windows
+después, segundos): cualquier readback posterior contaba como pisada.
+
+Los casos del log tienen esa forma: páginas enteras de texturas del editor que el juego llena
+con `memcpy` (`window_changed` 669–4096) y que después la GPU escribe como imágenes storage
+(`[T6a] BC view ... (GPU-written, storage): through memory` en el mismo rango de heap, que se
+recicla con cada cambio de pelo); y la de `0x10013fde80+96` (allocator) es un binding de 96
+bytes que la GPU escribe (`0x24`) sobre un nodo que el allocator había liberado. Lo que el log
+**no** permite es separar cada caso con certeza: el audit viejo no registraba los bindings.
+
+Orden con el hilo GPU retrasado (el submit cierra la window mientras el hilo GPU todavía procesa
+una submission anterior): si ese binding hace `Add` después del `Subtract` del cierre, el
+`UpdateBuffer` de los bytes de la CPU se graba en el siguiente `Maintain`, después del dispatch:
+la VRAM termina con el valor de la CPU y el readback no pisa nada. Si el dispatch es posterior
+(otra submission), la GPU escribió después: su valor gana, como en la PS4.
+
+**Arreglos.**
+- **Audit preciso** (`page_manager.cpp`, `buffer_cache.cpp`): cada `gpu_modified_ranges.Add` de
+  un binding escrito llama `PageManager::DiagnoseGpuWrite`, que pasa los bytes cambiados de
+  windows cerradas en ese rango a `reclaimed`. `readback-overwrite` cuenta ahora sólo bytes que
+  la CPU cambió en una window cerrada **y que ninguna escritura GPU reclamó después**: esos sí
+  son una pisada (el criterio sigue siendo 0). Los reclamados salen como
+  `readback-after-gpu-write ... gpu_claimed=N written=M` (informativo, con su propio tope), para
+  ver cuántos y dónde. Sólo con `BB_WRITE_WINDOW_DIAG=1`.
+- **El camino que sí esquivaba el merge**: las descargas de imágenes del texture cache
+  (`DownloadImageMemory`, sync y diferida) escribían directo con `TryWriteBacking`. Con
+  `BB_WRITE_WINDOW=1` ahora toman `ReadbackSnapshot` al pedir la descarga y escriben por
+  `WriteReadback` (+ audit), como los buffers. Con windows apagadas no cambia nada.
+
+### Compilación
+
+- Linux: `ufc3-build` → exit 0 (PGO off, LTO ON). `write-window-merge-test` y
+  `page-watch-perms-test` pasan (compilados bajo el lock de `ufc3-build`).
+- Windows: ver más abajo.
+
+### Una prueba
+
+`UFC3-WRITE-WINDOWS-TEST.exe`: Career → editor de luchador → cambiar pelo varias veces, salir
+de la categoría cabeza y volver a entrar (ida y vuelta varias veces) → primera pelea de Career
+completa; después Quick Fight con peleadores de fábrica, pelea completa. Mandar el log entero,
+también si se congela (cerrar el juego **después** de esperar ~10 s congelado, para que salgan
+las líneas `Wait over 5 s` / `Write fault loop`).
+
+Qué buscar:
+- `Write window audit: readback-overwrite` → **0**. Si aparece alguno, es una pisada real (sin
+  escritura GPU posterior): mandar el log.
+- `readback-after-gpu-write` → informativo; cuántos salen y en qué páginas.
+- `Write windows: ...; N faults on an open window` → N > 0 son casos que antes habrían sido un
+  reintento infinito.
+- Si se congela igual: las líneas `Wait over 5 s` (qué hilo espera qué y quién lo tiene) o
+  `Write fault loop` dicen cuál de las dos cosas es; sin ninguna de las dos, el bloqueo está
+  fuera de los locks vigilados (mandar el log igual).
