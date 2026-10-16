@@ -333,6 +333,9 @@ std::atomic<u64> window_cpu_bytes{0}, readback_kept_bytes{0};
 // ufc3 (BB_WRITE_STEP): gpu_modified_ranges is written on the GPU side; faulting threads read
 // it under this lock to decide a single step themselves (a command to the GPU thread drains the
 // draw pipe first: ~400 drains/s in fights). Writers take it exclusively, only around changes.
+// UFC-48: other threads write it too (a write window's close on the submitting thread, discard
+// locks), so the GPU thread reads it under this lock as well: a read without it walked a tree
+// node freed meanwhile (host fault in DownloadMemory, Career's fighter editor on Windows).
 std::shared_mutex gpu_ranges_mutex;
 // ufc3 (BB_READBACK_INORDER=1, experimental, default off): readbacks run as ordered tasks on
 // the draw recording thread (Liverpool::SendInOrderCommand) instead of after a drain of the
@@ -794,28 +797,33 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             const VAddr page_begin = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
             const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
             u64 tick = 0, gpu_bytes = 0;
-            gpu_modified_ranges.ForEachInRange(page_begin, page_end - page_begin,
-                                               [&](VAddr start, VAddr end) {
-                                                   gpu_bytes += end - start;
-                                                   tick = std::max(tick, WriteTicks().Newest(
-                                                                             start, end - start));
-                                               });
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 4> gpu_runs;
+            {
+                std::shared_lock rl{gpu_ranges_mutex};
+                gpu_modified_ranges.ForEachInRange(page_begin, page_end - page_begin,
+                                                   [&](VAddr start, VAddr end) {
+                                                       gpu_runs.emplace_back(start, end);
+                                                   });
+            }
+            for (const auto& [start, end] : gpu_runs) {
+                gpu_bytes += end - start;
+                tick = std::max(tick, WriteTicks().Newest(start, end - start));
+            }
             if (gpu_bytes != 0 && gpu_bytes <= TwinsMaxBytes() && tick != 0 &&
                 !scheduler.IsFree(tick)) {
                 {
                     std::scoped_lock lk{twins_mutex};
-                    gpu_modified_ranges.ForEachInRange(
-                        page_begin, page_end - page_begin, [&](VAddr start, VAddr end) {
-                            // Parts with a twin keep their older snapshot: the guest bytes may
-                            // have been written since it was taken.
-                            ForEachTwinRun(start, end, [&](VAddr from, VAddr to, TwinRun run) {
-                                if (run == TwinRun::None) {
-                                    std::vector<u8> snapshot(to - from); // ufc3: backing read
-                                    runtime_memory_read_backing(from, snapshot.data(), to - from);
-                                    twins[from] = std::move(snapshot);
-                                }
-                            });
+                    for (const auto& [start, end] : gpu_runs) {
+                        // Parts with a twin keep their older snapshot: the guest bytes may
+                        // have been written since it was taken.
+                        ForEachTwinRun(start, end, [&](VAddr from, VAddr to, TwinRun run) {
+                            if (run == TwinRun::None) {
+                                std::vector<u8> snapshot(to - from); // ufc3: backing read
+                                runtime_memory_read_backing(from, snapshot.data(), to - from);
+                                twins[from] = std::move(snapshot);
+                            }
                         });
+                    }
                 }
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
                 twin_faults.fetch_add(1, std::memory_order_relaxed);
@@ -828,10 +836,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         VAddr download_start = window_start, download_end = window_end;
         if (is_write && TwinsEnabled()) {
             u64 window_tick = 0;
-            gpu_modified_ranges.ForEachInRange(
-                window_start, window_end - window_start, [&](VAddr start, VAddr end) {
-                    window_tick = std::max(window_tick, WriteTicks().Newest(start, end - start));
-                });
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 8> gpu_runs;
+            {
+                std::shared_lock rl{gpu_ranges_mutex};
+                gpu_modified_ranges.ForEachInRange(
+                    window_start, window_end - window_start,
+                    [&](VAddr start, VAddr end) { gpu_runs.emplace_back(start, end); });
+            }
+            for (const auto& [start, end] : gpu_runs) {
+                window_tick = std::max(window_tick, WriteTicks().Newest(start, end - start));
+            }
             if (window_tick != 0 && !scheduler.IsFree(window_tick)) {
                 download_start = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
                 download_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
@@ -853,9 +867,6 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         bool skip_download = false;
         if (is_write && !TwinsEnabled() && SkipNoOverlapEnabled()) {
-            bool overlap = false;
-            gpu_modified_ranges.ForEachInRange(device_addr, size,
-                                               [&](VAddr, VAddr) { overlap = true; });
             // Only pages where the GPU wrote a few bytes (labels, counters): pages full of GPU
             // output (skinned vertices) must keep the normal download, or the game reads or
             // uploads stale data (fighters turned black). BB_WRITE_SKIP_MAX_BYTES (default 64).
@@ -865,14 +876,25 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             }();
             const VAddr page_begin = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
             const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+            bool overlap = false;
             u64 page_gpu_bytes = 0;
-            gpu_modified_ranges.ForEachInRange(page_begin, page_end - page_begin,
-                                               [&](VAddr a, VAddr b) { page_gpu_bytes += b - a; });
+            boost::container::small_vector<std::pair<VAddr, VAddr>, 4> gpu_runs;
+            {
+                // Copied out: keep_gpu_mutex is taken before gpu_ranges_mutex (SynchronizeMemory).
+                std::shared_lock rl{gpu_ranges_mutex};
+                gpu_modified_ranges.ForEachInRange(device_addr, size,
+                                                   [&](VAddr, VAddr) { overlap = true; });
+                gpu_modified_ranges.ForEachInRange(page_begin, page_end - page_begin,
+                                                   [&](VAddr a, VAddr b) {
+                                                       page_gpu_bytes += b - a;
+                                                       gpu_runs.emplace_back(a, b);
+                                                   });
+            }
             if (!overlap && page_gpu_bytes <= max_gpu_bytes) {
                 std::scoped_lock lk{keep_gpu_mutex};
-                gpu_modified_ranges.ForEachInRange(
-                    page_begin, page_end - page_begin,
-                    [&](VAddr start, VAddr end) { keep_gpu_bytes.Add(start, end - start); });
+                for (const auto& [start, end] : gpu_runs) {
+                    keep_gpu_bytes.Add(start, end - start);
+                }
                 skip_download = true;
                 skipped_write_downloads.fetch_add(1, std::memory_order_relaxed);
                 // The page stops being GPU-modified for the tracker (a page that is both GPU-
@@ -918,8 +940,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             constexpr u64 mask = ~(align - 1ULL);
             total_size_bytes += (new_size + align - 1) & mask;
         };
+        std::unique_lock rl{gpu_ranges_mutex};
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        { std::unique_lock rl{gpu_ranges_mutex}; gpu_modified_ranges.Subtract(address, size); }
+        gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
         // UFC-48: GPU-modified pages with no GPU bytes left (a write window's close took them
@@ -1941,8 +1964,7 @@ void BufferCache::ProcessDemotions() {
             return true; // written by a loader since it was handed out again
         }
         // Data only the GPU has (in the VRAM copy) would be lost: such blocks stay.
-        if (IsRegionGpuModified(address, block_size) ||
-            gpu_modified_ranges.Intersects(address, block_size)) {
+        if (IsRegionGpuModified(address, block_size) || GpuRangesIntersect(address, block_size)) {
             kept.fetch_add(1, std::memory_order_relaxed);
             if (force) {
                 BbStats::evac_kept_gpu.fetch_add(1, std::memory_order_relaxed);
@@ -2050,6 +2072,11 @@ void BufferCache::NoteFreshRange(VAddr addr, u64 size) {
     assets_pending.store(true, std::memory_order_release);
 }
 
+bool BufferCache::GpuRangesIntersect(VAddr addr, u64 size) const {
+    std::shared_lock rl{gpu_ranges_mutex};
+    return gpu_modified_ranges.Intersects(addr, size);
+}
+
 namespace {
 std::atomic<u64> discard_locks{0}, discard_gpu_bytes{0}, discard_pages_cleared{0};
 } // namespace
@@ -2125,7 +2152,7 @@ void BufferCache::ProcessPendingAssets() {
                 const VAddr to = std::min<VAddr>(addr + size, block_addr + block_size);
                 if (resident_ranges.Contains(block) && !in_place_blocks.Contains(block)) {
                     if (memory_tracker->IsRegionGpuModified(block_addr, block_size) ||
-                        gpu_modified_ranges.Intersects(block_addr, block_size)) {
+                        GpuRangesIntersect(block_addr, block_size)) {
                         // The GPU's data beside it is only in VRAM: it goes back into the game's
                         // memory as the submission ends, then the block moves (QueueCopyBacks).
                         // An upload now would put stale bytes over that data (whole pages).
@@ -2292,22 +2319,25 @@ void BufferCache::ProcessLateWrites() {
         for (u64 at = 0; at < size;) {
             u64 run = 0;
             bool conflict = false;
-            gpu_modified_ranges.ForEachInRange(addr + at, 4, [&](VAddr, VAddr) { conflict = true; });
+            {
+                std::shared_lock rl{gpu_ranges_mutex};
+                gpu_modified_ranges.ForEachInRange(addr + at, 4, [&](VAddr, VAddr) { conflict = true; });
+                while (!conflict && at + run < size) {
+                    bool next_conflict = false;
+                    gpu_modified_ranges.ForEachInRange(addr + at + run, 4,
+                                                       [&](VAddr, VAddr) { next_conflict = true; });
+                    if (next_conflict) {
+                        break;
+                    }
+                    run += 4;
+                }
+            }
             if (conflict) {
                 PageManager::DiagnoseWindowWrite(
                     addr + at, std::span<const u8>{bytes.data() + at, 4}, true);
                 stepped_write_conflicts.fetch_add(1, std::memory_order_relaxed);
                 at += 4;
                 continue;
-            }
-            while (at + run < size) {
-                bool next_conflict = false;
-                gpu_modified_ranges.ForEachInRange(addr + at + run, 4,
-                                                   [&](VAddr, VAddr) { next_conflict = true; });
-                if (next_conflict) {
-                    break;
-                }
-                run += 4;
             }
             runtime.UpdateBuffer(arena, arena->Offset(addr + at),
                                  std::span<const u8>(bytes.data() + at, run));
@@ -2764,10 +2794,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                             }
                         };
                         keep_gpu_bytes.ForEachInRange(at, end - at, [&](VAddr ks, VAddr ke) {
-                            bool still_gpu = false;
-                            gpu_modified_ranges.ForEachInRange(ks, ke - ks,
-                                                               [&](VAddr, VAddr) { still_gpu = true; });
-                            if (still_gpu) {
+                            if (GpuRangesIntersect(ks, ke - ks)) {
                                 emit(at, std::max(at, ks));
                                 at = std::max(at, ke);
                             }

@@ -322,6 +322,9 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// gpu_modified_ranges.Intersects under gpu_ranges_mutex (other threads write the ranges).
+    bool GpuRangesIntersect(VAddr addr, u64 size) const;
+
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
