@@ -128,7 +128,30 @@ void NoteDecoding(std::uint64_t seq) {
     decoding.store(seq, std::memory_order_relaxed);
 }
 
+namespace {
+void NoteLastWrite(std::uint64_t address, std::uint64_t value, std::uint64_t now) {
+    LastWrite& last = LastWriteSlot(address);
+    last.address.store(address, std::memory_order_relaxed);
+    last.value.store(value, std::memory_order_relaxed);
+    last.ns.store(now, std::memory_order_release);
+}
+bool IsFence(Source source) {
+    return source == Eop || source == Eos || source == ReleaseMem;
+}
+} // namespace
+
 void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source) {
+    if (bytes == 0 || address == 0) {
+        return;
+    }
+    // ufc3 (UFC-47): the last write per address is what GuardLabel tells the port's own label
+    // writes by, so it is kept whatever BB_CLOBBER_CHECK says. A fence label is noted by
+    // GuardLabel itself once the write is let through: noted here, before the guard, it was the
+    // write being judged, and a label the port bumps 2 -> 3 inside the buffer read as rebuilt.
+    const std::uint64_t now = NowNs();
+    if (!IsFence(source)) {
+        NoteLastWrite(address, value, now);
+    }
     // ufc3: the guest write ring and its reports are part of the issue-#2 diagnostics.
     static const bool enabled = [] {
         const char* e = std::getenv("BB_CLOBBER_CHECK");
@@ -137,20 +160,10 @@ void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, 
     if (!enabled) {
         return;
     }
-    if (bytes == 0 || address == 0) {
-        return;
-    }
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
-    const std::uint64_t now = NowNs();
     const std::uint64_t decoding_now = decoding.load(std::memory_order_relaxed);
     writes[writes_head.fetch_add(1, std::memory_order_relaxed) % writes.size()] =
         Write{address, value, now, decoding_now, bytes, source, tid, 0};
-    {
-        LastWrite& last = LastWriteSlot(address);
-        last.address.store(address, std::memory_order_relaxed);
-        last.value.store(value, std::memory_order_relaxed);
-        last.ns.store(now, std::memory_order_release);
-    }
     // The newest submitted buffer the write lands in.
     const Range* hit = nullptr;
     const std::uint64_t head = ranges_head.load(std::memory_order_relaxed);
@@ -250,6 +263,9 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
         }
     }
     if (!rebuilt) {
+        // The write goes ahead: the slot now holds the port's value (the next label to it, a
+        // counter's next step, is told from a rebuilt slot by this).
+        NoteLastWrite(address, value, NowNs());
         return false;
     }
     static std::atomic<std::uint64_t> guarded{0};
