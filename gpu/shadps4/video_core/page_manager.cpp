@@ -1086,8 +1086,13 @@ bool PageManager::WriteWindowsEnabled() {
         const char* env = std::getenv("BB_WRITE_WINDOW");
         const bool on = env && env[0] == '1';
         if (on) {
+            // Windows are decided in BufferCache::DecideWriteStep after its BB_WRITE_STEP gate:
+            // with steps off none opens (UFC-2: 0.1.3 logs read as windows on).
+            const char* step = std::getenv("BB_WRITE_STEP");
+            const bool inert = step && step[0] == '0';
             std::printf("GPU: CPU writes beside GPU data open their page until the next submission "
-                        "(BB_WRITE_WINDOW)\n");
+                        "(BB_WRITE_WINDOW)%s\n",
+                        inert ? "; inactive: BB_WRITE_STEP=0 opens none" : "");
         }
         return on;
     }();

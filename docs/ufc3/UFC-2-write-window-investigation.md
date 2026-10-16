@@ -2,7 +2,121 @@
 
 Estado: allocator corrupto confirmado; causa exacta del write todavía no demostrada.
 Se entrega diagnóstico optativo, no un fix de coherencia ni una habilitación por defecto.
-No se ejecutó el juego.
+No se ejecutó el juego. La segunda pasada (abajo) corrige qué builds tenían windows activas
+y reemplaza la prueba manual de la primera.
+
+## Segunda pasada (16 oct): qué builds abrían windows de verdad
+
+### Hechos (código y tags)
+
+- `BufferCache::DecideWriteStep` retorna `false` cuando `BB_WRITE_STEP=0` (o con twins, o
+  `assume_locks`) **antes** de mirar `WriteWindowsEnabled()` y antes de `RequestWindow()`. Con
+  step apagado no se abre ninguna window: `BB_WRITE_WINDOW=1` sola es inerte.
+- El banner `CPU writes beside GPU data open their page...` lo imprime `WriteWindowsEnabled()`
+  en el primer write fault aunque step esté apagado (el handler lo consulta antes de llamar a
+  DecideWriteStep). El banner **no** prueba windows activas; la prueba es la línea de stats
+  `Write windows: N/s opened instead of a readback` (contador `window_opens`, que sólo sube
+  después del gate). Este commit hace que el banner diga `inactive: BB_WRITE_STEP=0 opens none`.
+- El código de windows/step/readback (`page_manager.cpp`, `buffer_cache.cpp`, `liverpool.cpp`)
+  es igual en `ufc3-v0.1.2`, `ufc3-v0.1.3`, `ufc3-v0.1.4` y `ufc3-online` (8de5098), salvo el
+  diagnóstico de este ticket y el CMask de PS4 Pro. Lo que cambia entre tags es el entorno:
+
+| Build | Windows launcher | Linux run.sh | ¿Windows abren? |
+| --- | --- | --- | --- |
+| 0.1.2 | WINDOW=1, STEP sin fijar (default on) | — | **Sí** |
+| 0.1.3 | WINDOW=1, STEP=0 | WINDOW=1, STEP=0 | No |
+| 0.1.4 / ufc3-online | WINDOW=0, STEP=0 | WINDOW=1, STEP=0 | No |
+
+- Consecuencia: el hotfix 0.1.4 (`BB_WRITE_WINDOW=0` en Windows) no cambió el comportamiento
+  respecto de 0.1.3: en ambos ya estaban inactivas. Hoy, ni Linux ni Windows abren windows ni
+  hacen single-step por defecto: todo write fault sobre una página GPU paga un readback.
+
+### Hechos (reportes) cruzados con la tabla
+
+| Reporte | Build | ¿Windows activas? | Fault |
+| --- | --- | --- | --- |
+| HeuZ (RTX 4090), 3 faults | 0.1.2 | Sí (545–671/s en log) | +0x1262a2a, head `-1` |
+| Reddit (RTX 3060) | 0.1.2 | Sí (470–806/s) | +0x1262a2a, head `0x64`, carga 2.ª pelea |
+| Tester AMD (RX 9070) | parches sobre 0.1.2 | **Desconocido** (no se sabe si STEP ya era 0) | free-list next `0x64` |
+| Amigo (RX 7800 XT), 2 logs | 0.1.3 | **No** (STEP=0) | +0x4c4b3 / +0x4c90d en SimThread, otro sitio |
+
+Los cuatro faults en +0x1262a2a vienen de builds con windows realmente activas. El caso 0.1.3
+**no puede atribuirse a windows**: es otro sitio (vecino del allocator) con windows inertes.
+Ese log trae además cientos de `Late label guarded: EOS fence ... dropped`, lo que mantiene viva
+la hipótesis alternativa de escrituras tardías de fences/labels/readbacks sobre memoria ya
+liberada (mismo patrón que el bug de 2026-10-01 en `docs/parallel_gpu.md`: GPU idle señalado
+con fences diferidas pendientes, free-list pop leyendo basura).
+
+### Defecto de coherencia de las windows (hecho por lectura de código, no reproducido en juego)
+
+Sea R = bytes de la página en `gpu_modified_ranges` (VRAM es la copia buena, guest es vieja).
+
+1. DecideWriteStep sólo verifica que **el primer** write esté a más de 16 bytes de R. Con la
+   window abierta, cualquier thread escribe cualquier byte de la página sin fault, incluidos
+   los de R (por ejemplo un bloque que el GPU escribió, se liberó y el allocator reutiliza como
+   nodo: el «next» de la free list cae en R).
+2. Al cerrar, las palabras que tocan R se descartan (`stepped_write_conflicts`): VRAM conserva
+   el valor viejo y R sigue marcado GPU-owned.
+3. El siguiente readback que cubra esa página (`DownloadMemory`, ventana de 512 KiB alrededor de
+   cualquier fault) copia R de VRAM al guest con `TryWriteBacking`: **pisa el write del CPU**.
+   Un readback durante la window abierta hace lo mismo de inmediato.
+4. Un write del CPU que deja el mismo valor que tenía la copia vieja del guest no aparece en el
+   diff del snapshot: es indetectable, y el readback posterior también lo pisa.
+
+El camino normal (readback antes del write) y el single-step (cada instrucción chequea su
+dirección contra R) no tienen el punto 1; el step conserva una versión estrecha (otros threads
+durante la instrucción abierta). Este mecanismo explica que el valor leído como «next» sea un
+dato GPU (`-1`, `0x64`) y que falle al reciclar memoria (fin de pelea, carga de la siguiente);
+**sigue siendo hipótesis**: no se correlacionó el nodo dañado con R.
+
+Carreras secundarias (hechos de código, sin evidencia de que ocurran ni de que corrompan):
+- `OpenWindow` cambia protección sin el lock de página de los watchers; si un watcher (p. ej.
+  read watcher con `BB_READBACKS=2`) reprotege una página con window abierta, `OpenWindow`
+  devuelve «ya abierta» sin reabrirla: el write reintenta y vuelve a fallar hasta el próximo
+  submit (spin, no corrupción).
+- `CloseWindows` suelta `windows_mutex` antes de reproteger: otro submitter (Gfx/Asc) puede
+  seguir sin que los diffs del primero estén encolados para su submit.
+
+### Por qué no hay fix en esta pasada
+
+No existe una corrección mínima demostrable sin juego:
+- Subir las palabras en conflicto y quitarlas de R arregla sólo los writes con valor distinto
+  (punto 4 queda), necesita uploads con granularidad de byte y el orden entre writes GPU
+  registrados después de abrir la window y el write CPU (si no, destruye resultados GPU
+  válidos): es un rediseño del ownership, no un parche.
+- Una prueba sintética de BufferCache requiere Vulkan/arenas; un modelo aparte sólo repetiría
+  la descripción de arriba. No se agregaron tests.
+- Serializar Open/Close con los locks de página arregla el spin, no la pérdida de writes.
+
+Recuperar rendimiento sin windows: el camino coherente es el single-step (`BB_WRITE_STEP=1`,
+windows 0), apagado por las pieles negras de peleadores creados; no se midió en esta pasada.
+
+### Prueba A/B para el usuario (una sola, Windows)
+
+Mismo build, mismo recorrido: Fight Now con peleadores de fábrica (no created/career, para
+no mezclar el problema de pieles de STEP), pelea completa, post-pelea, volver y cargar la
+segunda pelea; hasta 20 min o el primer crash. Variables en el entorno **antes** de abrir el
+launcher (el launcher respeta las que ya existen):
+
+- **A (baseline, defaults)**: sin variables.
+- **B (diagnóstico)**: `BB_WRITE_STEP=1 BB_WRITE_WINDOW=1 BB_WRITE_WINDOW_DIAG=1`
+
+En B el log debe mostrar `Write window audit: on`, el banner sin `inactive` y líneas
+`Write windows: N/s`. Entregar ambos logs completos. Lectura:
+- B crashea en +0x1262a2a y `Write window audit fault: head page window id=...` encuentra la
+  página del head → windows confirmadas como productor; pasar al ticket de rediseño.
+- B crashea pero `no retained window for allocator head page` → no confirma windows; mirar
+  `upload-skip`/`readback-overwrite` del log.
+- A crashea → hay un bug independiente de windows (camino fences/labels, caso 0.1.3).
+- Ninguno crashea → no valida nada; comparar FPS de pelea entre A y B como dato de costo.
+
+### Siguiente ticket implementable
+
+Si B confirma windows: «Windows coherentes: reconciliar R antes de dar acceso». Al abrir una
+window, descargar sólo los rangos GPU de esa página (readback queue, esperando su write tick)
+y restarlos de `gpu_modified_ranges`, de modo que la página quede CPU-owned y el diff de cierre
+sea completo; medir FPS contra A. Si A también crashea: ticket aparte sobre fences/labels
+tardíos (`Late label guarded`) con `BB_WRITE_LOG=2`.
 
 ## Resolución del fault
 
@@ -192,3 +306,17 @@ automáticamente al submódulo, para dejar los cambios del ticket aislados.
 
 No se ejecutó el binario, el juego ni pruebas largas. No se validó el build Windows;
 la instrumentación usa el acceso a registros multiplataforma ya existente.
+
+### Compilación (segunda pasada)
+
+Cambio de código: sólo el texto del banner de `BB_WRITE_WINDOW` en `page_manager.cpp`
+(`getenv`/`printf` portables); no cambia gates, defaults ni decisiones.
+
+- Linux: `ufc3-build` → exit 0, `out/sacredfire` generado (PGO off, LTO ON).
+- Windows: **no verificado**. No hay wrapper Windows con lock; `scripts/build-windows.sh
+  --runtime` reconstruiría toda la biblioteca en el worktree. Se preparó una comprobación de
+  una sola unidad sin reconstruir (`ninja -t commands sacredfire-game` del build Windows del
+  checkout principal, filtrando `page_manager.cpp`, con rutas `gpu/` apuntando al worktree y
+  `-fsyntax-only` en lugar de `-o`), pero el entorno del agente no permitió ejecutarla.
+- `build.sh` volvió a aplicar el parche FSR al submódulo `gpu/third_party/fsr-vulkan`; queda
+  modificado en el worktree y no se commitea (el agente no pudo revertirlo).
