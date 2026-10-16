@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <deque>
 #ifndef _WIN32
 #include <sys/uio.h>
 #endif
@@ -305,13 +306,194 @@ std::array<StepSlot, 64> step_slots;
 struct WriteWindow {
     VAddr page;
     std::array<u8, TRACKER_BYTES_PER_PAGE> before;
+    u64 audit_id = 0;
 };
 std::mutex windows_mutex;
 std::vector<std::unique_ptr<WriteWindow>> open_windows;
 std::atomic<u32> open_window_count{0};
 thread_local bool want_window = false, fault_from_guest = false;
 constexpr std::size_t MaxWindows = 512;
+
+bool WindowAuditEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_WRITE_WINDOW_DIAG");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::printf("Write window audit: on; 1024 active/recent snapshots, at most 64 reports "
+                        "per event kind; observations do not establish CPU/GPU ownership "
+                        "(BB_WRITE_WINDOW_DIAG)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+struct WindowAuditRecord {
+    u64 id, rip, caller, tid;
+    VAddr page;
+    enum Phase { Open, Closing, Closed } phase = Open;
+    // Baseline at open, replaced by the final snapshot at close.
+    std::array<u8, TRACKER_BYTES_PER_PAGE> snapshot;
+};
+std::mutex window_audit_mutex;
+std::deque<WindowAuditRecord> window_audit;
+u64 window_audit_serial = 0;
+u32 window_audit_reopens = 0, window_audit_readbacks = 0, window_audit_skips = 0;
+
+// Called while windows_mutex is held, before the page is made writable. The audit's lock is
+// never held while acquiring windows_mutex, page locks, or the buffer cache's range lock.
+u64 AuditWindowOpen(const WriteWindow& window, u64 tid) {
+    if (!WindowAuditEnabled()) {
+        return 0;
+    }
+    std::scoped_lock lk{window_audit_mutex};
+    for (const auto& record : window_audit) {
+        if (record.page == window.page && record.phase == WindowAuditRecord::Closing &&
+            window_audit_reopens < 64) {
+            ++window_audit_reopens;
+            std::printf("Write window audit: reopen-during-close page=%#llx old_id=%llu "
+                        "new_id=%llu opener=%#llx tid=%llu\n",
+                        (unsigned long long)window.page, (unsigned long long)record.id,
+                        (unsigned long long)(window_audit_serial + 1),
+                        (unsigned long long)current_fault_rip, (unsigned long long)tid);
+        }
+    }
+    if (window_audit.size() >= 1024) {
+        // Retain live windows even when a long-lived one is older than the recent history.
+        const auto old = std::find_if(window_audit.begin(), window_audit.end(), [](const auto& r) {
+            return r.phase == WindowAuditRecord::Closed;
+        });
+        if (old == window_audit.end()) {
+            return 0; // bounded diagnostics even with concurrent submitters
+        }
+        window_audit.erase(old);
+    }
+    const u64 id = ++window_audit_serial;
+    window_audit.push_back({id, current_fault_rip, current_fault_caller, tid, window.page,
+                            WindowAuditRecord::Open, window.before});
+    return id;
+}
+
+void AuditWindowPhase(u64 id, const u8* after = nullptr) {
+    if (!id) {
+        return;
+    }
+    std::scoped_lock lk{window_audit_mutex};
+    for (auto& record : window_audit) {
+        if (record.id == id) {
+            record.phase = after ? WindowAuditRecord::Closed : WindowAuditRecord::Closing;
+            if (after) {
+                std::memcpy(record.snapshot.data(), after, PM_PAGE_SIZE);
+            }
+            break;
+        }
+    }
+}
 } // namespace
+
+void PageManager::DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip) {
+    if (!WindowAuditEnabled() || data.empty()) {
+        return;
+    }
+    std::scoped_lock lk{window_audit_mutex};
+    u32& reports = upload_skip ? window_audit_skips : window_audit_readbacks;
+    if (reports >= 64) {
+        return;
+    }
+    // Newest matching snapshot per page. Closed records are historical correlation only:
+    // subsequent legitimate CPU/GPU writes or reuse of the mapping can change these bytes.
+    std::vector<VAddr> seen_pages;
+    for (auto it = window_audit.rbegin(); it != window_audit.rend(); ++it) {
+        const auto& r = *it;
+        const VAddr start = std::max(address, r.page);
+        const VAddr end = std::min<VAddr>(address + data.size(), r.page + PM_PAGE_SIZE);
+        if (start >= end || std::find(seen_pages.begin(), seen_pages.end(), r.page) != seen_pages.end()) {
+            continue;
+        }
+        seen_pages.push_back(r.page);
+        std::array<u8, PM_PAGE_SIZE> current;
+        runtime_memory_read_backing(r.page, current.data(), PM_PAGE_SIZE);
+        u64 changed = 0, replaced = 0;
+        VAddr first = end;
+        for (VAddr at = start; at < end; ++at) {
+            const u64 offset = at - r.page;
+            const bool differs = current[offset] != data[at - address];
+            changed += current[offset] != r.snapshot[offset];
+            replaced += differs;
+            if (first == end && (upload_skip ||
+                                (differs && current[offset] != r.snapshot[offset]))) {
+                first = at;
+            }
+        }
+        if (first == end) {
+            continue;
+        }
+        const u64 offset = (first - r.page) & ~u64{7};
+        u64 baseline = 0, guest = 0, incoming = 0;
+        std::memcpy(&baseline, r.snapshot.data() + offset, 8);
+        std::memcpy(&guest, current.data() + offset, 8);
+        std::memcpy(&incoming, data.data() + (first - address), std::min<u64>(8, end - first));
+        std::printf("Write window audit: %s id=%llu age=%llu phase=%s page=%#llx "
+                    "range=%#llx+%llu opener=%#llx caller=+%#llx tid=%llu "
+                    "changed_since_snapshot=%llu differs_from_payload=%llu "
+                    "word=%#llx baseline=%#llx guest=%#llx payload_at=%#llx payload=%#llx\n",
+                    upload_skip ? "upload-skip" : "readback-overwrite",
+                    (unsigned long long)r.id, (unsigned long long)(window_audit_serial - r.id),
+                    r.phase == WindowAuditRecord::Open ? "open" :
+                    r.phase == WindowAuditRecord::Closing ? "closing" : "closed",
+                    (unsigned long long)r.page, (unsigned long long)start,
+                    (unsigned long long)(end - start), (unsigned long long)r.rip,
+                    (unsigned long long)r.caller, (unsigned long long)r.tid,
+                    (unsigned long long)changed, (unsigned long long)replaced,
+                    (unsigned long long)(r.page + offset), (unsigned long long)baseline,
+                    (unsigned long long)guest, (unsigned long long)first,
+                    (unsigned long long)incoming);
+        if (++reports >= 64) {
+            break;
+        }
+    }
+}
+
+void PageManager::DumpWindowFault(void* context) {
+    if (!WindowAuditEnabled()) {
+        return;
+    }
+    const auto reg = [&](Common::FaultRegister r) { return Common::GetFaultRegister(context, r); };
+    const u64 r14 = reg(Common::FaultRegister::R14);
+    std::fprintf(stderr, "Write window audit fault: rip=%#llx r12=%#llx r13=%#llx r14=%#llx "
+                         "r15=%#llx\n",
+                 (unsigned long long)reg(Common::FaultRegister::Rip),
+                 (unsigned long long)reg(Common::FaultRegister::R12),
+                 (unsigned long long)reg(Common::FaultRegister::R13), (unsigned long long)r14,
+                 (unsigned long long)reg(Common::FaultRegister::R15));
+    if (reg(Common::FaultRegister::Rip) != GuestImage + 0x1262a2a) {
+        return;
+    }
+    const VAddr head = r14 + 0x18;
+    u64 value = 0;
+    runtime_memory_read_backing(head, &value, sizeof(value));
+    std::fprintf(stderr, "Write window audit fault: allocator head=%#llx value=%#llx\n",
+                 (unsigned long long)head, (unsigned long long)value);
+    // A fatal fault may have interrupted an audit on this thread. Never wait for its lock.
+    std::unique_lock lk{window_audit_mutex, std::try_to_lock};
+    if (!lk.owns_lock()) {
+        std::fprintf(stderr, "Write window audit fault: history busy\n");
+        return;
+    }
+    for (auto it = window_audit.rbegin(); it != window_audit.rend(); ++it) {
+        if (head >= it->page && head + 8 <= it->page + PM_PAGE_SIZE) {
+            std::memcpy(&value, it->snapshot.data() + head - it->page, 8);
+            std::fprintf(stderr, "Write window audit fault: head page window id=%llu age=%llu "
+                                 "phase=%u snapshot_head=%#llx opener=%#llx caller=+%#llx\n",
+                         (unsigned long long)it->id,
+                         (unsigned long long)(window_audit_serial - it->id), unsigned(it->phase),
+                         (unsigned long long)value, (unsigned long long)it->rip,
+                         (unsigned long long)it->caller);
+            return;
+        }
+    }
+    std::fprintf(stderr, "Write window audit fault: no retained window for allocator head page\n");
+}
 
 struct PageManager::Impl {
     struct PageState {
@@ -492,6 +674,7 @@ struct PageManager::Impl {
         auto window = std::make_unique<WriteWindow>();
         window->page = page;
         runtime_memory_read_backing(page, window->before.data(), PM_PAGE_SIZE);
+        window->audit_id = AuditWindowOpen(*window, StepTid());
         open_windows.push_back(std::move(window));
         open_window_count.store(u32(open_windows.size()), std::memory_order_release);
         self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
@@ -506,6 +689,9 @@ struct PageManager::Impl {
         {
             std::scoped_lock wl{windows_mutex};
             closing.swap(open_windows);
+            for (const auto& window : closing) {
+                AuditWindowPhase(window->audit_id);
+            }
             open_window_count.store(0, std::memory_order_release);
         }
         std::array<u8, TRACKER_BYTES_PER_PAGE> after;
@@ -532,6 +718,7 @@ struct PageManager::Impl {
                 rasterizer->NoteSteppedWrite(page + at, std::vector<u8>(after.data() + at, after.data() + end));
                 at = end;
             }
+            AuditWindowPhase(window->audit_id, after.data());
         }
     }
 
@@ -899,8 +1086,13 @@ bool PageManager::WriteWindowsEnabled() {
         const char* env = std::getenv("BB_WRITE_WINDOW");
         const bool on = env && env[0] == '1';
         if (on) {
+            // Windows are decided in BufferCache::DecideWriteStep after its BB_WRITE_STEP gate:
+            // with steps off none opens (UFC-2: 0.1.3 logs read as windows on).
+            const char* step = std::getenv("BB_WRITE_STEP");
+            const bool inert = step && step[0] == '0';
             std::printf("GPU: CPU writes beside GPU data open their page until the next submission "
-                        "(BB_WRITE_WINDOW)\n");
+                        "(BB_WRITE_WINDOW)%s\n",
+                        inert ? "; inactive: BB_WRITE_STEP=0 opens none" : "");
         }
         return on;
     }();
