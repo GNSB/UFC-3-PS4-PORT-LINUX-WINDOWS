@@ -19,19 +19,44 @@ the native Bloodborne port. All code is GPL-2.0-or-later.
 
 ## Status
 
+**Current release: [0.1.4](../../releases)** (a hotfix on top of 0.1.3).
+
 **Playable.** Menus, loading, fights (including the menu's attract-mode fight), sound, controller
-and saves.
+and saves. What works today:
+
+- **Career**: it saves, and it no longer crashes on entry.
+- **PS4 Pro mode** (the game renders 1080p instead of 900p), with a checkbox in the Windows
+  launcher (`BB_NEO=1` on Linux).
+- **90 FPS** in the launcher's FPS limit, next to 60 / 120 / 144 / 240 / Unlimited.
+- **Hair and beards** with proper coverage instead of square cards.
+- **Created-fighter skin** that survives repeated editing (no black or garbled patches).
+- **Shadows** without acne or flicker from the emulated depth format.
+- **Career portraits and the post-fight screen**: your fighter shows up on the post-fight menu,
+  in the career pause menu and on the Saved Careers cards.
+- **Game language** selector in the Windows launcher.
 
 | Scene | Linux · Ryzen 5 5600 + RTX 4070 | Windows · Omen 16 (RTX 3060 Laptop, 6 GB) |
 |---|---|---|
 | Menus / loading screens | 240 FPS (the game's own cap) | 240 FPS (*Immediate* present mode) |
-| Fight, no FPS limit | **137–196 FPS** | 66–83 FPS before write windows; the new build is not measured yet |
+| Fight, no FPS limit | **137–196 FPS** (write windows on) | 66–83 FPS (measured without write windows, the Windows default) |
 | Fight, 120 FPS limit | steady 120 FPS | — |
 
-- Tested on NVIDIA (Linux and Windows). The AMD code paths are SacredFire's (developed on AMD /
-  Steam Deck), but **UFC 3 has not been tested on an AMD GPU yet**.
-- Known issues: moving the window to another monitor *during startup* can crash the NVIDIA driver
+- Tested by the maintainer on NVIDIA (Linux and Windows); AMD fixes come from @luscamovi's
+  RX 9070, and players have reported on other AMD and NVIDIA cards (RX 7800 XT, RTX 4090…).
+- **Write windows** (a faster CPU/GPU memory path, see *Performance*) are **on on Linux and off
+  on Windows**: on Windows they corrupted the game's heap (crashes loading the second fight or
+  signing the career contract). Windows fights are therefore slower than Linux ones.
+
+**Known issues**
+
+- Moving the window to another monitor *during startup* can crash the NVIDIA driver
   (`Swapchain::Destroy`).
+- Write windows stay off on Windows (a performance limitation, no longer a crash); the cause is
+  still under investigation, and `BB_WRITE_WINDOW=1` brings the crash risk back.
+- Some long hairstyles leave a slightly lighter line at the base of the neck.
+- Portuguese (Portugal) (`BB_LANGUAGE=7`) is listed but the game has no text for it: pick
+  Portuguese (Brazil) (`17`).
+- No online play yet.
 
 ## Requirements
 
@@ -54,23 +79,29 @@ and saves.
 2. Open **`UFC3.exe`**. Pick the `CUSA06534` folder (the base game; an update next to it is
    detected automatically) and press **Play**.
 3. On first launch the game is prepared (a few seconds) in `%LOCALAPPDATA%\UFC3Native`. Each
-   session's log goes to `%LOCALAPPDATA%\UFC3Native\logs\`.
+   session's log goes to `%LOCALAPPDATA%\UFC3Native\logs\`; the launcher's **Open logs folder**
+   button opens it. **If the game crashes, send us that session's `.log`** (with **Frame
+   statistics** checked if you can reproduce it).
 
 ### Launcher settings (God of War III port style)
 
 | Setting | Values | Notes |
 |---|---|---|
 | Player name | text (16 ASCII characters) | The name the game shows. |
+| Game language | English (US), French, German, Italian, Spanish (Spain / Latin America), Portuguese (Brazil / Portugal), Polish, Russian, Japanese, Chinese (Traditional) | `BB_LANGUAGE`. Portugal has no text in the game: use Brazil. |
 | Controls... | per PS4 input | Keyboard key (click, then press it) and gamepad button. Saved to `bbport.ini`. |
 | Game resolution | 720p / 1080p | What the game renders. |
-| Display resolution | Same / 1080p / 1440p (2K) / 4K | Window size; the game's 1080p frame is scaled to it (use FSR 1.0 + sharpening). Fullscreen uses the monitor's size. |
-| FPS limit | 60 / 120 / 144 / 240 / **Unlimited** | The game never goes above 240. |
+| Display resolution | Same / 1080p / 1440p (2K) / 4K | Window size; the game's frame is scaled to it (use FSR 1.0 + sharpening). Fullscreen uses the monitor's size. |
+| PS4 Pro mode | on / **off** | `BB_NEO`: the game renders 1080p instead of 900p, at a lower frame rate. |
+| FPS limit | 60 / 90 / 120 / 144 / 240 / **Unlimited** | Saved by value; the game never goes above 240. |
 | Present mode | Mailbox / VSync (FIFO) / **Immediate** | On NVIDIA, Mailbox stops at 2× the monitor's refresh rate; Immediate reaches 240 (may tear). |
 | Upscaling | Off / AMD FSR 1.0 | For an internal resolution below the monitor's. |
 | Sharpness (RCAS) | Off / Low / Medium / High | |
 | FPS counter | on / off | Top left. |
+| Frame statistics | on / off | Periodic FPS, readback and (on Windows) memory figures in the log; useful in crash reports. |
 
-Environment variables you already have set take precedence over the launcher.
+Environment variables you already have set take precedence over the launcher (for example a
+`.bat` with `set BB_WRITE_WINDOW=1` before starting `UFC3.exe`).
 
 ## Linux
 
@@ -99,7 +130,7 @@ BB_ALLOW_DIRTY=1 bash scripts/package-windows.sh
 Write the notes in `docs/ufc3/releases/<version>.md`, commit, then:
 
 ```bash
-bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, creates the GitHub release
+bash scripts/release.sh <version>   # tags ufc3-v<version>, builds, packages, pushes, creates the GitHub release
 ```
 
 ## Key environment variables
@@ -107,13 +138,16 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
 | Variable | UFC 3 default | What it does |
 |---|---|---|
 | `BB_FPS_LIMIT` | 0 on Windows (unlimited; the launcher offers 60/90/120/144/240), 120 in `run.sh` | FPS limit (0 = none). |
-| `BB_NEO` | 0 (launcher: "PS4 Pro mode") | PS4 Pro mode: the game renders 1080p instead of 900p. |
+| `BB_NEO` | 0 (launcher: "PS4 Pro mode") | PS4 Pro mode: the game renders 1080p instead of 900p (about 80 FPS in fights on an RTX 4070). |
 | `BB_PRESENT_MODE` | Immediate (Windows) | `Mailbox`, `Fifo` or `Immediate`. |
 | `BB_VBLANK_HZ` / `BB_FLIP_RATE` | 480 / 0 | The game asks for 30 Hz; with flip rate 0 and a high virtual vblank it runs at the real rate (the simulation follows real frame time). |
 | `BB_READBACKS` / `BB_READBACK_LINEAR` | 2 / 1 | Precise reads of GPU-written memory (without them the fight renders black, as UFC 4 does in shadPS4). |
 | `BB_WRITE_STEP` | 0 | CPU writes next to a few GPU-written bytes are single-stepped instead of waiting for the GPU. Off: created/career fighters' skin came out black or garbled. |
-| `BB_WRITE_WINDOW` | 1 on Linux (`run.sh`), 0 on Windows (launcher) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). On Windows it corrupts the game's heap (crashes loading the second fight or signing the career contract; RX 9070, RTX 4090, RTX 3060, RX 7800 XT ×2, even with `BB_WRITE_STEP=0`), so the Windows launcher defaults to 0. Linux has no reports and keeps it on. Set `BB_WRITE_WINDOW=1` before starting the launcher to re-enable it on Windows, at the risk of those crashes. |
+| `BB_WRITE_WINDOW` | **1 on Linux** (`run.sh`), **0 on Windows** (launcher) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). On Windows it corrupted the game's heap (crashes loading the second fight or signing the career contract), so the launcher turns it off; Linux has no reports. `BB_WRITE_WINDOW=1` before the launcher re-enables it on Windows, at the risk of those crashes. |
 | `BB_PREUPLOAD` | 0 | Background upload of rewritten game memory into VRAM (1, 2 = all of it). Off for the same skin textures as `BB_WRITE_STEP`. |
+| `BB_ALPHA_TO_MASK` | on | Hair/beard coverage (`DB_ALPHA_TO_MASK` emulated as a shader dither). `0` turns it off; `coverage` uses Vulkan alpha-to-coverage on MSAA targets; `colourmap` limits it to draws sampling the hair colour map (Create Fighter only). |
+| `SHADPS4_BC_MODE` | 3 | GPU-compressed textures go through memory (created-fighter skin). `0` restores the older compressed-view/copy behaviour, for comparison. |
+| `BB_T4_PRESERVE_ALIAS` | 1 | Keeps the portrait the game draws into a larger render target when it re-reads it at the portrait's size (post-fight fighter, career portraits). `0` disables it. |
 | `BB_LDS_ORDER` | 1 | Subgroup memory barriers around shared-memory (LDS) stores in translated shaders, which the GCN code expects (octagon floor grain on AMD). `0` turns them off; clear the shader cache when changing it. |
 | `BB_GPU_WRITE_TWINS` | 0 | Incompatible with precise readbacks (deadlock). |
 | `BB_INTERNAL_WIDTH/HEIGHT`, `BB_FSR1`, `BB_RCAS` | from the launcher | Internal resolution and upscaling. |
@@ -122,6 +156,9 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
 | `BB_USER_NAME` | `Player 1` | The PS4 user name the game shows (16 bytes). |
 | `BB_LANGUAGE` | 1 (launcher: "Game language") | The PS4 system language: 1 English (US), 2 French, 3 Spanish (Spain), 4 German, 5 Italian, 0 Japanese, 7 Portuguese (Portugal; the game has no text for it), 8 Russian, 10 Chinese (Traditional), 16 Polish, 17 Portuguese (Brazil), 20 Spanish (Latin America). |
 | `BB_FRAME_STATS` | 1 in `run.sh` | Periodic statistics in the log (FPS, µs per draw, readbacks, write sites…). |
+
+There are also purely diagnostic switches (`*_TRACE`, `*_SKIP`, `*_DRAWS`…); they are described
+in the [release notes](docs/ufc3/releases/).
 
 ## How it works
 
@@ -163,12 +200,12 @@ bash scripts/release.sh 0.1.0   # tags ufc3-v0.1.0, builds, packages, pushes, cr
    submission's data. On Windows that actually happens: write windows corrupt the game's
    heap (crashes loading the second fight or signing the career contract; five cases with
    RX 9070, RTX 4090, RTX 3060 and RX 7800 XT ×2, even with `BB_WRITE_STEP=0`; with
-   `BB_WRITE_WINDOW=0` the RX 7800 XT user stopped crashing). **`BB_WRITE_WINDOW=1` by
-   default on Linux** (`run.sh`), where no crashes were reported (20-minute sessions on an
-   RTX 4070 completed fine), **and `0` on Windows** (launcher). To re-enable it on Windows
-   at the cost of those crashes, set `BB_WRITE_WINDOW=1` before starting the launcher,
-   for example from a `.bat` with `set BB_WRITE_WINDOW=1`. This override wins on either
-   platform.
+   `BB_WRITE_WINDOW=0` the RX 7800 XT user stopped crashing). So the default is
+   **`BB_WRITE_WINDOW=1` on Linux** (`run.sh`), where no crashes were reported (20-minute
+   sessions on an RTX 4070 completed fine), **and `0` on Windows** (launcher, since 0.1.4).
+   To re-enable it on Windows at the cost of those crashes, set `BB_WRITE_WINDOW=1` before
+   starting the launcher, for example from a `.bat` with `set BB_WRITE_WINDOW=1`. An
+   explicit value wins on either platform.
 
 The full technical write-up (diagnostics, failed experiments, measurements) is in
 [`docs/ufc3/GROK_HANDOFF.md`](docs/ufc3/GROK_HANDOFF.md), [`docs/ufc3/HANDOFF.md`](docs/ufc3/HANDOFF.md)
@@ -191,21 +228,22 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) — renderer and shader recompiler.
 - The God of War III Windows port and *eltutz*'s work, as references for Windows tuning (timers,
   priorities, GPU readback model).
-- [@luscamovi](https://x.com/luscamovi) — the AMD (RX 9070) patches: PS4 Pro mode, the career
-  save fix, the octagon floor grain on AMD, the 90 FPS option and the launcher's Pro checkbox.
-- *mancelli*'s [shadPS4 fork](https://github.com/mancelli/shadPS4/releases/tag/ufc4-intel-arc-2026-10-14)
-  — hair (DB_ALPHA_TO_MASK), created-fighter skin, depth and NaN fixes (see
-  [`gpu/VENDOR.txt`](gpu/VENDOR.txt), which also credits the backported upstream shadPS4 PRs).
-- Upstream shadPS4 backport authors: TheTurtle, Claudio Godoi, kiwakiwaa, artemkaVG,
-  DanielSvoboda and Chris Chreece (original commits in [`gpu/VENDOR.txt`](gpu/VENDOR.txt)).
-- HeuZ — Windows RTX 4090 logs that located the write-window crash; pvict (GitHub) —
+- **[@luscamovi](https://x.com/luscamovi)** (on X) — the AMD (RX 9070) patches, PS4 Pro mode and
+  the career save fix (also the AMD octagon floor grain, the 90 FPS option and the launcher's
+  Pro checkbox).
+- **mancelli** and their [shadPS4 fork](https://github.com/mancelli/shadPS4/releases/tag/ufc4-intel-arc-2026-10-14)
+  — hair (`DB_ALPHA_TO_MASK`), created-fighter skin, depth bias and NaN fixes.
+- Upstream shadPS4 authors whose PRs were backported: TheTurtle, Claudio Godoi, kiwakiwaa,
+  artemkaVG, DanielSvoboda and Chris Chreece (original commits in [`gpu/VENDOR.txt`](gpu/VENDOR.txt)).
+- **HeuZ** — Windows RTX 4090 logs that located the write-window crash; **pvict** (GitHub) —
   Portuguese testing with `BB_LANGUAGE` that motivated the Windows language selector.
-  Thanks to everyone who sent logs and reports.
+  Thanks to everyone who sent Windows logs and reports.
 
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
   [FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), Dear ImGui.
 
-Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md).
+Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md) and
+[`0.1.4`](docs/ufc3/releases/0.1.4.md).
 
 ## License
 
