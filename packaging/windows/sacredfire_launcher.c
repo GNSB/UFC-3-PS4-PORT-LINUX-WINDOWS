@@ -475,10 +475,12 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
      * answered as uncompressed by the runtime). */
     game_env(L"BB_NEO", settings.neo ? L"1" : L"0");
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
-    /* Write windows on by default on both platforms for performance: RTX 4070 fights go from
-     * 105-113 to 140-190 FPS. Windows crashes after a fight (RX 9070, RTX 4090) remain under
-     * investigation. Set BB_WRITE_WINDOW=0 before starting the launcher to disable them. */
-    game_env(L"BB_WRITE_WINDOW", L"1");
+    /* Write windows off by default on Windows: with them on, Windows corrupts the game's heap
+     * (crashes loading the second fight or signing the career contract). Five cases so far:
+     * RX 9070, RTX 4090, RTX 3060 and RX 7800 XT x2, even with BB_WRITE_STEP=0. With
+     * BB_WRITE_WINDOW=0 the RX 7800 XT user stopped crashing. Linux has no reports and keeps
+     * them on (run.sh). Set BB_WRITE_WINDOW=1 before starting the launcher to re-enable them. */
+    game_env(L"BB_WRITE_WINDOW", L"0");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
     /* Created fighters' skin is compressed by the game on the CPU into texture memory: with the

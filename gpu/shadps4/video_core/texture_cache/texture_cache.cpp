@@ -3,6 +3,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <xxhash.h>
 
@@ -92,7 +94,185 @@ void LogT6a(char kind, VAddr address, const char* format, Args... args) {
     }
     std::printf(format, args...);
 }
+
+bool T4TraceEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_T4_TRACE");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+bool T4Portrait(const ImageInfo& info) {
+    return (info.size.width == 864 && info.size.height == 1360) ||
+           (info.size.width == 652 && info.size.height == 1080) ||
+           (info.size.width == 600 && info.size.height == 1080) ||
+           (info.size.width == 1000 && info.size.height == 1200) ||
+           (info.size.width == 252 && info.size.height == 400) ||
+           (info.size.width == 328 && info.size.height == 280) ||
+           (info.size.width == 188 && info.size.height == 160) ||
+           (info.size.width == 360 && info.size.height == 260) ||
+           (info.size.width == 120 && info.size.height == 100);
+}
+
+bool T4PreserveAlias(const Image& source, const ImageInfo& destination) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_T4_PRESERVE_ALIAS");
+        return !env || std::string_view{env} != "0";
+    }();
+    const auto& src = source.info;
+    // UFC-13: only the observed portrait RT -> sampled texture transitions. A CPU/buffer
+    // write invalidates SafeToDownload(), so reused pools do not inherit a stale GPU image.
+    const bool padded_shape =
+        (destination.size.width >= 600 && src.size == Extent3D{1024, 2048, 1}) ||
+        (destination.size == Extent3D{252, 400, 1} && src.size == Extent3D{256, 512, 1}) ||
+        ((destination.size == Extent3D{328, 280, 1} ||
+          destination.size == Extent3D{360, 260, 1}) && src.size == Extent3D{512, 512, 1}) ||
+        (destination.size == Extent3D{188, 160, 1} && src.size == Extent3D{256, 256, 1}) ||
+        (destination.size == Extent3D{120, 100, 1} && src.size == Extent3D{128, 128, 1});
+    return enabled && T4Portrait(destination) && padded_shape &&
+           source.SafeToDownload() && source.usage.render_target &&
+           src.guest_address == destination.guest_address &&
+           destination.size.depth == 1 &&
+           src.type == AmdGpu::ImageType::Color2D && destination.type == src.type &&
+           src.pixel_format == vk::Format::eR8G8B8A8Unorm &&
+           destination.pixel_format == src.pixel_format &&
+           src.tile_mode == AmdGpu::TileMode::Thin2DThin &&
+           destination.tile_mode == src.tile_mode && src.array_mode == destination.array_mode &&
+           src.props.is_tiled && destination.props.is_tiled &&
+           src.alt_tile == destination.alt_tile && src.bank_swizzle == destination.bank_swizzle &&
+           src.num_bits == 32 && destination.num_bits == 32 &&
+           src.num_samples == 1 && destination.num_samples == 1 &&
+           src.resources.layers == 1 && destination.resources.layers == 1 &&
+           src.resources.levels == 1 && destination.resources.levels >= 1 &&
+           src.pitch == src.size.width && destination.pitch == src.pitch &&
+           src.mips_layout[0].pitch == destination.mips_layout[0].pitch &&
+           src.mips_layout[0].offset == 0 && destination.mips_layout[0].offset == 0 &&
+           !((src.micro_tiled_mips | destination.micro_tiled_mips) & 1u);
+}
+
+// UFC-13: diagnostics only; never write tiled images back as linear pixels. Called on the
+// GPU thread. Group by layout rather than address so per-frame allocations cannot flood logs.
+void LogT4Image(const Image& image, const char* event, u64 tick, bool linear_readback,
+                const u8* pixels = nullptr, u32 bytes = 0) {
+    const auto& info = image.info;
+    if (!T4TraceEnabled() || info.size.width < 64 || info.size.height < 64 || info.props.is_depth ||
+        info.props.is_block || info.props.is_volume) {
+        return;
+    }
+    static std::unordered_map<std::string, u32> counts;
+    const auto layout = fmt::format("{} {}x{} pitch={} fmt={} tile={} tiled={}", event,
+                                    info.size.width, info.size.height, info.pitch,
+                                    vk::to_string(info.pixel_format), u32(info.tile_mode),
+                                    bool(info.props.is_tiled));
+    auto it = counts.find(layout);
+    if (it == counts.end()) {
+        if (counts.size() >= 512) {
+            return;
+        }
+        it = counts.emplace(layout, 0).first;
+    }
+    if (it->second >= 32) {
+        return;
+    }
+    ++it->second;
+    std::string content;
+    if (pixels && bytes) {
+        // This is the completed host staging copy, never a read of protected guest pages.
+        u32 nonzero = 0;
+        for (u32 i = 0; i < bytes; ++i) {
+            nonzero += pixels[i] != 0;
+        }
+        content = fmt::format(" host_bytes={} nonzero={} hash={:#x}", bytes, nonzero,
+                              XXH3_64bits(pixels, bytes));
+        if (info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+            info.pixel_format == vk::Format::eR8G8B8A8Srgb) {
+            // Visible level-0 pixels only: padding can contain nonzero staging bytes.
+            std::array<u32, 4> channel_nonzero{};
+            for (u32 y = 0; y < info.size.height; ++y) {
+                for (u32 x = 0; x < info.size.width; ++x) {
+                    const u64 offset = (u64(y) * info.pitch + x) * 4;
+                    if (offset + 4 <= bytes) {
+                        for (u32 c = 0; c < 4; ++c) {
+                            channel_nonzero[c] += pixels[offset + c] != 0;
+                        }
+                    }
+                }
+            }
+            content += fmt::format(" rgba_nonzero={},{},{},{}", channel_nonzero[0],
+                                   channel_nonzero[1], channel_nonzero[2], channel_nonzero[3]);
+        }
+    }
+    std::printf("[T4] tick=%llu %s addr=%#llx guest_bytes=%u mips=%u layers=%u "
+                "samples=%u flags=%#x linear_eligible=%d%s\n",
+                static_cast<unsigned long long>(tick), layout.c_str(),
+                static_cast<unsigned long long>(info.guest_address), info.guest_size,
+                info.resources.levels, info.resources.layers, info.num_samples, u32(image.flags),
+                linear_readback && (!info.props.is_tiled || info.size.width <= 8) &&
+                    info.guest_address != 0,
+                content.c_str());
+}
 } // Anonymous namespace
+
+void TextureCache::TraceT4Pixels(Image& image, const char* event, Extent2D region) {
+    // Explicit, bounded diagnostic waits, separate from normal BB_T4_TRACE logging. This
+    // reads the Vulkan image into host staging; it never changes guest/buffer-cache bytes.
+    static const bool pixels_enabled = [] {
+        const char* env = std::getenv("BB_T4_TRACE_PIXELS");
+        return env && env[0] == '1';
+    }();
+    const auto& info = image.info;
+    if (!T4TraceEnabled() || !pixels_enabled || info.props.is_depth || info.props.is_block ||
+        info.size.depth != 1 || info.resources.layers != 1 || info.num_samples != 1 ||
+        info.pixel_format != vk::Format::eR8G8B8A8Unorm) {
+        return;
+    }
+    static std::unordered_set<std::string> seen;
+    static std::unordered_map<std::string, u32> counts;
+    const auto layout = fmt::format("{} {}x{}", event, info.size.width, info.size.height);
+    const auto key = fmt::format("{} {:#x} {}", layout, info.guest_address, info.guest_size);
+    if (seen.size() >= 16 || counts[layout] >= 2 || !seen.insert(key).second) {
+        return;
+    }
+    ++counts[layout];
+    const u64 size = u64(info.pitch) * info.size.height * 4;
+    if (size > 8_MB) {
+        return;
+    }
+    const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
+    const vk::BufferImageCopy copy{
+        .bufferOffset = download.offset,
+        .bufferRowLength = info.pitch,
+        .bufferImageHeight = info.size.height,
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {info.size.width, info.size.height, 1},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+    scheduler.Finish();
+    download.Invalidate();
+    LogT4Image(image, event, scheduler.CurrentTick(), readback_linear_images,
+               download.mapped, static_cast<u32>(size));
+    if (region.width && region.height) {
+        // Same completed staging copy: distinguish the requested portrait rectangle from
+        // pixels elsewhere in the padded 1024x2048 target. No additional GPU wait or copy.
+        const u32 width = std::min(region.width, info.size.width);
+        const u32 height = std::min(region.height, info.size.height);
+        std::array<u32, 4> channels{};
+        for (u32 y = 0; y < height; ++y) {
+            for (u32 x = 0; x < width; ++x) {
+                const u64 offset = (u64(y) * info.pitch + x) * 4;
+                for (u32 c = 0; c < 4; ++c) {
+                    channels[c] += download.mapped[offset + c] != 0;
+                }
+            }
+        }
+        std::printf("[T4] tick=%llu alias-region-host addr=%#llx region=%ux%u "
+                    "rgba_nonzero=%u,%u,%u,%u\n",
+                    static_cast<unsigned long long>(scheduler.CurrentTick()),
+                    static_cast<unsigned long long>(info.guest_address), width, height,
+                    channels[0], channels[1], channels[2], channels[3]);
+    }
+}
 
 std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
     std::unique_lock lock{mutex, std::try_to_lock}; // the caller may hold it already
@@ -158,6 +338,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         const auto [arena, offset] =
             buffer_cache.ObtainBuffer(image.info.guest_address, download_size, true);
         if (buffer_cache.IsInPlace(image.info.guest_address, download_size)) {
+            LogT4Image(image, "download-in-place", scheduler.CurrentTick(), readback_linear_images);
             image_copy.bufferOffset = offset;
             runtime.DownloadImage(&image, arena, std::span{&image_copy, 1});
             return;
@@ -184,12 +365,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
+        LogT4Image(image, "download-host", scheduler.CurrentTick(), readback_linear_images,
+                   download.mapped, download_size);
         BbFreeCheck::Check(image.info.guest_address, download_size, download.mapped,
                            BbFreeCheck::ImageDownload);
         BbClobber::NoteWrite(image.info.guest_address, 0, u32(download_size),
                              BbClobber::ImageDownload);
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        const bool written = Core::Memory::Instance()->TryWriteBacking(
+            std::bit_cast<u8*>(image.info.guest_address), download.mapped, download_size);
+        LogT4Image(image, written ? "guest-written" : "guest-write-failed",
+                   scheduler.CurrentTick(), readback_linear_images);
         if (!WriteTracking()) {
             buffer_cache.InvalidateMemory(image.info.guest_address, download_size);
         }
@@ -451,6 +636,25 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.num_samples;
         if (image_info.BlockDim() != cache_image.info.BlockDim() ||
             lhs_block_size != rhs_block_size) {
+            static u32 alias_trace_count = 0;
+            if (T4TraceEnabled() && T4Portrait(image_info) &&
+                cache_image.info.size == Extent3D{1024, 2048, 1} &&
+                cache_image.SafeToDownload() && alias_trace_count < 64) {
+                ++alias_trace_count;
+                std::printf("[T4] tick=%llu alias-rejected-blockdim addr=%#llx "
+                            "cached=%ux%u pitch=%u tile=%u mips=%u write_tick=%llu "
+                            "requested=%ux%u pitch=%u tile=%u mips=%u binding=%u\n",
+                            static_cast<unsigned long long>(scheduler.CurrentTick()),
+                            static_cast<unsigned long long>(image_info.guest_address),
+                            cache_image.info.size.width, cache_image.info.size.height,
+                            cache_image.info.pitch, u32(cache_image.info.tile_mode),
+                            cache_image.info.resources.levels,
+                            static_cast<unsigned long long>(cache_image.gpu_write_tick),
+                            image_info.size.width, image_info.size.height, image_info.pitch,
+                            u32(image_info.tile_mode), image_info.resources.levels, u32(binding));
+                TraceT4Pixels(cache_image, "alias-before-reject-host",
+                              {image_info.size.width, image_info.size.height});
+            }
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
@@ -768,10 +972,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     key_hash = (key_hash ^ key_hash >> 33) * 0xC4CEB9FE1A85EC53ull;
     key_hash ^= key_hash >> 33;
     auto& cached = find_image_cache[key_hash % find_image_cache.size()];
-    // An exact match stays valid while that image is registered with the same description;
-    // resolved overlaps (views into other images) only until any image registration changes.
+    // An exact match stays valid while that image is registered with the same description.
+    // Portraits also check registrations: a newly rendered padded source can supersede an
+    // exact alias. Resolved overlaps likewise depend on the registry generation.
     const auto still_exact = [&] {
-        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id) {
+        if (cached.view_mip >= 0 || cached.view_slice >= 0 || !cached.image_id ||
+            (desc.type == BindingType::Texture && T4Portrait(info))) {
             return false;
         }
         const Image& image = slot_images[cached.image_id];
@@ -805,8 +1011,73 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     ImageId image_id{};
 
-    // Check for a perfect match first
+    // A newly registered padded RT must take precedence over an exact sampled alias.
+    // Otherwise a second postprocess pass reuses the old alias (even in the same tick).
+    // Consume the source once, before mip generation, so later binds keep generated mips.
+    ImageId portrait_source{};
+    if (desc.type == BindingType::Texture && T4Portrait(info)) {
+        for (const auto id : image_ids) {
+            if (T4PreserveAlias(slot_images[id], info)) {
+                if (portrait_source) { // Ambiguous pool overlap: keep ordinary resolution.
+                    portrait_source = {};
+                    break;
+                }
+                portrait_source = id;
+            }
+        }
+    }
+    if (portrait_source) {
+        for (const auto id : image_ids) {
+            const auto& other = slot_images[id].info;
+            if (id != portrait_source && other.guest_address == info.guest_address &&
+                other.guest_size >= info.guest_size && other.size == info.size &&
+                other.pixel_format == info.pixel_format && other.type == info.type &&
+                other.resources.levels >= info.resources.levels &&
+                other.resources.layers == info.resources.layers &&
+                other.props.is_pow2 == info.props.is_pow2 && other.pitch == info.pitch &&
+                other.tile_mode == info.tile_mode && other.alt_tile == info.alt_tile &&
+                other.bank_swizzle == info.bank_swizzle &&
+                T4PreserveAlias(slot_images[portrait_source], other)) {
+                // Keep a previously expanded chain as one image: creating a separate
+                // mip-0 alias here would fork it from the later storage mip writes.
+                image_id = id;
+                break;
+            }
+        }
+        const bool reused = bool(image_id);
+        if (!image_id) {
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+            RegisterImage(image_id);
+        }
+        // Insertion may move slots; reacquire both references afterwards.
+        auto& src = slot_images[portrait_source];
+        auto& dst = slot_images[image_id];
+        TraceT4Pixels(src, "alias-before-copy-host", {info.size.width, info.size.height});
+        RefreshImage(dst);
+        // Equal macro-tile parameters and effective pitch give identical addresses in
+        // the mip-0 origin rectangle. Slice height has no effect on slice 0 (RGBA8, 1x).
+        runtime.CopyImageMip0Region(&src, &dst);
+        TraceT4Pixels(dst, "alias-preserved-host");
+        static u32 preserved_count = 0;
+        if (T4TraceEnabled() && preserved_count++ < 128) {
+            std::printf("[T4] tick=%llu alias-preserved addr=%#llx region=%ux%u pitch=%u "
+                        "tile=%u mip=0 mips=%u requested_mips=%u src_id=%u dst_id=%u reused=%d\n",
+                        static_cast<unsigned long long>(scheduler.CurrentTick()),
+                        static_cast<unsigned long long>(info.guest_address),
+                        info.size.width, info.size.height, info.pitch, u32(info.tile_mode),
+                        dst.info.resources.levels, info.resources.levels, portrait_source.index,
+                        image_id.index, reused);
+        }
+        if (src.binding.is_bound || src.binding.is_target) {
+            src.binding.needs_rebind = 1u;
+        }
+        FreeImage(portrait_source);
+        TrackImage(image_id);
+    }
+
+    // Check for a perfect match unless a live portrait source has already supplied it.
     for (const auto& cache_id : image_ids) {
+        if (portrait_source) break;
         auto& cache_image = slot_images[cache_id];
         if (cache_image.info.guest_address != info.guest_address) {
             continue;
@@ -964,6 +1235,29 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     if (refresh) {
         UpdateImage(image_id);
     }
+    if (T4TraceEnabled() && T4Portrait(desc.info)) {
+        static u32 view_count = 0;
+        if (view_count++ < 256) {
+            const auto& view = desc.view_info;
+            std::printf("[T4] tick=%llu view addr=%#llx requested=%ux%u "
+                        "resolved=%ux%u image_id=%u binding=%u view_fmt=%s mip=%u+%u "
+                        "layer=%u+%u swizzle=%u,%u,%u,%u\n",
+                        static_cast<unsigned long long>(scheduler.CurrentTick()),
+                        static_cast<unsigned long long>(image.info.guest_address),
+                        desc.info.size.width, desc.info.size.height,
+                        image.info.size.width, image.info.size.height, image_id.index, u32(desc.type),
+                        vk::to_string(view.format).c_str(), view.range.base.level,
+                        view.range.extent.levels, view.range.base.layer, view.range.extent.layers,
+                        u32(view.mapping.r), u32(view.mapping.g),
+                        u32(view.mapping.b), u32(view.mapping.a));
+        }
+        if (desc.type == BindingType::Texture && image.info.props.is_tiled &&
+            False(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Dirty))) {
+            TraceT4Pixels(image, "alias-upload-host");
+        }
+    }
+    LogT4Image(image, desc.type == BindingType::Storage ? "storage" : "sampled",
+               scheduler.CurrentTick(), readback_linear_images);
     if (memo && !BbToggle::Disabled(BbToggle::TextureViewMemo)) {
         if (memo->image_id == image_id && memo->backing == image.backing && memo->view_id) {
             return slot_image_views[memo->view_id];
@@ -993,6 +1287,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
+    LogT4Image(image, "render-target", scheduler.CurrentTick(), readback_linear_images);
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {

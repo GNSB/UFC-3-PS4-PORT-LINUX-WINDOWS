@@ -265,6 +265,8 @@ private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+    void TraceT4Draw(const GraphicsPipeline* pipeline, const RenderState& state,
+                     bool indirect);
     /// bbport: a draw continuing the open render pass with the same inputs gets the same render
     /// state (RenderStateMemo); nothing can have broken the pass in between (barriers, copies and
     /// dispatches end it).

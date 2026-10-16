@@ -386,6 +386,9 @@ private:
     /// images over it to reupload from there. Called with the cache mutex held.
     void WriteBackImage(ImageId image_id);
 
+    /// UFC-13: bounded host-only image probes, opt-in with both T4 trace switches.
+    void TraceT4Pixels(Image& image, const char* event, Extent2D region = {});
+
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     /// Removes the image and any views/surface metas that reference it.

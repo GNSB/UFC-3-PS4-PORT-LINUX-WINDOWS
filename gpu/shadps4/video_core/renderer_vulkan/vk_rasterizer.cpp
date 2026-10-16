@@ -98,6 +98,20 @@ bool SkipShader(u64 hash) {
     return std::ranges::find(live, hash) != live.end() ||
            std::ranges::find(fixed, hash) != fixed.end();
 }
+// Portrait production also uses temporary targets larger than the requested texture.
+// Include MSAA/float intermediates of this shape, rather than filtering on RGBA8 alone.
+bool T4TraceEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_T4_TRACE");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+bool T4PortraitTarget(const VideoCore::ImageInfo& info) {
+    return info.size.width >= 600 && info.size.width <= 1024 &&
+           info.size.height >= 1000 && info.size.height <= 2048;
+}
 } // namespace
 
 
@@ -718,6 +732,18 @@ void Rasterizer::EliminateFastClear() {
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
+    if (T4TraceEnabled() && T4PortraitTarget(image.info)) {
+        static u32 count = 0;
+        if (count++ < 128) {
+            std::printf("%s\n", fmt::format(
+                "[T4] tick={} fast-clear addr={:#x} cmask={:#x} mode={} undefined_msaa={} "
+                "value={:08x},{:08x},{:08x},{:08x}",
+                scheduler.CurrentTick(), image.info.guest_address, col_buf.CmaskAddress(),
+                u32(Regs().color_control.mode), undefined_msaa, clear_value.color.uint32[0],
+                clear_value.color.uint32[1], clear_value.color.uint32[2],
+                clear_value.color.uint32[3]).c_str());
+        }
+    }
     runtime.ClearImage(&image, desc.view_info.range, clear_value);
     ScopeMarkerEnd();
 }
@@ -1678,6 +1704,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         draw_jitter = upscaler->Jitter();
     }
     UpdateDynamicState(pipeline, is_indexed);
+    TraceT4Draw(pipeline, state, false);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
@@ -1820,6 +1847,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         draw_jitter = upscaler->Jitter();
     }
     UpdateDynamicState(pipeline, is_indexed);
+    TraceT4Draw(pipeline, state, true);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
@@ -4045,6 +4073,86 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     return state;
 }
 
+void Rasterizer::TraceT4Draw(const GraphicsPipeline* pipeline, const RenderState& state,
+                              bool indirect) {
+    if (!T4TraceEnabled()) return;
+    bool portrait = false;
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        if (cb_descs[cb].first &&
+            T4PortraitTarget(texture_cache.GetImage(cb_descs[cb].first).info)) portrait = true;
+    }
+    if (!portrait) return;
+    // Recording thread only. Preserve draw order, including repeated shaders/clears.
+    static u32 count = 0;
+    if (count >= 4096) return;
+    const u32 serial = ++count;
+    const auto& regs = Regs();
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& dynamic = scheduler.GetDynamicState();
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+    const auto& depth = state.depth_stencil_attachment;
+    std::string detail = fmt::format(
+        "[T4] tick={} draw={} indirect={} count={} instances={} vs={:08x} ps={:08x} "
+        "ps_variant={:x} fb={}x{} mrt={:#x} raster_samples={} a2c={} "
+        "db_alpha_to_mask={:#x} a2m_disable={} discard={} cull={} "
+        "depth_test={} func={} write={} bounds={}:{}..{} stencil={} "
+        "depth_clear={} stencil_clear={} depth_clear_bits={:08x},{:08x}",
+        scheduler.CurrentTick(), serial, indirect, regs.num_indices,
+        regs.num_instances.NumInstances(), vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0,
+        key.stage_hashes[u32(Shader::SwStage::Fragment)], state.width, state.height,
+        key.mrt_mask, key.num_samples, u32(key.alpha_to_coverage),
+        regs.reg_array[AmdGpu::Regs::ContextRegWordOffset + 0x2DC],
+        u32(regs.depth_shader_control.alpha_to_mask_disable), dynamic.rasterizer_discard_enable,
+        vk::to_string(dynamic.cull_mode), dynamic.depth_test_enabled,
+        vk::to_string(dynamic.depth_compare_op), dynamic.depth_write_enabled,
+        dynamic.depth_bounds_test_enabled, dynamic.depth_bounds_min, dynamic.depth_bounds_max,
+        dynamic.stencil_test_enabled, depth.depth_clear, depth.stencil_clear,
+        depth.clear_value[0], depth.clear_value[1]);
+    if (db_desc.first) {
+        const auto& info = texture_cache.GetImage(db_desc.first).info;
+        detail += fmt::format(" depth={:#x}:{}x{}:{}:samples{}", info.guest_address,
+                              info.size.width, info.size.height,
+                              vk::to_string(info.pixel_format), info.num_samples);
+    }
+    for (u32 i = 0; i < dynamic.viewports.size(); ++i) {
+        const auto& vp = dynamic.viewports[i];
+        const auto& sc = dynamic.scissors[i];
+        detail += fmt::format(" vp{}={},{},{}x{},z{}..{} sc{}={},{},{}x{}", i,
+                              vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth,
+                              i, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height);
+    }
+    if (dynamic.stencil_test_enabled) {
+        detail += fmt::format(" stencil_front={}:ref{:#x}:read{:#x}:write{:#x} "
+                              "stencil_back={}:ref{:#x}:read{:#x}:write{:#x}",
+                              vk::to_string(dynamic.stencil_front_ops.compare_op),
+                              dynamic.stencil_front_reference, dynamic.stencil_front_compare_mask,
+                              dynamic.stencil_front_write_mask,
+                              vk::to_string(dynamic.stencil_back_ops.compare_op),
+                              dynamic.stencil_back_reference, dynamic.stencil_back_compare_mask,
+                              dynamic.stencil_back_write_mask);
+    }
+    for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+        if (!cb_descs[cb].first) continue;
+        const auto& info = texture_cache.GetImage(cb_descs[cb].first).info;
+        const auto& att = state.color_attachments[cb];
+        const auto& blend = key.blend_controls[cb];
+        detail += fmt::format(
+            " CB{}={:#x}:{}x{}:{}:tile{}:samples{}:backing{}:mip{} "
+            "clear{}:{:08x},{:08x},{:08x},{:08x} mask{:#x} "
+            "blend{}:rgb({},{},{}):alpha({},{},{},separate{})",
+            cb, info.guest_address, info.size.width, info.size.height,
+            vk::to_string(info.pixel_format), u32(info.tile_mode), info.num_samples,
+            key.color_samples[cb], cb_descs[cb].second.view_info.range.base.level,
+            att.is_clear, att.clear_value[0], att.clear_value[1], att.clear_value[2],
+            att.clear_value[3], u32(dynamic.color_write_masks[cb]), u32(blend.enable),
+            u32(blend.color_src_factor), u32(blend.color_dst_factor), u32(blend.color_func),
+            u32(blend.alpha_src_factor), u32(blend.alpha_dst_factor), u32(blend.alpha_func),
+            u32(blend.separate_alpha_blend));
+    }
+    std::printf("%s\n", detail.c_str());
+}
+
 void Rasterizer::Resolve() {
     const auto& mrt0_hint = CbExtent(0);
     const auto& mrt1_hint = CbExtent(1);
@@ -4056,6 +4164,21 @@ void Rasterizer::Resolve() {
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  Regs().color_buffers[0].Address(),
                                  Regs().color_buffers[1].Address()));
+    if (T4TraceEnabled() &&
+        (T4PortraitTarget(mrt0_image.info) || T4PortraitTarget(mrt1_image.info))) {
+        static u32 count = 0;
+        if (count++ < 128) {
+            const auto& src = mrt0_image.info;
+            const auto& dst = mrt1_image.info;
+            std::printf("%s\n", fmt::format(
+                "[T4] tick={} cb-resolve src={:#x}:{}x{}:{}:samples{} "
+                "dst={:#x}:{}x{}:{}:samples{}",
+                scheduler.CurrentTick(), src.guest_address, src.size.width, src.size.height,
+                vk::to_string(src.pixel_format), src.num_samples, dst.guest_address,
+                dst.size.width, dst.size.height, vk::to_string(dst.pixel_format),
+                dst.num_samples).c_str());
+        }
+    }
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();

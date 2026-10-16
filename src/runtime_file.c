@@ -31,13 +31,20 @@ _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 typedef PlatformListing Listing;
 /* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
  * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file. */
-typedef struct { int used, host, dirty, save_logged; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
+typedef struct { int used, host, dirty, save_logged; unsigned t4_logged; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+
+/* UFC-13: trace capture production and consumption, alongside GPU [T4] layout diagnostics. */
+static int t4_path(const char *p) {
+    const char *on=getenv("BB_T4_TRACE");
+    return on && on[0]=='1' && p &&
+        (!strncmp(p,"/temp0/createplayer",19) || !strncmp(p,"/temp0/images",13));
+}
 
 static int save_path(const char *p) { return p && !strncmp(p,"/savedata",9); }
 static int temp_name(const char *name) {
@@ -100,10 +107,14 @@ void runtime_file_configure(const char *app0,const char *user) {
     }
     /* ufc3: folders the game reads its fighter portraits and created-player data from
      * (/temp0/images/career, /temp0/images/match, /temp0/createplayer); it only opens them, so
-     * without them the career pause menu showed no portrait. */
+     * missing folders are a separate failure from blank/corrupt capture contents. */
     {
         const char *ufc_dirs[]={"temp0/images","temp0/images/career","temp0/images/match","temp0/createplayer"};
-        for (int i=0;i<4;++i) { snprintf(path,sizeof(path),"%s/%s",user,ufc_dirs[i]); platform_mkdir(path,0755); }
+        for (int i=0;i<4;++i) {
+            snprintf(path,sizeof(path),"%s/%s",user,ufc_dirs[i]);
+            int r=platform_mkdir(path,0755);
+            if (t4_path("/temp0/images")) printf("[T4] configure mkdir %s -> %d\n",path,r);
+        }
     }
 }
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
@@ -334,6 +345,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     }
     if (save_trace() && save_path(guest))
         printf("Save trace: open(%s, flags 0x%x) -> host %d%s%s\n",guest,flags,host,temp ? ", copy " : "",temp ? temp : "");
+    if (t4_path(guest)) printf("[T4] open %s flags=%#x host=%d\n",guest,flags,host);
     if (host<0) {
         e=-host;
         if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
@@ -377,6 +389,12 @@ static int64_t do_close(int fd) {
     File closed=*f;
     *f=(File){0};
     pthread_mutex_unlock(&lock);
+    if (t4_path(closed.path)) {
+        PlatformStat s={0};
+        int r=platform_fstat(closed.host,&s);
+        printf("[T4] close %s fd=%d stat=%d bytes=%lld directory=%d\n",
+               closed.path,fd,r,(long long)s.size,s.is_dir);
+    }
     free_listing(closed.dir);
     int result=0;
     if (closed.temp) result=commit_file(&closed);
@@ -398,6 +416,14 @@ static int host_fd_written(int fd) {
     if (!f->dirty && save_trace() && save_path(f->path)) printf("Save trace: first write to fd %d (%s)\n",fd,f->path);
     f->dirty=1;
     return f->host;
+}
+/* First successful transfer in each direction, including the guest buffer address. Do not
+ * dereference it here: GPU pages may be protected, and tracing must not cause readbacks. */
+static void t4_io(int fd,const char *op,const void *buffer,ssize_t bytes,unsigned bit) {
+    File *f=get(fd);
+    if (bytes<=0 || !f || !t4_path(f->path) || (f->t4_logged&bit)) return;
+    f->t4_logged|=bit;
+    printf("[T4] %s %s fd=%d buffer=%p bytes=%lld\n",op,f->path,fd,buffer,(long long)bytes);
 }
 /* The GPU side is told of the write first (runtime_memory_note_write: its tracking unprotects the
  * range). Pages protected again meanwhile would make the kernel's copy fail with EFAULT instead
@@ -429,6 +455,7 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     ssize_t n=read_retrying(h,buffer,size,0,0);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
+    t4_io(fd,"read",buffer,n,1);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
@@ -440,6 +467,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     ssize_t n=read_retrying(h,buffer,size,offset,1);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
+    t4_io(fd,"pread",buffer,n,1);
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
@@ -460,6 +488,7 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     touch_for_read(buffer,size);
     ssize_t n=platform_write(h,buffer,size);
     if (n<0) return -errno;
+    t4_io(fd,"write",buffer,n,2);
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
 }
@@ -468,6 +497,7 @@ static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset)
     if (h<0) return -EBADF;
     touch_for_read(buffer,size);
     ssize_t n=platform_pwrite(h,buffer,size,offset);
+    t4_io(fd,"pwrite",buffer,n,2);
     return n<0 ? -errno : n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
@@ -540,6 +570,7 @@ static int64_t path_op(const char *guest,int op,int mode) {
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     int r= op==0 ? platform_mkdir(path,mode ? mode : 0755) : op==1 ? platform_rmdir(path) : platform_unlink(path);
+    if (t4_path(guest)) printf("[T4] %s %s -> %d\n",op==0 ? "mkdir" : op==1 ? "rmdir" : "unlink",guest,r);
     if (save_trace() && save_path(guest)) printf("Save trace: %s(%s) -> %d\n",op==0 ? "mkdir" : op==1 ? "rmdir" : "unlink",guest,r);
     return r;
 }
@@ -550,6 +581,7 @@ static int64_t do_rename(const char *from,const char *to) {
     if (!e) e=translate(to,b,sizeof(b));
     if (e) return -e;
     int r=platform_rename(a,b);
+    if (t4_path(from) || t4_path(to)) printf("[T4] rename %s -> %s result=%d\n",from,to,r);
     if (save_trace() && (save_path(from) || save_path(to))) printf("Save trace: rename(%s, %s) -> %d\n",from,to,r);
     return r;
 }
