@@ -73,3 +73,15 @@ Unblock) and extract it again.
 
 This project is not affiliated with or endorsed by Electronic Arts, Sony Interactive
 Entertainment or the UFC. GPL-2.0-or-later; third-party licences are in `licenses\`.
+
+## Host or join a private online session
+
+In **Online play**, choose **Offline**, **Join server** or **Host server**. Previously saved Online server addresses migrate to Join.
+
+To host, select this PC's LAN address in **Host address to share** and press **Play**. The launcher runs the bundled Python server, checks its TCP and UDP listeners, then opens the game. **Copy IP** copies the address your friend should enter in Join server. The server closes with the game, Stop, or the launcher. Another server already using a required port produces an error; it is never taken over or killed. Python does not need a separate installation.
+
+For a friend outside your LAN, install a VPN such as Tailscale on both PCs and use the host's VPN IP in both games (including the host). Use **Rescan** after connecting the VPN. The launcher neither installs the VPN nor configures your router. Internet play through the VPN still needs a two-network gameplay test. Both PCs need the same UFC 3 port build. Select compatible Quick Fight settings and search at nearly the same time.
+
+If Windows Firewall asks about Python or the game, allow the connection on the LAN/VPN interface. Server logs are `%LOCALAPPDATA%\UFC3Native\logs\server-*.log`. An inherited `BB_ONLINE_SERVER` keeps priority; Host requires it to match the selected local IP. Remove the override to use the GUI's Offline mode.
+
+Diagnostic, without starting the game: `UFC3.exe --check-host <local-LAN-or-VPN-IP>` starts, verifies, and closes a server. The result is recorded in `logs\host-check.log`.

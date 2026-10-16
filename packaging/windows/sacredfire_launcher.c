@@ -2,8 +2,9 @@
  * which cannot be produced from Linux for the bundled Python; this one is built by the cross
  * toolchain with no dependency beyond Windows). GPL-2.0-or-later.
  *
- * Window: the game folder (picker; the game check decides), the game language, the online server, the controller for port 1, the
- * game patches (written to bbport.ini as the in-game menu does), PS4 Pro mode, fullscreen,
+ * Window: the game folder (picker; the game check decides), the game language, online play
+ * (Offline, Join server: the host's address, Host server: this PC runs tools\ufc3_server.py for
+ * the session, see "Host server" below), the controller for port 1, the game patches (written to bbport.ini as the in-game menu does), PS4 Pro mode, fullscreen,
  * the developer switches (frame statistics, Vulkan validation, clear the shader cache, menu
  * trace), Play/Stop, the log of the run, and buttons for the logs and data folders. Settings
  * are kept in <data>\sacredfire.ini.
@@ -21,6 +22,10 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+/* Winsock and IP Helper are loaded at run time (net_load): the launcher links neither. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
@@ -43,7 +48,10 @@ static wchar_t python[PATHW], game_exe[PATHW], caps_exe[PATHW];
 /* ---- settings (<data>\sacredfire.ini) ---- */
 typedef struct {
     wchar_t game[PATHW], gamepad[128], player[32];
-    wchar_t online_server[256]; /* BB_ONLINE_SERVER: the online server's address; empty: offline */
+    /* Online play: offline, join the server at join_address, or host one at host_address (an
+     * IPv4 address of this PC the friend reaches: LAN or VPN). BB_ONLINE_SERVER is the one in use. */
+    int online_mode;
+    wchar_t join_address[256], host_address[64];
     int neo, fullscreen, clear_cache, validation, frame_stats, menu_trace;
     /* UFC 3, as the GoW3R launcher's Video panel: the PS4 output size, the frame-rate cap,
      * the swapchain present mode; show_fps mirrors bbport.ini. */
@@ -114,7 +122,17 @@ static void game_env(const wchar_t *name, const wchar_t *value) {
         if (!wcscmp(managed_env[i], name)) { if (managed_given[i]) value = managed_value[i]; break; }
     SetEnvironmentVariableW(name, value);
 }
+/* The value the launcher was started with (a .bat, the system), or NULL. */
+static const wchar_t *given_env(const wchar_t *name) {
+    for (int i = 0; i < (int)(sizeof(managed_env) / sizeof(managed_env[0])); ++i)
+        if (!wcscmp(managed_env[i], name)) return managed_given[i] ? managed_value[i] : NULL;
+    return NULL;
+}
 static int clampi(int v, int n) { return v < 0 || v >= n ? 0 : v; }
+/* Online play (online_mode= in sacredfire.ini; before it, a non-empty online_server= meant Join). */
+enum { ONLINE_OFFLINE, ONLINE_JOIN, ONLINE_HOST };
+static const wchar_t *const online_mode_names[] = {L"Offline", L"Join server", L"Host server"};
+static const wchar_t *const online_mode_ids[] = {L"offline", L"join", L"host"};
 
 static int exists(const wchar_t *path) { return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
 static void join(wchar_t *out_path, size_t n, const wchar_t *a, const wchar_t *b) {
@@ -148,6 +166,7 @@ static void settings_load(void) {
     FILE *f = _wfopen(path, L"r, ccs=UTF-8");
     if (!f) return;
     wchar_t line[PATHW];
+    int mode_saved = 0;
     while (fgetws(line, PATHW, f)) {
         trimw(line);
         wchar_t *eq = wcschr(line, L'=');
@@ -156,7 +175,11 @@ static void settings_load(void) {
         if (!wcscmp(line, L"game")) wcsncpy(settings.game, value, PATHW - 1);
         else if (!wcscmp(line, L"gamepad")) wcsncpy(settings.gamepad, value, 127);
         else if (!wcscmp(line, L"player")) wcsncpy(settings.player, value, 16);
-        else if (!wcscmp(line, L"online_server")) wcsncpy(settings.online_server, value, 255);
+        else if (!wcscmp(line, L"online_server")) wcsncpy(settings.join_address, value, 255); /* Join's address */
+        else if (!wcscmp(line, L"host_address")) wcsncpy(settings.host_address, value, 63);
+        else if (!wcscmp(line, L"online_mode")) {
+            for (int i = 0; i < 3; ++i) if (!wcscmp(online_mode_ids[i], value)) { settings.online_mode = i; mode_saved = 1; }
+        }
         else if (!wcscmp(line, L"neo")) settings.neo = _wtoi(value);
         else if (!wcscmp(line, L"fullscreen")) settings.fullscreen = _wtoi(value);
         else if (!wcscmp(line, L"clear_cache")) settings.clear_cache = _wtoi(value);
@@ -174,12 +197,15 @@ static void settings_load(void) {
         else if (!wcscmp(line, L"language")) { const int i = language_index_of(value); if (i >= 0) settings.language = i; }
     }
     fclose(f);
+    /* A sacredfire.ini of the launcher with one "Online server" field: an address there was Join. */
+    if (!mode_saved) settings.online_mode = settings.join_address[0] ? ONLINE_JOIN : ONLINE_OFFLINE;
 }
 static void settings_save(void) {
     wchar_t path[PATHW]; settings_path(path);
     FILE *f = _wfopen(path, L"w, ccs=UTF-8");
     if (!f) return;
-    fwprintf(f, L"player=%ls\nonline_server=%ls\n", settings.player, settings.online_server);
+    fwprintf(f, L"player=%ls\nonline_mode=%ls\nonline_server=%ls\nhost_address=%ls\n", settings.player,
+             online_mode_ids[settings.online_mode], settings.join_address, settings.host_address);
     fwprintf(f, L"game=%ls\ngamepad=%ls\nneo=%d\nfullscreen=%d\nclear_cache=%d\nvalidation=%d\nframe_stats=%d\nmenu_trace=%d\n"
                 L"resolution=%d\nfps_limit=%ls\npresent_mode=%d\nupscaler=%d\nsharpness=%d\ndisplay=%d\nskip_movies=%d\nlanguage=%ls\n",
              settings.game, settings.gamepad, settings.neo, settings.fullscreen, settings.clear_cache, settings.validation,
@@ -266,6 +292,8 @@ static void fail(const wchar_t *message) {
 
 /* ---- running programs ---- */
 static HANDLE game_process; /* the running game (Stop) */
+static volatile LONG stop_requested;
+static int server_failed(void);
 /* Quotes one argument the way CommandLineToArgvW undoes it. */
 static void append_argument(wchar_t *line, size_t n, const wchar_t *argument) {
     size_t at = wcslen(line);
@@ -284,6 +312,7 @@ static void append_argument(wchar_t *line, size_t n, const wchar_t *argument) {
 /* Runs a command line and waits; its output goes to the log, or into `captured` (then at most
  * `wait_ms`). Returns the exit code, 127 when it cannot start. */
 static DWORD run(wchar_t *line, char *captured, size_t capture_size, int is_game, DWORD wait_ms) {
+    if (stop_requested) return 130;
     SECURITY_ATTRIBUTES inheritable = {.nLength = sizeof(inheritable), .bInheritHandle = TRUE};
     HANDLE read_end = NULL, write_end = NULL;
     if (!CreatePipe(&read_end, &write_end, &inheritable, 0)) { fail(L"CreatePipe failed"); return 127; }
@@ -301,6 +330,15 @@ static DWORD run(wchar_t *line, char *captured, size_t capture_size, int is_game
     if (is_game) game_process = process.hProcess;
     size_t total = 0; DWORD got; char chunk[16384];
     for (;;) {
+        if (stop_requested || (is_game && server_failed())) TerminateProcess(process.hProcess, 1);
+        if (is_game) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(read_end, NULL, 0, NULL, &available, NULL)) break;
+            if (!available) {
+                if (WaitForSingleObject(process.hProcess, 100) == WAIT_OBJECT_0) break;
+                continue;
+            }
+        }
         if (captured) {
             if (total + 1 >= capture_size || !ReadFile(read_end, captured + total, (DWORD)(capture_size - 1 - total), &got, NULL) || !got) break;
             total += got;
@@ -340,6 +378,340 @@ static DWORD script(const wchar_t *folder, const wchar_t *name, const wchar_t *c
     return run(line, captured, capture_size, 0, INFINITE);
 }
 
+/* ---- Host server: tools\ufc3_server.py with the bundled Python, for one game session ----
+ * Play in Host mode, after the preparation: the ports must be free (one in use is reported, never
+ * taken over or closed: another UFC3.exe hosting, a ufc3_server.py); the server starts with
+ * --bind 0.0.0.0, its output in <data>\logs\server-<time>.log; every listener has to answer on the
+ * chosen address before the game starts, with BB_ONLINE_SERVER = that address, not loopback (the
+ * runtime announces to the peer the interface that routes to the server: runtime_net.c
+ * local_address). The server ends with the game (its exit, Stop, the window closed, a failed
+ * start); it is in a job object that Windows kills with the launcher if the launcher is killed. */
+static unsigned short host_tcp_ports[] = {42230, 40443, 40080, 10041, 10744, 17502}; /* ufc3_server.py --ports default */
+static unsigned short host_udp_port = 17502;                                       /* ufc3_server.py QOS_PORT */
+static DWORD host_start_timeout_ms = 30000; /* a first start can be slow (an antivirus scanning python\) */
+static HANDLE server_job, server_process;    /* the play thread owns them; Stop and closing only kill */
+static CRITICAL_SECTION server_lock;
+static wchar_t server_log[PATHW];
+
+
+/* ws2_32 and iphlpapi, loaded once in wWinMain (net_load). */
+static int net_available;
+static int (WSAAPI *p_WSAStartup)(WORD, LPWSADATA);
+static int (WSAAPI *p_WSAGetLastError)(void);
+static SOCKET (WSAAPI *p_socket)(int, int, int);
+static int (WSAAPI *p_bind)(SOCKET, const struct sockaddr *, int);
+static int (WSAAPI *p_connect)(SOCKET, const struct sockaddr *, int);
+static int (WSAAPI *p_closesocket)(SOCKET);
+static int (WSAAPI *p_ioctlsocket)(SOCKET, long, u_long *);
+static int (WSAAPI *p_select)(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
+static int (WSAAPI *p_setsockopt)(SOCKET, int, int, const char *, int);
+static int (WSAAPI *p_sendto)(SOCKET, const char *, int, int, const struct sockaddr *, int);
+static int (WSAAPI *p_recvfrom)(SOCKET, char *, int, int, struct sockaddr *, int *);
+static ULONG (WINAPI *p_GetAdaptersAddresses)(ULONG, ULONG, PVOID, PIP_ADAPTER_ADDRESSES, PULONG);
+#define NET_LOAD(module, name) do { FARPROC f = GetProcAddress(module, #name); if (!f) return; memcpy(&p_##name, &f, sizeof f); } while (0)
+static void net_load(void) {
+    InitializeCriticalSection(&server_lock);
+    HMODULE iphlp = LoadLibraryW(L"iphlpapi.dll");
+    if (iphlp) { FARPROC f = GetProcAddress(iphlp, "GetAdaptersAddresses"); if (f) memcpy(&p_GetAdaptersAddresses, &f, sizeof f); }
+    HMODULE ws2 = LoadLibraryW(L"ws2_32.dll");
+    if (!ws2) return;
+    NET_LOAD(ws2, WSAStartup); NET_LOAD(ws2, WSAGetLastError); NET_LOAD(ws2, socket); NET_LOAD(ws2, bind); NET_LOAD(ws2, connect);
+    NET_LOAD(ws2, closesocket); NET_LOAD(ws2, ioctlsocket); NET_LOAD(ws2, select); NET_LOAD(ws2, setsockopt);
+    NET_LOAD(ws2, sendto); NET_LOAD(ws2, recvfrom);
+    WSADATA wsa;
+    net_available = p_WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+}
+/* IPv4 addresses are kept in host order (a.b.c.d = a << 24 | ...). */
+static void make_sockaddr(struct sockaddr_in *a, uint32_t ip, unsigned short port) {
+    memset(a, 0, sizeof(*a));
+    a->sin_family = AF_INET;
+    a->sin_port = (unsigned short)((port >> 8) | (port << 8));
+    unsigned char *b = (unsigned char *)&a->sin_addr;
+    b[0] = (unsigned char)(ip >> 24); b[1] = (unsigned char)(ip >> 16); b[2] = (unsigned char)(ip >> 8); b[3] = (unsigned char)ip;
+}
+static void ip_text(uint32_t ip, wchar_t *out, size_t n) {
+    _snwprintf(out, n, L"%u.%u.%u.%u", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255); out[n - 1] = 0;
+}
+/* Dotted IPv4 only (a, b, c, d in 0..255); 0 when it is not one. */
+static int parse_ipv4(const wchar_t *text, uint32_t *ip) {
+    uint32_t value = 0; int parts = 0;
+    for (const wchar_t *p = text;; ++p) {
+        if (!iswdigit(*p)) return 0;
+        unsigned part = 0; int digits = 0;
+        while (iswdigit(*p)) { part = part * 10 + (unsigned)(*p++ - L'0'); if (++digits > 3) return 0; }
+        if (part > 255) return 0;
+        value = value << 8 | part;
+        if (++parts == 4) { if (*p) return 0; *ip = value; return 1; }
+        if (*p != L'.') return 0;
+    }
+}
+static int ip_private(uint32_t ip) { return (ip >> 24) == 10 || (ip >> 20) == 0xac1 || (ip >> 16) == 0xc0a8; }
+static int ip_cgnat(uint32_t ip) { return (ip >> 22) == (100u << 2 | 1); } /* 100.64.0.0/10: Tailscale */
+/* The first word of a field ("192.168.1.20  (LAN: Wi-Fi)" -> "192.168.1.20"). */
+static void address_token(const wchar_t *text, wchar_t *out, size_t n) {
+    while (*text == L' ' || *text == L'\t') ++text;
+    size_t k = 0;
+    while (text[k] && text[k] != L' ' && text[k] != L'\t' && text[k] != L'(' && k < n - 1) { out[k] = text[k]; ++k; }
+    out[k] = 0;
+}
+
+/* This PC's IPv4 addresses (adapters that are up), best first: LAN, VPN, public, virtual. */
+typedef struct { uint32_t ip; int rank; wchar_t text[16], label[192]; } LocalAddress;
+static LocalAddress local_addresses[32];
+static int local_address_count;
+static const wchar_t *const rank_names[] = {L"LAN", L"VPN", L"public", L"virtual adapter"};
+static int name_has(const wchar_t *name, const wchar_t *part) { return StrStrIW(name, part) != NULL; }
+static void local_addresses_refresh(void) {
+    local_address_count = 0;
+    if (!p_GetAdaptersAddresses) return;
+    ULONG size = 32768;
+    IP_ADAPTER_ADDRESSES *list = NULL;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        free(list); list = malloc(size);
+        if (!list) return;
+        const ULONG r = p_GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, NULL, list, &size);
+        if (r == ERROR_SUCCESS) break;
+        if (r != ERROR_BUFFER_OVERFLOW || attempt == 2) { free(list); return; }
+    }
+    for (IP_ADAPTER_ADDRESSES *a = list; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        const wchar_t *name = a->FriendlyName ? a->FriendlyName : L"?";
+        for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u && local_address_count < COUNT(local_addresses); u = u->Next) {
+            if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET) continue;
+            const unsigned char *b = (const unsigned char *)&((struct sockaddr_in *)u->Address.lpSockaddr)->sin_addr;
+            const uint32_t ip = (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
+            if ((ip >> 24) == 127 || (ip >> 16) == 0xa9fe || !ip) continue; /* loopback, link-local (no DHCP) */
+            int rank = ip_private(ip) ? 0 : ip_cgnat(ip) ? 1 : 2;
+            if (name_has(name, L"Tailscale") || name_has(name, L"ZeroTier") || name_has(name, L"Hamachi") || name_has(name, L"Radmin") ||
+                name_has(name, L"WireGuard") || name_has(name, L"NetBird")) rank = 1;
+            else if (name_has(name, L"vEthernet") || name_has(name, L"VirtualBox") || name_has(name, L"VMware") || name_has(name, L"Hyper-V") ||
+                     name_has(name, L"WSL") || name_has(name, L"Bluetooth")) rank = 3;
+            int at = local_address_count++;
+            while (at > 0 && local_addresses[at - 1].rank > rank) { local_addresses[at] = local_addresses[at - 1]; --at; }
+            LocalAddress *l = &local_addresses[at];
+            l->ip = ip; l->rank = rank;
+            ip_text(ip, l->text, 16);
+            _snwprintf(l->label, 192, L"%ls  (%ls: %ls)", l->text, rank_names[rank], name); l->label[191] = 0;
+        }
+    }
+    free(list);
+}
+/* The Host address: an IPv4 address of this PC that the friend can reach. 0 and a message to
+ * show when it is not usable; a public address is allowed (a note goes to the log). */
+static int host_address_check(const wchar_t *text, uint32_t *ip, wchar_t *message, size_t n) {
+    static const wchar_t pick[] = L"Pick this PC's LAN address (often 192.168.x.x) or, to play outside your home network, "
+                                  L"its VPN address (Tailscale 100.x.x.x, ZeroTier) from the list; Rescan updates it.";
+    if (!text[0]) { _snwprintf(message, n, L"Host server: no address for your friend. %ls", pick); message[n - 1] = 0; return 0; }
+    if (!parse_ipv4(text, ip)) { _snwprintf(message, n, L"Host server: \"%ls\" is not an IPv4 address (like 192.168.1.20). %ls", text, pick); message[n - 1] = 0; return 0; }
+    if ((*ip >> 24) == 127) {
+        _snwprintf(message, n, L"Host server: %ls is this PC only (loopback): your friend cannot reach it. %ls", text, pick); message[n - 1] = 0; return 0;
+    }
+    if (!*ip || (*ip >> 28) >= 14 || (*ip >> 16) == 0xa9fe) {
+        _snwprintf(message, n, L"Host server: %ls cannot be used by your friend (%ls). %ls", text,
+                   (*ip >> 16) == 0xa9fe ? L"a link-local address: the network gave this PC no address" : L"not a PC's address", pick);
+        message[n - 1] = 0; return 0;
+    }
+    local_addresses_refresh();
+    int found = !p_GetAdaptersAddresses; /* no list on this system: the start checks it */
+    for (int i = 0; i < local_address_count; ++i) found |= local_addresses[i].ip == *ip;
+    if (!found) {
+        _snwprintf(message, n, L"Host server: %ls is not an address of this PC now (is the network or the VPN connected?). %ls", text, pick);
+        message[n - 1] = 0; return 0;
+    }
+    if (!ip_private(*ip) && !ip_cgnat(*ip))
+        logw(L"Host server: %ls is not a LAN or Tailscale address; your friend reaches it only if this network routes it to this PC "
+             L"(the launcher opens no router ports).\n", text);
+    return 1;
+}
+/* A port someone else holds (bind fails: in use, or reserved by Windows / Hyper-V). */
+static int port_taken(int type, unsigned short port) {
+    SOCKET s = p_socket(AF_INET, type, type == SOCK_STREAM ? IPPROTO_TCP : IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+    struct sockaddr_in a; make_sockaddr(&a, 0, port);
+    int taken = 0;
+    if (p_bind(s, (struct sockaddr *)&a, sizeof(a)) != 0) { const int e = p_WSAGetLastError(); taken = e == WSAEADDRINUSE || e == WSAEACCES; }
+    p_closesocket(s);
+    return taken;
+}
+/* A TCP connection to ip:port within 300 ms. */
+static int tcp_answers(uint32_t ip, unsigned short port) {
+    SOCKET s = p_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    u_long nonblocking = 1; p_ioctlsocket(s, FIONBIO, &nonblocking);
+    struct sockaddr_in a; make_sockaddr(&a, ip, port);
+    int ok = p_connect(s, (struct sockaddr *)&a, sizeof(a)) == 0;
+    if (!ok && p_WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writable = {.fd_count = 1, .fd_array = {s}}, failed = {.fd_count = 1, .fd_array = {s}};
+        const struct timeval wait = {0, 300000};
+        ok = p_select(0, NULL, &writable, &failed, &wait) > 0 && writable.fd_count == 1 && failed.fd_count == 0;
+    }
+    p_closesocket(s);
+    return ok;
+}
+/* The QoS ping site echoes a datagram back. */
+static int udp_echoes(uint32_t ip, unsigned short port) {
+    SOCKET s = p_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
+    const DWORD timeout = 300; p_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    struct sockaddr_in a; make_sockaddr(&a, ip, port);
+    static const char probe[] = "UFC3.exe host check";
+    char reply[64];
+    const int ok = p_sendto(s, probe, sizeof(probe) - 1, 0, (struct sockaddr *)&a, sizeof(a)) > 0 && p_recvfrom(s, reply, sizeof(reply), 0, NULL, NULL) > 0;
+    p_closesocket(s);
+    return ok;
+}
+/* The end of the server's log, into the launcher's log. */
+static void server_log_tail(void) {
+    FILE *f = _wfopen(server_log, L"rb");
+    if (!f) return;
+    static char tail[4096]; fseek(f, 0, SEEK_END);
+    const long size = ftell(f), from = size > (long)sizeof(tail) - 1 ? size - (long)sizeof(tail) + 1 : 0;
+    fseek(f, from, SEEK_SET);
+    const size_t n = fread(tail, 1, sizeof(tail) - 1, f); tail[n] = 0; fclose(f);
+    logw(L"--- the host server's log (%ls) ---\n", server_log); logf("%s%s", tail, n && tail[n - 1] == '\n' ? "" : "\n"); logw(L"---\n");
+}
+/* Ends the server's process tree (any thread; the handles stay with the play thread). */
+static void server_kill(void) {
+    EnterCriticalSection(&server_lock);
+    if (server_job) TerminateJobObject(server_job, 1); else if (server_process) TerminateProcess(server_process, 1);
+    LeaveCriticalSection(&server_lock);
+}
+/* The play thread: ends it if it runs, says how it ended, closes the handles. */
+static void server_stop(const wchar_t *why) {
+    if (!server_process) return;
+    DWORD code = 0;
+    const int was_running = WaitForSingleObject(server_process, 0) == WAIT_TIMEOUT;
+    server_kill();
+    WaitForSingleObject(server_process, 5000);
+    GetExitCodeProcess(server_process, &code);
+    if (was_running) logw(L"Host server: stopped (%ls); its log: %ls\n", why, server_log);
+    else { logw(L"Host server: it had already ended (exit code %lu) before %ls.\n", code, why); server_log_tail(); }
+    EnterCriticalSection(&server_lock);
+    CloseHandle(server_process); server_process = NULL;
+    if (server_job) { CloseHandle(server_job); server_job = NULL; }
+    LeaveCriticalSection(&server_lock);
+}
+static int server_failed(void) {
+    if (!server_process || WaitForSingleObject(server_process, 0) != WAIT_OBJECT_0) return 0;
+    server_log_tail();
+    server_stop(L"an unexpected server exit");
+    fail(L"The hosted server stopped unexpectedly. This online session will close; see the server log.");
+    return 1;
+}
+/* Starts the server and waits until it answers on `ip`. 0: ready; 1: failed (said); 2: Stop. */
+static int server_start(uint32_t ip) {
+    wchar_t address[16], script_path[PATHW], message[1024];
+    ip_text(ip, address, 16);
+    join(script_path, PATHW, root, L"tools\\ufc3_server.py");
+    if (!exists(script_path)) { fail(L"tools\\ufc3_server.py is missing next to the launcher: the package is incomplete."); return 1; }
+    if (!net_available) { fail(L"Host server: Windows networking (ws2_32.dll) is not available."); return 1; }
+    /* Ports already held: not ours to take over or close. */
+    wchar_t taken[256] = L""; size_t at = 0;
+    for (int i = 0; i < COUNT(host_tcp_ports); ++i)
+        if (port_taken(SOCK_STREAM, host_tcp_ports[i])) at += (size_t)_snwprintf(taken + at, 256 - at, L"%ls%u/TCP", at ? L", " : L"", host_tcp_ports[i]);
+    if (port_taken(SOCK_DGRAM, host_udp_port)) at += (size_t)_snwprintf(taken + at, 256 - at, L"%ls%u/UDP", at ? L", " : L"", host_udp_port);
+    if (at) {
+        _snwprintf(message, 1024, L"Host server: port %ls already in use on this PC, so the server cannot start. Another UFC 3 server "
+                                  L"is probably running (another UFC3.exe hosting, or ufc3_server.py): close it, or pick Join server "
+                                  L"and type its address. (A port reserved by Windows shows in: netsh int ipv4 show excludedportrange tcp)", taken);
+        message[1023] = 0; fail(message); return 1;
+    }
+    /* <data>\logs\server-<time>.log: the server's output (also kept after a failure). */
+    wchar_t logs[PATHW]; join(logs, PATHW, data, L"logs"); ensure_directory(logs);
+    SYSTEMTIME now; GetLocalTime(&now);
+    _snwprintf(server_log, PATHW, L"%ls\\server-%04u%02u%02u_%02u%02u%02u.log", logs, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    server_log[PATHW - 1] = 0;
+    SECURITY_ATTRIBUTES inheritable = {.nLength = sizeof(inheritable), .bInheritHandle = TRUE};
+    HANDLE log = CreateFileW(server_log, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (log == INVALID_HANDLE_VALUE) { _snwprintf(message, 1024, L"Host server: cannot write %ls", server_log); message[1023] = 0; fail(message); return 1; }
+    /* python -E -s -u -X utf8 tools\ufc3_server.py --bind 0.0.0.0 --ports ...: one argument each, no shell. */
+    static wchar_t line[32768]; wchar_t ports[128] = L"";
+    for (int i = 0, k = 0; i < COUNT(host_tcp_ports); ++i) k += _snwprintf(ports + k, 128 - k, L"%ls%u", i ? L"," : L"", host_tcp_ports[i]);
+    line[0] = 0;
+    append_argument(line, 32768, python);
+    const wchar_t *const options[] = {L"-E", L"-s", L"-u", L"-X", L"utf8"};
+    for (int i = 0; i < COUNT(options); ++i) append_argument(line, 32768, options[i]);
+    append_argument(line, 32768, script_path);
+    append_argument(line, 32768, L"--bind"); append_argument(line, 32768, L"0.0.0.0");
+    append_argument(line, 32768, L"--ports"); append_argument(line, 32768, ports);
+    {
+        char header[PATHW * 3 + 64]; char utf8[PATHW * 3];
+        WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8), NULL, NULL);
+        DWORD written; const int n = snprintf(header, sizeof(header), "UFC3.exe host server for %ls: %s\r\n", address, utf8);
+        if (n > 0) WriteFile(log, header, (DWORD)strlen(header), &written, NULL);
+    }
+    logw(L"Host server: starting (log: %ls)\n> %ls\n", server_log, line);
+    /* The job: the server dies with the launcher, even when the launcher is killed. */
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) { CloseHandle(job); job = NULL; }
+    }
+    /* The child inherits the log handle only (not the console, not other pipes). */
+    STARTUPINFOEXW startup = {.StartupInfo = {.cb = sizeof(startup), .dwFlags = STARTF_USESTDHANDLES, .hStdOutput = log, .hStdError = log}};
+    SIZE_T list_size = 0; InitializeProcThreadAttributeList(NULL, 1, 0, &list_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST list = list_size ? malloc(list_size) : NULL;
+    if (list && (!InitializeProcThreadAttributeList(list, 1, 0, &list_size) ||
+                 !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &log, sizeof(log), NULL, NULL))) { free(list); list = NULL; }
+    startup.lpAttributeList = list;
+    if (!list) startup.StartupInfo.cb = sizeof(STARTUPINFOW);
+    PROCESS_INFORMATION process;
+    const BOOL started = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED | (list ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                                        NULL, data, &startup.StartupInfo, &process);
+    const DWORD start_error = GetLastError();
+    if (list) { DeleteProcThreadAttributeList(list); free(list); }
+    CloseHandle(log); /* the child has its own: no later child (the game) inherits it */
+    if (!started) {
+        if (job) CloseHandle(job);
+        _snwprintf(message, 1024, L"Host server: python\\python.exe could not start (Windows error %lu).", start_error); message[1023] = 0;
+        fail(message); return 1;
+    }
+    if (job && !AssignProcessToJobObject(job, process.hProcess)) {
+        logw(L"Host server: no job object (error %lu); it is ended with the game, but not if the launcher is killed.\n", GetLastError());
+        CloseHandle(job); job = NULL;
+    }
+    EnterCriticalSection(&server_lock);
+    server_job = job; server_process = process.hProcess;
+    LeaveCriticalSection(&server_lock);
+    ResumeThread(process.hThread); CloseHandle(process.hThread);
+    /* Ready when every listener answers on the address the game and the friend use. */
+    logw(L"Host server: waiting for its ports on %ls (TCP %ls, UDP %u; the checks show in its log)\n", address, ports, host_udp_port);
+    int tcp_ready[COUNT(host_tcp_ports)] = {0}, udp_ready = 0;
+    const ULONGLONG begin = GetTickCount64();
+    for (;;) {
+        if (stop_requested) { server_stop(L"Stop"); return 2; }
+        if (WaitForSingleObject(server_process, 0) == WAIT_OBJECT_0) {
+            DWORD code = 0; GetExitCodeProcess(server_process, &code);
+            server_log_tail();
+            server_stop(L"the game started");
+            _snwprintf(message, 1024, L"Host server: it stopped while starting (exit code %lu). Its log is above and in %ls.", code, server_log);
+            message[1023] = 0; fail(message); return 1;
+        }
+        int ready = 1;
+        for (int i = 0; i < COUNT(host_tcp_ports); ++i) { if (!tcp_ready[i]) tcp_ready[i] = tcp_answers(ip, host_tcp_ports[i]); ready &= tcp_ready[i]; }
+        if (!udp_ready) udp_ready = udp_echoes(ip, host_udp_port);
+        if (ready && udp_ready) break;
+        if (GetTickCount64() - begin > host_start_timeout_ms) {
+            wchar_t missing[256] = L""; size_t m = 0;
+            for (int i = 0; i < COUNT(host_tcp_ports); ++i)
+                if (!tcp_ready[i]) m += (size_t)_snwprintf(missing + m, 256 - m, L"%ls%u/TCP", m ? L", " : L"", host_tcp_ports[i]);
+            if (!udp_ready) m += (size_t)_snwprintf(missing + m, 256 - m, L"%ls%u/UDP", m ? L", " : L"", host_udp_port);
+            server_log_tail();
+            server_stop(L"it did not answer in time");
+            _snwprintf(message, 1024, L"Host server: no answer on %ls port %ls after %lu s, so it was stopped. A firewall or security "
+                                      L"program may block python.exe, or %ls is not this PC's address. Log: %ls",
+                       address, missing, host_start_timeout_ms / 1000, address, server_log);
+            message[1023] = 0; fail(message); return 1;
+        }
+        Sleep(200);
+    }
+    logw(L"Host server: ready on %ls (%.1f s).\n", address, (GetTickCount64() - begin) / 1000.0);
+    logw(L"  Your friend: Online play = Join server, address %ls (outside your home network, both PCs on the same VPN).\n"
+         L"  If Windows asks whether python.exe may accept connections, allow it (Private networks; a VPN can count as Public).\n", address);
+    return 0;
+}
+
 /* ---- the controllers (bb-gpu-capabilities --gamepads: "GUID<tab>name" per line) ---- */
 typedef struct { wchar_t guid[64], name[128]; } Gamepad;
 static Gamepad gamepads[16]; static int gamepad_count;
@@ -370,7 +742,7 @@ static void gamepads_refresh(void) {
 }
 
 /* ---- the run: what run.sh does, then the game. Returns the game's exit code. ---- */
-static DWORD play(const wchar_t *const *extra, int extra_count) {
+static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     wchar_t out[PATHW], user_dir[PATHW], config[PATHW];
     join(out, PATHW, data, L"out"); ensure_directory(out);
     join(user_dir, PATHW, data, L"user"); ensure_directory(user_dir);
@@ -468,7 +840,15 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     game_env(L"BB_GAMEPAD", settings.gamepad[0] ? settings.gamepad : NULL);
     game_env(L"BB_USER_NAME", settings.player[0] ? settings.player : NULL); /* the PS4 user name the game shows */
     game_env(L"BB_LANGUAGE", language_ids[settings.language]); /* a BB_LANGUAGE set before the launcher (a .bat) wins */
-    game_env(L"BB_ONLINE_SERVER", settings.online_server[0] ? settings.online_server : NULL); /* unset: offline */
+    const wchar_t *online = settings.online_mode == ONLINE_HOST ? settings.host_address :
+                            settings.online_mode == ONLINE_JOIN ? settings.join_address : NULL;
+    if (settings.online_mode == ONLINE_JOIN && !settings.join_address[0] && !given_env(L"BB_ONLINE_SERVER")) {
+        fail(L"Join server: enter the host's IP address."); return 2;
+    }
+    if (settings.online_mode == ONLINE_HOST && given_env(L"BB_ONLINE_SERVER") && wcscmp(given_env(L"BB_ONLINE_SERVER"), settings.host_address)) {
+        fail(L"BB_ONLINE_SERVER differs from the selected Host address. Remove the environment override or select that same local IP."); return 2;
+    }
+    game_env(L"BB_ONLINE_SERVER", online);
     /* The fight scene renders black without precise readbacks of linear images (shadPS4 issue
      * #4375, UFC 4, same engine); precise readbacks deadlock against the GPU write twins, so
      * those stay off. The game asks for flip rate 1 (30 Hz); its simulation follows the real
@@ -550,12 +930,23 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     for (int i = 0; i < extra_count; ++i) append_argument(line, 32768, extra[i]);
     char version[64]; read_version(version, sizeof(version));
     logf("SacredFire %s (Windows)\n", version);
+    if (stop_requested) return 130;
+    if (settings.online_mode == ONLINE_HOST) {
+        uint32_t ip; wchar_t message[1024];
+        if (!host_address_check(settings.host_address, &ip, message, COUNT(message))) { fail(message); return 2; }
+        if (server_start(ip)) return 2;
+    }
     const DWORD code = run(line, NULL, 0, 1, INFINITE);
     logf("sacredfire-game.exe exited with code %lu%s\n", code,
          code == 0 ? "" : code == 3 ? " (a fault; the report is above)" : code == 142 ? " (watchdog)" : code == 23 ? " (GPU library assertion)" : "");
     return code;
 }
 
+static DWORD play(const wchar_t *const *extra, int extra_count) {
+    const DWORD code = play_impl(extra, extra_count);
+    server_stop(L"the game session ended");
+    return code;
+}
 
 /* ---- Steam: a non-Steam shortcut (userdata\<user>\config\shortcuts.vdf) ----
  * The same entry the Linux launcher writes (launcher/steam_shortcuts.py): Steam keeps its
@@ -721,7 +1112,7 @@ static void add_to_steam(void) {
 }
 
 /* ---- the window ---- */
-enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_ONLINE, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
+enum { ID_GAME = 100, ID_BROWSE, ID_PLAYER, ID_LANGUAGE, ID_ONLINE, ID_MODE, ID_HOST, ID_HOSTSCAN, ID_COPYHOST, ID_GAMEPAD, ID_RESCAN, ID_CONTROLS, ID_RESOLUTION, ID_DISPLAY, ID_FPS, ID_PRESENT, ID_UPSCALER, ID_SHARPNESS, ID_SHOWFPS, ID_FULLSCREEN, ID_NEO, ID_SKIPMOVIES, ID_CLEAR, ID_VALIDATION, ID_STATS, ID_TRACE,
        ID_PLAY, ID_STOP, ID_STEAM, ID_LOGS, ID_DATA, ID_LOG, ID_LAST };
 static HWND controls[ID_LAST - 100];
 static int running;
@@ -948,6 +1339,37 @@ static void controls_open(void) {
 }
 
 /* The window into the settings; patch switches go to bbport.ini when they changed. */
+static void online_controls(void) {
+    int mode = (int)SendMessageW(control(ID_MODE), CB_GETCURSEL, 0, 0);
+    EnableWindow(control(ID_ONLINE), !running && mode == ONLINE_JOIN);
+    EnableWindow(control(ID_HOST), !running && mode == ONLINE_HOST);
+    EnableWindow(control(ID_HOSTSCAN), !running && mode == ONLINE_HOST);
+    EnableWindow(control(ID_COPYHOST), mode == ONLINE_HOST);
+}
+static void fill_host_addresses(void) {
+    wchar_t current[256]; GetWindowTextW(control(ID_HOST), current, COUNT(current));
+    if (!current[0]) wcsncpy(current, settings.host_address, COUNT(current)-1);
+    local_addresses_refresh();
+    SendMessageW(control(ID_HOST), CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < local_address_count; ++i)
+        SendMessageW(control(ID_HOST), CB_ADDSTRING, 0, (LPARAM)local_addresses[i].label);
+    if (current[0]) SetWindowTextW(control(ID_HOST), current);
+    else if (local_address_count) SendMessageW(control(ID_HOST), CB_SETCURSEL, 0, 0);
+}
+static void copy_host_address(void) {
+    wchar_t text[256], ip[64]; GetWindowTextW(control(ID_HOST), text, COUNT(text));
+    address_token(text, ip, COUNT(ip));
+    if (!ip[0] || !OpenClipboard(main_window)) return;
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (wcslen(ip)+1)*sizeof(wchar_t));
+    if (memory) {
+        void *dest = GlobalLock(memory);
+        if (dest) {
+            memcpy(dest, ip, (wcslen(ip)+1)*sizeof(wchar_t)); GlobalUnlock(memory);
+            EmptyClipboard(); if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+        } else GlobalFree(memory);
+    }
+    CloseClipboard();
+}
 static void read_controls(void) {
     GetWindowTextW(control(ID_GAME), settings.game, PATHW); trimw(settings.game);
     {
@@ -958,14 +1380,11 @@ static void read_controls(void) {
         settings.player[k] = 0;
         SetWindowTextW(control(ID_PLAYER), settings.player);
     }
-    {
-        /* An IP or a host name (a :port is ignored by the game): no spaces. */
-        wchar_t server[256]; GetWindowTextW(control(ID_ONLINE), server, 256);
-        int k = 0;
-        for (int i = 0; server[i] && k < 255; ++i) if (server[i] > 0x20) settings.online_server[k++] = server[i];
-        settings.online_server[k] = 0;
-        SetWindowTextW(control(ID_ONLINE), settings.online_server);
-    }
+    settings.online_mode = clampi((int)SendMessageW(control(ID_MODE), CB_GETCURSEL, 0, 0), 3);
+    GetWindowTextW(control(ID_ONLINE), settings.join_address, COUNT(settings.join_address));
+    trimw(settings.join_address);
+    wchar_t host[256]; GetWindowTextW(control(ID_HOST), host, COUNT(host));
+    address_token(host, settings.host_address, COUNT(settings.host_address));
     int sel = (int)SendMessageW(control(ID_GAMEPAD), CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel <= gamepad_count) wcsncpy(settings.gamepad, gamepads[sel - 1].guid, 127); else settings.gamepad[0] = 0;
     settings.fullscreen = checked(ID_FULLSCREEN); settings.neo = checked(ID_NEO); settings.skip_movies = checked(ID_SKIPMOVIES); settings.clear_cache = checked(ID_CLEAR);
@@ -1028,21 +1447,27 @@ static void set_running(int on) {
     EnableWindow(control(ID_PLAY), !on); EnableWindow(control(ID_STOP), on);
     for (int id = ID_GAME; id <= ID_TRACE; ++id) EnableWindow(control(id), !on);
     EnableWindow(control(ID_STEAM), !on);
+    online_controls();
 }
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
     case WM_COMMAND: {
         const int id = LOWORD(wparam);
-        if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(folder)) SetWindowTextW(control(ID_GAME), folder); }
+        if (id == ID_MODE && HIWORD(wparam) == CBN_SELCHANGE) online_controls();
+        else if (id == ID_HOSTSCAN && !running) fill_host_addresses();
+        else if (id == ID_COPYHOST) copy_host_address();
+        else if (id == ID_BROWSE) { wchar_t folder[PATHW]; if (pick_folder(folder)) SetWindowTextW(control(ID_GAME), folder); }
         else if (id == ID_RESCAN) { gamepads_refresh(); fill_gamepads(); logw(L"Controllers: %d found\n", gamepad_count); }
         else if (id == ID_CONTROLS && !running) controls_open();
         else if (id == ID_PLAY && !running) {
             read_controls();
             open_log_file(NULL);
+            InterlockedExchange(&stop_requested, 0);
             set_running(1);
             HANDLE t = CreateThread(NULL, 0, play_thread, NULL, 0, NULL);
             if (t) CloseHandle(t); else { fail(L"CreateThread failed"); set_running(0); }
         } else if (id == ID_STOP && running) {
+            InterlockedExchange(&stop_requested, 1); server_kill();
             if (game_process) { logw(L"Stop: the game process is ended\n"); TerminateProcess(game_process, 1); }
         } else if (id == ID_STEAM && !running) {
             read_controls(); /* the shortcut uses the saved settings */
@@ -1078,9 +1503,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         open_log_file(L"launcher.log");
         return 0;
     case WM_CLOSE:
-        if (running && game_process) {
+        if (running) {
             if (MessageBoxW(window, L"The game is running. Close it too?", L"SacredFire", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
-            TerminateProcess(game_process, 1);
+            InterlockedExchange(&stop_requested, 1); server_kill();
+            if (game_process) TerminateProcess(game_process, 1);
         }
         read_controls();
         DestroyWindow(window);
@@ -1105,9 +1531,9 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
                     .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1), .lpszClassName = L"UFC3NativeLauncher", .hIcon = LoadIconW(instance, MAKEINTRESOURCEW(1))};
     RegisterClassW(&wc);
     const DWORD style = WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX;
-    /* The client area is 760x828 at 96 DPI: the window is created, measured, and resized by the
+    /* The client area is 760x878 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
-    const int client_w = sx(760), client_h = sx(828);
+    const int client_w = sx(760), client_h = sx(878);
     main_window = CreateWindowExW(0, wc.lpszClassName, L"EA SPORTS UFC 3 - native PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
@@ -1131,9 +1557,15 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     SendMessageW(control(ID_PLAYER), EM_SETLIMITTEXT, 16, 0); y += 34;
     make(L"STATIC", L"Game language (the game's text and menus):", 0, 12, y + 4, 330, 18, 0);
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 344, y, 200, 300, ID_LANGUAGE); y += 34;
-    make(L"STATIC", L"Online server (IP of the host; empty = offline):", 0, 12, y + 4, 330, 18, 0);
-    make(L"EDIT", settings.online_server, WS_BORDER | ES_AUTOHSCROLL, 344, y, 200, 24, ID_ONLINE);
-    SendMessageW(control(ID_ONLINE), EM_SETLIMITTEXT, 255, 0); y += 34;
+    make(L"STATIC", L"Online play", 0, 12, y + 4, 115, 18, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 132, y, 180, 150, ID_MODE);
+    make(L"STATIC", L"Join address", 0, 328, y + 4, 110, 18, 0);
+    make(L"EDIT", settings.join_address, WS_BORDER | ES_AUTOHSCROLL, 440, y, 308, 24, ID_ONLINE); y += 32;
+    make(L"STATIC", L"Host address to share", 0, 12, y + 4, 155, 18, 0);
+    make(L"COMBOBOX", L"", CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL, 170, y, 390, 160, ID_HOST);
+    make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 568, y, 80, 24, ID_HOSTSCAN);
+    make(L"BUTTON", L"Copy IP", BS_PUSHBUTTON, 656, y, 92, 24, ID_COPYHOST); y += 28;
+    make(L"STATIC", L"Outside your LAN: both PCs need a VPN; choose this PC's VPN IP. Host starts with Play and stops with the game.", 0, 12, y, 736, 18, 0); y += 24;
     make(L"STATIC", L"Controller for player 1 (in-game menu: L3+R3 or Insert):", 0, 12, y, 640, 18, 0); y += 20;
     make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, 12, y, 520, 200, ID_GAMEPAD);
     make(L"BUTTON", L"Rescan", BS_PUSHBUTTON, 540, y, 88, 24, ID_RESCAN);
@@ -1167,7 +1599,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     make(L"BUTTON", L"Add to Steam", BS_PUSHBUTTON, 300, y, 130, 30, ID_STEAM);
     make(L"BUTTON", L"Open logs folder", BS_PUSHBUTTON, 480, y, 130, 30, ID_LOGS);
     make(L"BUTTON", L"Open data folder", BS_PUSHBUTTON, 618, y, 130, 30, ID_DATA); y += 40;
-    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 828 - y - 12, ID_LOG);
+    log_edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 12, y, 736, 878 - y - 12, ID_LOG);
     SendMessageW(log_edit, EM_SETLIMITTEXT, 0, 0);
     {
         const struct { int id, count, selected; const wchar_t *const *names; } combos[] = {
@@ -1177,6 +1609,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
             {ID_PRESENT, COUNT(present_names), settings.present_mode, present_names},
             {ID_UPSCALER, COUNT(upscaler_names), settings.upscaler, upscaler_names},
             {ID_SHARPNESS, COUNT(sharpness_names), settings.sharpness, sharpness_names},
+            {ID_MODE, COUNT(online_mode_names), settings.online_mode, online_mode_names},
             {ID_LANGUAGE, COUNT(language_names), settings.language, language_names},
         };
         for (int c = 0; c < COUNT(combos); ++c) {
@@ -1186,7 +1619,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     }
     set_checked(ID_SHOWFPS, settings.show_fps); set_checked(ID_FULLSCREEN, settings.fullscreen); set_checked(ID_NEO, settings.neo); set_checked(ID_SKIPMOVIES, settings.skip_movies); set_checked(ID_CLEAR, settings.clear_cache);
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
-    gamepads_refresh(); fill_gamepads();
+    gamepads_refresh(); fill_gamepads(); fill_host_addresses();
     set_running(0);
     char version[64]; read_version(version, sizeof(version));
     logf("SacredFire %s (Windows). Data: ", version); logw(L"%ls\n", data);
@@ -1209,6 +1642,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     /* A child that cannot load (0xC0000022 ...) reports to the log, not a system dialog. */
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX);
     managed_env_capture();
+    net_load();
     GetModuleFileNameW(NULL, root, PATHW);
     { wchar_t *slash = wcsrchr(root, L'\\'); if (slash) *slash = 0; }
     SetCurrentDirectoryW(root);
@@ -1219,11 +1653,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         if (old) { WaitForSingleObject(old, 30000); CloseHandle(old); }
         first = 3;
     }
-    const wchar_t *game_argument = NULL;
+    const wchar_t *game_argument = NULL, *check_host = NULL;
     static const wchar_t *extra[64]; int extra_count = 0;
     for (int i = first; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--game") && i + 1 < argc) game_argument = argv[++i];
         else if (!wcscmp(argv[i], L"--play")) play_now = 1;
+        else if (!wcscmp(argv[i], L"--check-host") && i + 1 < argc) check_host = argv[++i];
         else if (!wcscmp(argv[i], L"--help") || !wcscmp(argv[i], L"-h")) {
             logw(L"SacredFire.exe [--play] [--game <folder>] [game options]\n"
                  L"  Without --play: the launcher window. --play starts the game with the saved settings.\n"
@@ -1244,6 +1679,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     join(caps_exe, PATHW, root, L"bin\\bb-gpu-capabilities.exe");
     settings_load();
     patches_load();
+    if (check_host) {
+        open_log_file(L"host-check.log");
+        uint32_t ip; wchar_t message[1024];
+        int result = 2;
+        if (host_address_check(check_host, &ip, message, COUNT(message))) result = server_start(ip);
+        else fail(message);
+        server_stop(L"the host check finished");
+        if (log_file) fclose(log_file);
+        return result;
+    }
     if (game_argument) { wcsncpy(settings.game, game_argument, PATHW - 1); settings.game[PATHW - 1] = 0; }
     else if (env_or(L"BB_GAME_DIR", NULL)) { wcsncpy(settings.game, env_or(L"BB_GAME_DIR", L""), PATHW - 1); settings.game[PATHW - 1] = 0; }
     if (play_now) {
