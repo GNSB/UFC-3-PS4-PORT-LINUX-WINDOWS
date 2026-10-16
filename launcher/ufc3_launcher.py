@@ -26,6 +26,8 @@ class Launcher(Gtk.Application):
         super().__init__(application_id='io.ufc3.NativeLauncher', flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.data = data_dir()
         self.settings = load_settings(self.data)
+        if os.environ.get('BB_GAME_DIR'):
+            self.settings['game'] = os.environ['BB_GAME_DIR']
         if not self.settings['game'] and (ROOT / 'orig/CUSA06534/eboot.bin').is_file():
             self.settings['game'] = str(ROOT / 'orig/CUSA06534')
         self.cancel = threading.Event()
