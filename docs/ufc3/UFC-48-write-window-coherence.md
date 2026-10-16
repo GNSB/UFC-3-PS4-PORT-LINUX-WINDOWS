@@ -176,3 +176,59 @@ prueba recompilado con `-DUFC3_WRITE_WINDOWS_TEST` y agregado como antes. Paquet
 Career completa; después Quick Fight con peleadores de fábrica, pelea completa. Mandar el log.
 Esperado: sin el assert; mismas líneas `Write windows: ... CPU took over X GPU bytes` y 0
 `readback-overwrite`. Sangre/sudor ausentes en golpes es UFC-49, no esto.
+
+## Tercera pasada: host fault en el editor de luchador de Career (Windows)
+
+Prueba 2 con `UFC3-WRITE-WINDOWS-TEST.exe` de 9dcb459
+(`~/ufcCOntext/external-logs/UFC48-test2-win-20261016_172729.log`): el assert write-only ya no
+aparece. Crash del host tras cambiar el pelo 4 veces en el editor de luchador:
+`Host fault: read access to 00000000000001E9 at sacredfire-game.exe+0x13c123`, exit 3.
+
+**Simbolizado** (`llvm-symbolizer` sobre `out/windows/bin/sacredfire-game.exe` de 9dcb459; su
+`.text` es idéntica byte a byte a la del exe del zip, que sólo está sin debug info):
+`+0x13c123` = `mov (%rax),%rax` del `operator++` del árbol de `std::set` (libc++ `__tree:175`),
+dentro de `RangeSet::ForEachInRange` (`range_set.h:90`, el `it++`) ← `DownloadMemory`
+(`buffer_cache.cpp:921`, `gpu_modified_ranges.ForEachInRange(address, size, add_download)`) ←
+`MemoryTracker::ForEachDownloadRange` ← `ReadMemory`. No es `ReadbackSnapshot`/`WriteReadback`,
+ni el audit, ni el step.
+
+**Causa: carrera de datos sobre `gpu_modified_ranges`.** El iterador siguió el puntero de un
+nodo liberado/reusado mientras lo recorría: `rax`/`rsi = 0x1e9` es basura leída como hijo
+izquierdo. `rdi = 0x105382f000`, `r12 = 0x1053830000` son el `address`/`address+size` de la
+página que bajaba (4 KiB exactos, dentro de la textura de pelo `0x105382b300`, 1 402 880 B, que
+el juego llena con `memcpy` de ucrtbase: `343 into image 0x105382b300`, y 3362 write faults en
+`0x1053975000`); no cruza de página. `rdx`/`r15` (`0xffffffefac7d1000`) son restas de esa
+basura con los límites del rango, no un offset mal calculado.
+
+El diseño suponía que el hilo GPU era el único que escribía `gpu_modified_ranges` (por eso lo
+leía sin lock; los hilos con fault leían bajo `gpu_ranges_mutex` compartido). 558ae55 agregó
+un escritor en otro hilo: `CloseWindows` corre en `Liverpool::SubmitGfx`/`SubmitAsc` (el hilo
+del juego que hace el submit) y `NoteSteppedWrite(from_window)` hace `Subtract` ahí. El log lo
+muestra a la vez: `Write windows: 300.8/s opened ...; CPU took over 14176 GPU bytes` y
+`423.1 readbacks/s`. Un `Subtract` que rebalancea/libera nodos mientras el hilo GPU itera →
+nodo liberado. (`NoteDiscardRange`, desde los discard locks del juego, ya era otro escritor
+fuera del hilo GPU; mucho más raro.)
+
+**Arreglo (bb4e938, `buffer_cache.cpp/.h`).** Toda lectura de `gpu_modified_ranges` en el hilo
+GPU toma `gpu_ranges_mutex`: compartido en `ReadMemory` (skip-no-overlap y los caminos twins),
+`ProcessLateWrites` (conflictos de steps), `ProcessDemotions`, `ProcessPendingAssets` y
+`SynchronizeMemory` (nuevo `GpuRangesIntersect`); en `DownloadMemory` lectura + `Subtract` en
+una sola sección exclusiva. El lock sigue siendo hoja: los rangos se copian antes de tomar
+`keep_gpu_mutex`/`twins_mutex` (que `SynchronizeMemory` y el camino twins toman *antes* que
+`gpu_ranges_mutex`), y `DiagnoseWindowWrite` corre ya liberado. Con lock hoja no hay deadlock
+posible con `windows_mutex` (que `CloseWindows` tiene tomado al restar).
+
+**Test.** No agregué uno: la carrera necesita el `BufferCache` entero con dos hilos; un stress
+de `RangeSet` + `shared_mutex` sólo probaría la librería. `write-window-merge-test` pasa.
+
+**Compilación.** Linux `ufc3-build` exit 0 (`ufc3-v0.1.4-29-gbb4e938`). Windows
+`scripts/build-windows.sh --runtime` (bajo el lock de `ufc3-build`) exit 0,
+`scripts/package-windows.sh` limpio; launcher de prueba recompilado con
+`-DUFC3_WRITE_WINDOWS_TEST`, sin debug info, agregado con `README-UFC48.txt`. Paquete:
+`~/UFC3Native-windows-ufc48-bb4e938.zip` (+ `.sha256`).
+
+**Una prueba.** `UFC3-WRITE-WINDOWS-TEST.exe`: Career → editor de luchador → cambiar pelo y
+otras partes varias veces (más de 4) → primera pelea de Career completa; después Quick Fight con
+peleadores de fábrica, pelea completa. Mandar el log entero. Esperado: sin `Host fault`, sin el
+assert; `Write windows: ... CPU took over X GPU bytes` y 0 `readback-overwrite`; FPS de pelea
+como en la prueba anterior (el lock compartido es por readback, no por draw).
