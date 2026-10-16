@@ -127,3 +127,52 @@ Qué buscar en el log:
   apagadas). En el log de UFC-2 con windows la pelea iba a 109–192 FPS.
 - Un fault en `+0x1262a2a` o un freeze con este build refuta el arreglo como suficiente: mandar
   el log (el audit imprime el `Write window audit fault` con r12–r15 y la cabeza del allocator).
+
+## Segunda pasada: assert «write-only» al entrar a Career
+
+Prueba en Windows (RTX 3060 laptop) con `UFC3-WRITE-WINDOWS-TEST.exe` de dfc7705
+(`~/ufcCOntext/external-logs/UFC48-test-win-20261016_170301.log`): Quick Fight bien (sin
+`readback-overwrite`/`upload-skip`, 0 conflictos), pero al cargar Career:
+`page_manager.cpp:1179 Protect: Assertion Failed! Attempted to protect region as write-only` →
+exit 23. Es un assert del port.
+
+**Causa (regresión de 558ae55, no del single-step).** Con readbacks precisos (`BB_READBACKS=2`,
+lo que pone el launcher) una página con bit GPU en el `RegionManager` tiene un read watcher, y
+una con bit CPU no tiene write watcher; si tiene los dos, `PageState::Perms()` daba `Write`
+solo. El invariante que lo evitaba: el bit GPU de una página implica bytes suyos en
+`gpu_modified_ranges`, y toda readback que los baja desmarca la página (`DownloadMemory` →
+`UnmarkRegionAsGpuModified`). 558ae55 lo rompió: el cierre de una window saca de
+`gpu_modified_ranges` los bytes GPU que la CPU pisó (`NoteSteppedWrite(from_window)`) pero la
+página queda con su bit GPU. Si el cierre se llevó todos los bytes GPU de la página:
+
+1. la siguiente escritura de la CPU ahí hace fault; `InvalidateRegion` ve el bit GPU →
+   `DecideWriteStep` cuenta 0 bytes GPU (ni step ni window) → `ReadMemory`;
+2. `DownloadMemory` no encuentra nada que copiar y volvía **antes** de `UnmarkRegionAsGpuModified`;
+3. el fault marca la página CPU-modified: read watcher sin write watcher → `Protect(Write)` →
+   assert en Windows. En Linux (`userfaultfd`) el mismo estado deja la página sin acceso, y un
+   read fault ahí volvía al mismo `DownloadMemory` vacío sin fin.
+
+Con `BB_WRITE_STEP=1` solo (sin windows) no pasa: el step no saca bytes de
+`gpu_modified_ranges`. Las otras restas (discard, twins, block moves, readback sin descarga)
+desmarcan la página o mueven el bloque. No se reprodujo en Linux (no se corre el juego acá);
+la cadena sale del código y del punto exacto del log (carga de Career, windows abiertas).
+
+**Arreglo (9dcb459).**
+- `DownloadMemory`: el retorno temprano sin bytes que bajar también desmarca el rango
+  (`buffer_cache.cpp`). Corrige el estado: la página deja de ser GPU-modified y vuelve a
+  `ReadWrite` por el camino normal.
+- `PageState::Perms()` pasa por `PageWatch::FromWatchers` (`page_watch_perms.h`): sin lectura
+  tampoco hay escritura. Es la semántica correcta (una página cuyos datos están sólo en VRAM no
+  debe aceptar escrituras sin fault) y evita que otro estado inconsistente vuelva a pedir
+  write-only. Test: `page-watch-perms-test` (`tests/test_page_watch_perms.cpp`).
+
+**Compilación.** Linux `ufc3-build` exit 0 (`ufc3-v0.1.4-27-g9dcb459`). Windows
+`scripts/build-windows.sh --runtime` exit 0, `scripts/package-windows.sh` limpio; launcher de
+prueba recompilado con `-DUFC3_WRITE_WINDOWS_TEST` y agregado como antes. Paquete:
+`~/UFC3Native-windows-ufc48-9dcb459.zip` (+ `.sha256`). `page-watch-perms-test` y
+`write-window-merge-test` pasan.
+
+**Una prueba.** `UFC3-WRITE-WINDOWS-TEST.exe`: entrar a Career y jugar la primera pelea de
+Career completa; después Quick Fight con peleadores de fábrica, pelea completa. Mandar el log.
+Esperado: sin el assert; mismas líneas `Write windows: ... CPU took over X GPU bytes` y 0
+`readback-overwrite`. Sangre/sudor ausentes en golpes es UFC-49, no esto.
