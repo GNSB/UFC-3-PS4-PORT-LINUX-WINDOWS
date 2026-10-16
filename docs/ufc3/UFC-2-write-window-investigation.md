@@ -1,9 +1,97 @@
 # UFC-2: corrupción del heap con write windows
 
-Estado: allocator corrupto confirmado; causa exacta del write todavía no demostrada.
-Se entrega diagnóstico optativo, no un fix de coherencia ni una habilitación por defecto.
-No se ejecutó el juego. La segunda pasada (abajo) corrige qué builds tenían windows activas
-y reemplaza la prueba manual de la primera.
+Estado: allocator corrupto confirmado; productor del write **no identificado**. Corrupción y
+rendimiento **no resueltos**. Se entrega diagnóstico optativo (`BB_WRITE_WINDOW_DIAG`), no un
+fix de coherencia ni una habilitación por defecto. No se ejecutó el juego.
+
+Hallazgo válido principal: con `BB_WRITE_STEP=0` el gate de `DecideWriteStep` impide abrir
+windows; con los defaults actuales todo write fault sobre una página GPU paga un readback, y
+recuperar ese rendimiento queda pendiente de resolver la coherencia de las windows.
+
+Orden de lectura: la tercera pasada corrige a las dos anteriores donde se contradicen. La
+sección «Una prueba manual» de la primera pasada y la «Prueba A/B» de la segunda quedan
+**reemplazadas** por la única prueba de la tercera.
+
+## Tercera pasada (16 oct): grados de certeza, flags seguros, validación Windows
+
+### Grados de certeza
+
+| Afirmación | Grado | Base |
+| --- | --- | --- |
+| La free list del allocator de clases tiene una cabeza inválida (`-1`, `0x64`) en `+0x1262a2a` | Hecho | Disassembly + registros de 3 logs y transcripción Reddit |
+| Con `BB_WRITE_STEP=0` no se abre ninguna window aunque `BB_WRITE_WINDOW=1` | Hecho de código | `DecideWriteStep` retorna antes de `RequestWindow` |
+| Con window abierta, writes CPU sobre bytes GPU-owned se pierden al cerrar y un readback posterior los pisa | Hecho de código, no reproducido | Lectura de `CloseWindows`/`ProcessLateWrites`/`DownloadMemory` |
+| Los faults en `+0x1262a2a` aparecen en corridas con windows abriéndose | Correlación; en el log del propio fault sólo se vio actividad en Reddit (transcripción) | ver tabla de reportes |
+| Los faults de HeuZ salen de corridas con windows activas | Inferido del default 0.1.2 (STEP on); actividad vista sólo en otro log de la misma sesión | ver tabla de reportes |
+| Las windows producen el write que corrompe la free list | **Hipótesis** | ningún evento liga una window con el nodo dañado |
+| El crash del amigo (0.1.3) tiene la misma causa | **Sin atribuir** | otro sitio, otro recorrido, windows probablemente inertes |
+
+Qué haría falta para pasar de hipótesis a causa (y aun así con límites):
+- un evento `readback-overwrite` (o `upload-skip`) cuyo rango cubra exactamente el slot dañado
+  (`[r14+0x18]`, o el campo «next» del nodo que fue cabeza antes), con el payload igual al
+  valor malo (`-1`/`0x64`) y ocurrido **antes** del fault y **después** de la última escritura
+  legítima conocida del allocator en ese slot;
+- que la window del evento sea de la misma asignación: la página puede haberse liberado y
+  reutilizado/remapeado entre el snapshot y el fault (comparar edad/ID de window con la vida
+  del bloque);
+- descartar productores que el diagnóstico no ve: writes GPU directos in-place, readbacks de
+  imágenes/labels, fences tardías (`Late label guarded`);
+- tener presente que el diagnóstico cambia el timing: si no crashea con él, no prueba nada.
+
+La entrada «windows confirmadas como productor si `head page window id=...`» de la segunda pasada
+era incorrecta: que la página del head figure en el historial de windows es sólo correlación
+(la página pudo tener una window por cualquier otro bloque que comparte esos 4 KiB).
+
+### `BB_WRITE_LOG`: no recomendarlo, en ningún modo
+
+Código actual (`gpu/shim/bbport_write_log.cpp`, `bbgpu_dump_guest_writes`): con
+`Mode() != 0`, es decir `BB_WRITE_LOG=1` **y también `=2`**, el dump del fault hace
+`memcpy` directo desde `rax - 0x30 .. rax + 0x60` sin validar la dirección. En `+0x1262a2a`
+`rax` no es un puntero del allocator (en Reddit `rax=1`): el handler puede fallar dentro del
+handler. Además el dump busca el patrón de otro bug (`0x0000005300000000`, valor `0x53`).
+Por eso **se retira** la sugerencia de la segunda pasada de un ticket con `BB_WRITE_LOG=2`
+para fences: queda como idea sólo después de que el dump valide la dirección (no se hace en
+esta pasada). `BB_WRITE_WINDOW_DIAG` en cambio lee `[r14+0x18]` con
+`runtime_memory_read_backing`, que consulta la tabla de VMAs y devuelve ceros si no está
+mapeado; no sigue punteros inválidos (sí toma el read lock de esa tabla dentro del handler).
+
+### Validación Windows de este código (sin paquete)
+
+Sólo **comprobación de sintaxis** con el toolchain Windows real; no es un build, no enlaza, no
+hace LTO, no genera `.exe` ni paquete. Script: `/tmp/ufc2-winsyntax/run.sh`.
+
+- Toma con `ninja -t commands sacredfire-game` los comandos de compilación del build Windows ya
+  configurado en el checkout principal (`/home/myzk/Projects/ufc3-native/out/windows/build`,
+  llvm-mingw `20261006-ucrt`, `x86_64-w64-mingw32-clang++ -std=gnu++23 -O2 -flto=thin`, mismos
+  `-D`/`-I` de CMake) para `page_manager.cpp`, `buffer_cache/buffer_cache.cpp` y
+  `shim/bbport_write_log.cpp`.
+- Reescribe con `sed` las rutas `ufc3-native/gpu/` → worktree UFC-2, quita `-MD -MT -MF` y
+  cambia `-o *.obj` por `-fsyntax-only` (no escribe nada en el build principal).
+- Corre bajo el lock global de `ufc3-build` (`$XDG_RUNTIME_DIR/ufc3-build.lock`, `flock`).
+- Resultado: las 3 unidades **ok**; único warning `argument unused during compilation: '-c'`.
+- Límites: los headers generados (`out/windows/build/include`) y el sysroot son los del checkout
+  principal (rama `ufc3-online`); no se verificó el enlace, ni el resto de las unidades, ni el
+  comportamiento en Windows. No se modificaron defaults ni scripts.
+
+### La única prueba sugerida (cuando exista paquete Windows con este diagnóstico)
+
+Hoy no hay paquete Windows que lo contenga: no pedir nada al usuario hasta que exista.
+Cuando exista, **una sola** corrida:
+
+```
+BB_WRITE_STEP=1 BB_WRITE_WINDOW=1 BB_WRITE_WINDOW_DIAG=1
+```
+
+en el entorno antes de abrir el launcher (el launcher respeta las variables gestionadas que ya
+existen); Fight Now con peleadores de fábrica, pelea completa, post-pelea, volver y cargar la
+segunda; hasta 20 min o el primer crash. Sin `BB_WRITE_LOG`, sin `BB_READBACKS=2`.
+
+Es un **diagnóstico combinado** STEP+windows (las windows no pueden abrirse sin STEP): no atribuye
+FPS ni separa la contribución de STEP de la de windows, y STEP arrastra la regresión conocida de
+pieles negras en peleadores creados (por eso fábrica). Lo que se busca en el log: banner sin
+`inactive`, líneas `Write windows: N/s`, y si crashea, `Write window audit fault` más los
+eventos `readback-overwrite`/`upload-skip` para cruzar contra los criterios de arriba. Un crash
+sin esos eventos no descarta windows; una corrida sin crash no valida nada.
 
 ## Segunda pasada (16 oct): qué builds abrían windows de verdad
 
@@ -19,33 +107,44 @@ y reemplaza la prueba manual de la primera.
   después del gate). Este commit hace que el banner diga `inactive: BB_WRITE_STEP=0 opens none`.
 - El código de windows/step/readback (`page_manager.cpp`, `buffer_cache.cpp`, `liverpool.cpp`)
   es igual en `ufc3-v0.1.2`, `ufc3-v0.1.3`, `ufc3-v0.1.4` y `ufc3-online` (8de5098), salvo el
-  diagnóstico de este ticket y el CMask de PS4 Pro. Lo que cambia entre tags es el entorno:
+  diagnóstico de este ticket y el CMask de PS4 Pro. Lo que cambia entre tags es el entorno.
 
-| Build | Windows launcher | Linux run.sh | ¿Windows abren? |
+La tabla describe los **defaults de los scripts** (`git grep` por tag). El usuario puede
+sobreescribirlos: el launcher Windows respeta `BB_WRITE_WINDOW`/`BB_WRITE_STEP` si ya están en el
+entorno, y `run.sh` usa `${VAR:-default}`. Que una corrida concreta abriera windows sólo lo
+prueba su log: la línea de stats `Write windows: N/s` (se imprime sólo si `window_opens` > 0).
+
+| Build | Default launcher Windows | Default run.sh | Con esos defaults, ¿windows abren? |
 | --- | --- | --- | --- |
-| 0.1.2 | WINDOW=1, STEP sin fijar (default on) | — | **Sí** |
+| 0.1.2 | WINDOW=1, STEP sin fijar (código: on) | WINDOW=1 | Sí |
 | 0.1.3 | WINDOW=1, STEP=0 | WINDOW=1, STEP=0 | No |
 | 0.1.4 / ufc3-online | WINDOW=0, STEP=0 | WINDOW=1, STEP=0 | No |
+| esta rama (desde 4b644a8) | WINDOW=0, STEP=0 | WINDOW=0, STEP=0 | No |
 
-- Consecuencia: el hotfix 0.1.4 (`BB_WRITE_WINDOW=0` en Windows) no cambió el comportamiento
-  respecto de 0.1.3: en ambos ya estaban inactivas. Hoy, ni Linux ni Windows abren windows ni
-  hacen single-step por defecto: todo write fault sobre una página GPU paga un readback.
+- Consecuencia **para corridas con defaults**: el hotfix 0.1.4 (`BB_WRITE_WINDOW=0` en Windows)
+  no cambió el comportamiento respecto de 0.1.3. Con los defaults actuales ni Linux ni Windows
+  abren windows ni hacen single-step: todo write fault sobre una página GPU paga un readback.
+  Una corrida con `BB_WRITE_STEP=1` en el entorno sí las abre en cualquiera de esos builds.
 
 ### Hechos (reportes) cruzados con la tabla
 
-| Reporte | Build | ¿Windows activas? | Fault |
-| --- | --- | --- | --- |
-| HeuZ (RTX 4090), 3 faults | 0.1.2 | Sí (545–671/s en log) | +0x1262a2a, head `-1` |
-| Reddit (RTX 3060) | 0.1.2 | Sí (470–806/s) | +0x1262a2a, head `0x64`, carga 2.ª pelea |
-| Tester AMD (RX 9070) | parches sobre 0.1.2 | **Desconocido** (no se sabe si STEP ya era 0) | free-list next `0x64` |
-| Amigo (RX 7800 XT), 2 logs | 0.1.3 | **No** (STEP=0) | +0x4c4b3 / +0x4c90d en SimThread, otro sitio |
+| Reporte | Build | Actividad de windows | Fuente | Fault |
+| --- | --- | --- | --- | --- |
+| HeuZ (RTX 4090), 3 faults | 0.1.2 | Vista 545–671/s sólo en 142452 (crash `0xC0000409`, no el fault); en 134426/153603/154238 no quedó anotada | logs de `/tmp/ufc3z` (ya no están; no se re-verificó) | +0x1262a2a, head `-1` |
+| Reddit (RTX 3060) | 0.1.2 | Vista: 470–806/s | transcripción del Jefe, no el log original | +0x1262a2a, head `0x64`, carga 2.ª pelea |
+| Tester AMD (RX 9070) | parches sobre 0.1.2 | Desconocida | README de parches, sin log | free-list next `0x64` |
+| Amigo (RX 7800 XT), 2 logs | 0.1.3 | **Inferida** inactiva | extracto: «STEP apagado»; no transcribe líneas `Write windows:` | +0x4c4b3 / +0x4c90d en SimThread |
 
-Los cuatro faults en +0x1262a2a vienen de builds con windows realmente activas. El caso 0.1.3
-**no puede atribuirse a windows**: es otro sitio (vecino del allocator) con windows inertes.
-Ese log trae además cientos de `Late label guarded: EOS fence ... dropped`, lo que mantiene viva
-la hipótesis alternativa de escrituras tardías de fences/labels/readbacks sobre memoria ya
-liberada (mismo patrón que el bug de 2026-10-01 en `docs/parallel_gpu.md`: GPU idle señalado
-con fences diferidas pendientes, free-list pop leyendo basura).
+Lectura con esos límites: los dos reportes 0.1.2 con log tienen actividad de windows vista
+(Reddit en el log del fault; HeuZ en otro log de la misma sesión) y fault en +0x1262a2a. Esto es correlación, no causa (ver grados de certeza arriba). El caso del amigo
+**no se atribuye**: es otro sitio (vecino del allocator), otro recorrido (Career + Create Fighter,
+crash al firmar contrato) y la inactividad de windows sale del extracto y del default de 0.1.3,
+no de un log completo revisado aquí. Ese log trae además cientos de `Late label guarded: EOS
+fence ... dropped`, lo que mantiene viva la hipótesis alternativa de escrituras tardías de
+fences/labels/readbacks sobre memoria ya liberada (mismo patrón que el bug de 2026-10-01 en
+`docs/parallel_gpu.md`). El comentario del launcher 0.1.4 («con `BB_WRITE_WINDOW=0` el usuario
+RX 7800 XT dejó de crashear») es anecdótico: con STEP=0 ese cambio no altera el camino de
+windows, así que no confirma ni descarta nada.
 
 ### Defecto de coherencia de las windows (hecho por lectura de código, no reproducido en juego)
 
@@ -91,32 +190,22 @@ No existe una corrección mínima demostrable sin juego:
 Recuperar rendimiento sin windows: el camino coherente es el single-step (`BB_WRITE_STEP=1`,
 windows 0), apagado por las pieles negras de peleadores creados; no se midió en esta pasada.
 
-### Prueba A/B para el usuario (una sola, Windows)
+### Prueba A/B (retirada en la tercera pasada)
 
-Mismo build, mismo recorrido: Fight Now con peleadores de fábrica (no created/career, para
-no mezclar el problema de pieles de STEP), pelea completa, post-pelea, volver y cargar la
-segunda pelea; hasta 20 min o el primer crash. Variables en el entorno **antes** de abrir el
-launcher (el launcher respeta las que ya existen):
+Proponía dos corridas (A defaults, B `BB_WRITE_STEP=1 BB_WRITE_WINDOW=1 BB_WRITE_WINDOW_DIAG=1`)
+y leía «head page window id» como confirmación del productor. Retirada: eso es correlación, B
+mezcla STEP y windows (no sirve para atribuir FPS) y no hay paquete Windows con el diagnóstico.
+Ver «La única prueba sugerida» arriba.
 
-- **A (baseline, defaults)**: sin variables.
-- **B (diagnóstico)**: `BB_WRITE_STEP=1 BB_WRITE_WINDOW=1 BB_WRITE_WINDOW_DIAG=1`
+### Siguiente ticket implementable (condicional)
 
-En B el log debe mostrar `Write window audit: on`, el banner sin `inactive` y líneas
-`Write windows: N/s`. Entregar ambos logs completos. Lectura:
-- B crashea en +0x1262a2a y `Write window audit fault: head page window id=...` encuentra la
-  página del head → windows confirmadas como productor; pasar al ticket de rediseño.
-- B crashea pero `no retained window for allocator head page` → no confirma windows; mirar
-  `upload-skip`/`readback-overwrite` del log.
-- A crashea → hay un bug independiente de windows (camino fences/labels, caso 0.1.3).
-- Ninguno crashea → no valida nada; comparar FPS de pelea entre A y B como dato de costo.
-
-### Siguiente ticket implementable
-
-Si B confirma windows: «Windows coherentes: reconciliar R antes de dar acceso». Al abrir una
-window, descargar sólo los rangos GPU de esa página (readback queue, esperando su write tick)
-y restarlos de `gpu_modified_ranges`, de modo que la página quede CPU-owned y el diff de cierre
-sea completo; medir FPS contra A. Si A también crashea: ticket aparte sobre fences/labels
-tardíos (`Late label guarded`) con `BB_WRITE_LOG=2`.
+Sólo si una corrida diagnóstica cumple los criterios de causa de la tercera pasada: «Windows
+coherentes: reconciliar R antes de dar acceso». Al abrir una window, descargar sólo los rangos
+GPU de esa página (readback queue, esperando su write tick) y restarlos de
+`gpu_modified_ranges`, de modo que la página quede CPU-owned y el diff de cierre sea completo;
+medir FPS por separado. Si el fault aparece sin windows activas (actividad comprobada en log):
+ticket aparte sobre fences/labels tardíos (`Late label guarded`); su herramienta no puede ser
+`BB_WRITE_LOG` mientras el dump lea `rax` sin validar.
 
 ## Resolución del fault
 
@@ -272,7 +361,10 @@ memoria in-place ni readbacks de imágenes/labels. El historial y los reportes s
 acotados; su ausencia no descarta el bug y el coste del diagnóstico puede cambiar
 el timing de la carrera.
 
-## Una prueba manual
+## Una prueba manual (retirada en la tercera pasada)
+
+Se conserva como registro; **no usar**: mezcla `BB_READBACKS=2` con el diagnóstico y fue
+reemplazada por la única prueba de la tercera pasada.
 
 Ejecutar una sola sesión con el build que contiene este parche:
 
@@ -285,8 +377,8 @@ ejecuta el juego antes de abrirlo. Mantener el resto de opciones de la reproducc
 original y comprobar en el log el banner `Write window audit: on` y actividad
 `Write windows:`. Jugar una pelea completa, ver la repetición/postpelea y comenzar
 la segunda; continuar hasta 20 minutos o el primer crash. Entregar el log completo,
-incluyendo `Write window audit` y el reporte del fault. No activar BB_WRITE_LOG:
-su dump antiguo supone otro allocator y lee directamente un bloque desde rax.
+incluyendo `Write window audit` y el reporte del fault. No activar BB_WRITE_LOG
+(ni `=1` ni `=2`): su dump supone otro bug y lee directamente un bloque desde rax.
 
 Objetivo: correlacionar el bucket/nodo con los eventos de overwrite/skip y determinar
 si se observa reapertura durante cierre. Una sesión sin crash no valida un fix.
@@ -313,7 +405,8 @@ Cambio de código: sólo el texto del banner de `BB_WRITE_WINDOW` en `page_manag
 (`getenv`/`printf` portables); no cambia gates, defaults ni decisiones.
 
 - Linux: `ufc3-build` → exit 0, `out/sacredfire` generado (PGO off, LTO ON).
-- Windows: **no verificado**. No hay wrapper Windows con lock; `scripts/build-windows.sh
+- Windows (segunda pasada): **no verificado**; resuelto en la tercera pasada sólo a nivel de
+  sintaxis (ver «Validación Windows»). No hay wrapper Windows con lock; `scripts/build-windows.sh
   --runtime` reconstruiría toda la biblioteca en el worktree. Se preparó una comprobación de
   una sola unidad sin reconstruir (`ninja -t commands sacredfire-game` del build Windows del
   checkout principal, filtrando `page_manager.cpp`, con rutas `gpu/` apuntando al worktree y
