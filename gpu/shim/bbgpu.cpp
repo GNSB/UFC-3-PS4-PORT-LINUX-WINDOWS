@@ -289,8 +289,11 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         while (window->PollEvents()) {
             SDL_Delay(2);
         }
-        LOG_INFO(Frontend, "Window closed by user");
+        // ufc3 (UFC-47): printed whatever the log level, so that "exited with code 0" in a
+        // log reads as a closed window (the X, Alt+F4, the menu's Quit), not a crash.
         std::fflush(stdout);
+        std::fprintf(stderr, "Window closed (window close or quit request): exiting with code 0\n");
+        std::fflush(stderr);
         std::_Exit(0);
     });
     g_window_thread.detach();

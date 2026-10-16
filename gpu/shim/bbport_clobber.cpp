@@ -74,6 +74,9 @@ LastWrite& LastWriteSlot(std::uint64_t address) {
     return last_writes[(address >> 2) % last_writes.size()];
 }
 
+// The last label GuardLabel dropped (ReportLongWait).
+std::atomic<std::uint64_t> dropped_address{0}, dropped_value{0}, dropped_ns{0};
+
 // BB_COPY_PROTECT: the read-only copies.
 struct Protected {
     std::atomic<std::uint64_t> base{0}, bytes{0}, seq{0};
@@ -268,6 +271,9 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
         NoteLastWrite(address, value, NowNs());
         return false;
     }
+    dropped_address.store(address, std::memory_order_relaxed);
+    dropped_value.store(value, std::memory_order_relaxed);
+    dropped_ns.store(NowNs(), std::memory_order_relaxed);
     static std::atomic<std::uint64_t> guarded{0};
     const std::uint64_t n = guarded.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n <= 16 || n % 100 == 0) {
@@ -305,6 +311,34 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
         AskForReport();
     }
     return true;
+}
+
+void ReportLongWait(std::uint64_t address, std::uint32_t function, std::uint32_t ref,
+                    std::uint32_t mask, unsigned seconds) {
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true)) {
+        return;
+    }
+    static const char* const functions[] = {"always", "<", "<=", "==", "!=", ">=", ">", "?"};
+    const std::uint32_t now = *reinterpret_cast<const volatile std::uint32_t*>(address);
+    std::fprintf(stderr,
+                 "GPU wait not met for %u s: WAIT_REG_MEM on %#llx, which holds %#x, waits for "
+                 "(value & %#x) %s %#x; decoding submission %llu; the game is frozen while this "
+                 "lasts (UFC-47)\n",
+                 seconds, (unsigned long long)address, now, mask, functions[function & 7], ref,
+                 (unsigned long long)decoding.load(std::memory_order_relaxed));
+    const std::uint64_t last = dropped_address.load(std::memory_order_relaxed);
+    if (last != 0) {
+        std::fprintf(stderr,
+                     "  last label the late-label guard dropped: value %#llx to %#llx, %.2f s ago%s\n",
+                     (unsigned long long)dropped_value.load(std::memory_order_relaxed),
+                     (unsigned long long)last,
+                     (NowNs() - dropped_ns.load(std::memory_order_relaxed)) / 1e9,
+                     last == address ? " (the address this wait reads)" : "");
+    } else {
+        std::fprintf(stderr, "  the late-label guard has dropped no label\n");
+    }
+    std::fflush(stderr);
 }
 
 void DumpWritesInto(std::uint64_t address, std::uint64_t bytes) {

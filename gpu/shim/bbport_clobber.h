@@ -63,6 +63,13 @@ void DumpWritesInto(std::uint64_t address, std::uint64_t bytes);
 bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source,
                 std::uint64_t packet_seq, const std::uint32_t* at_submit);
 
+/// ufc3 (UFC-47): the GPU thread's WAIT_REG_MEM on guest memory `address` has not been met for
+/// `seconds` (it waits for (value & mask) <function> ref; function: the PM4 code). Once per
+/// run, on stderr, with the value there now and the last label the guard dropped: a label the
+/// game waits on that never arrives freezes the game here.
+void ReportLongWait(std::uint64_t address, std::uint32_t function, std::uint32_t ref,
+                    std::uint32_t mask, unsigned seconds);
+
 /// BB_COPY_PROTECT=1.
 bool ProtectCopies();
 /// Storage for a SubmittedCopy: whole pages, page-aligned, when ProtectCopies(); malloc otherwise.

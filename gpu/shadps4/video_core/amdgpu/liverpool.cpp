@@ -1843,7 +1843,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                // ufc3 (UFC-47): a wait on memory not met for 5 s is reported once.
+                const auto wait_start = std::chrono::steady_clock::now();
+                bool wait_reported = false;
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    if (!wait_reported &&
+                        wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
+                        std::chrono::steady_clock::now() - wait_start > std::chrono::seconds(5)) {
+                        wait_reported = true;
+                        BbClobber::ReportLongWait(
+                            wait_reg_mem->Address<u64>(), u32(wait_reg_mem->function.Value()),
+                            wait_reg_mem->ref, wait_reg_mem->mask, 5);
+                    }
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                         continue;
