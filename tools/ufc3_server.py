@@ -20,6 +20,7 @@ from ufc3_auth import CLIENT_ID, SERVER_ID, IdentityStore, user_authenticated, p
 
 IDENTITIES = IdentityStore()
 ONLINE = {}  # blaze id -> account, one entry per connected game
+CONNECTIONS = {}  # blaze id -> current writer
 
 
 def stamp():
@@ -276,12 +277,16 @@ async def blaze(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 if frame.msg_type == PING:
                     writer.write(Frame(frame.component, frame.command, frame.msg_num, PING_REPLY).encode())
                     continue
+                decoded = True
                 try:
-                    request, _ = decode_struct(frame.payload)
+                    request, consumed = decode_struct(frame.payload)
+                    if consumed != len(frame.payload):
+                        raise ValueError('trailing or truncated TDF data')
                     logged = Struct({tag: (kind, '<redacted>' if tag in ('AUTH', 'KEY') else value)
                                      for tag, (kind, value) in request.items()})
                     text = dump(logged)
                 except Exception as error:  # keep serving; the raw bytes are saved
+                    decoded = False
                     request, _ = decode_partial(frame.payload)
                     raw = os.path.join(RAW_DIR, f'{frame.component:x}-{frame.command:x}-{frame.msg_num}.bin')
                     os.makedirs(RAW_DIR, exist_ok=True)
@@ -289,7 +294,7 @@ async def blaze(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         f.write(frame.payload)
                     text = (f'(partly decoded: {error}; raw payload in {raw})\n' + dump(request))
                 handler = HANDLERS.get((frame.component, frame.command))
-                known = handler or (frame.component, frame.command) in ((AUTHENTICATION, 0xa), (UTIL, 8))
+                known = handler or frame.component == ufc3_games.GAME_MANAGER or (frame.component, frame.command) in ((AUTHENTICATION, 0xa), (UTIL, 8))
                 print(f'{stamp()} blaze: {frame}{"" if known else "  (no handler: empty reply)"}', flush=True)
                 if text:
                     print('  ' + text.replace('\n', '\n  '), flush=True)
@@ -309,6 +314,11 @@ async def blaze(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                         print(f'{stamp()} blaze: login rejected ({error})', flush=True)
                         return
                     session = (account, key)
+                    previous = CONNECTIONS.get(account.id)
+                    if previous is not None and previous is not writer:
+                        send_game_notes(ufc3_games.leave(account.id, game_log, writer=previous))
+                        previous.close()
+                    CONNECTIONS[account.id] = writer
                     ONLINE[account.id] = account
                     online_id = account.id
                     print(f'{stamp()} blaze: authenticated account {account.id} ({account.name}), '
@@ -325,14 +335,29 @@ async def blaze(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 elif (frame.component, frame.command) == (UTIL, 0x7):
                     payload = preauth_reply(request, writer.get_extra_info('sockname')[0])
                 elif frame.component == ufc3_games.GAME_MANAGER and session:
-                    result = ufc3_games.handle(frame.command, request, session[0], writer, peer[0], game_log)
-                    payload, notes = result if result else (b'', [])
+                    try:
+                        if CONNECTIONS.get(session[0].id) is not writer:
+                            raise ufc3_games.GameError('request from an obsolete connection')
+                        if not decoded:
+                            raise ufc3_games.GameError('GameManager requires a fully decoded request')
+                        result = ufc3_games.handle(frame.command, request, session[0], writer, peer[0], game_log)
+                        if result is None:
+                            # Explicitly accepted telemetry. No metrics consumer yet.
+                            if frame.command != 0xAB:
+                                raise ufc3_games.GameError('unsupported GameManager command',
+                                                          ufc3_games.ERR_COMMAND_NOT_FOUND)
+                            result = (b'', [])
+                        payload, notes = result
+                    except (ValueError, TypeError, IndexError, KeyError) as error:
+                        code = getattr(error, 'code', ufc3_games.ERR_SYSTEM)
+                        writer.write(Frame(frame.component, frame.command, frame.msg_num, ERROR_REPLY,
+                                           metadata=encode_struct(Struct(ERRC=(INT, code)))).encode())
+                        game_log(f'rejected command {frame.command:#x} for {session[0].name}: {error}')
+                        continue
                 else:
                     payload = handler(request) if handler else b''
                 writer.write(Frame(frame.component, frame.command, frame.msg_num, REPLY, payload).encode())
-                for target, note in notes:
-                    target.write(note.encode())
-                    print(f'{stamp()} game: -> {note}', flush=True)
+                send_game_notes(notes)
                 notes = []
                 if (frame.component, frame.command) == (AUTHENTICATION, 0xa):
                     writer.write(Frame(USER_SESSIONS, 8, 0, NOTIFICATION,
@@ -344,12 +369,31 @@ async def blaze(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         pass
     finally:
         if online_id is not None:
-            ONLINE.pop(online_id, None)
-            for target, note in ufc3_games.leave(online_id, game_log):
-                target.write(note.encode())
+            if CONNECTIONS.get(online_id) is writer:
+                CONNECTIONS.pop(online_id, None)
+                ONLINE.pop(online_id, None)
+            send_game_notes(ufc3_games.leave(online_id, game_log, writer=writer))
         await close_writer(writer)
     print(f'{stamp()} blaze: client {peer[0]}:{peer[1]} left', flush=True)
     writer.close()
+
+
+def send_game_notes(notes):
+    for target, note in notes:
+        if not ufc3_games.live(target):
+            continue
+        try:
+            target.write(note.encode())
+        except ConnectionError:
+            target.close()
+        else:
+            print(f'{stamp()} game: -> {note}', flush=True)
+
+
+async def game_maintenance():
+    while True:
+        await asyncio.sleep(1)
+        send_game_notes(ufc3_games.expire(game_log))
 
 
 def game_log(text):
@@ -492,7 +536,7 @@ async def main():
     loop = asyncio.get_running_loop()
     await loop.create_datagram_endpoint(QosProbe, local_addr=(args.bind, QOS_PORT))
     print(f'{stamp()} qos ping site on udp {args.bind}:{QOS_PORT}', flush=True)
-    await asyncio.gather(*(s.serve_forever() for s in servers))
+    await asyncio.gather(game_maintenance(), *(s.serve_forever() for s in servers))
 
 
 if __name__ == '__main__':
