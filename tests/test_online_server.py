@@ -709,6 +709,34 @@ class RoomLifecycleTests(unittest.TestCase):
         game = next(iter(self.gm.GAMES.values()))
         self.assertIn(dict(game.attributes)['WeightClass'], values)
 
+    def test_replay_resets_postgame_to_pregame_with_new_reporting_id(self):
+        game = self.room()
+        self.connect(game)
+        for state in (self.gm.PRE_GAME, self.gm.IN_GAME, self.gm.POST_GAME):
+            if state == self.gm.IN_GAME:
+                self.call(self.gm.FINALIZE_GAME_CREATION, GID=(INT, game.gid))
+            self.call(self.gm.ADVANCE_GAME_STATE, GID=(INT, game.gid), GSTA=(INT, state))
+        players, attributes = list(game.players), list(game.attributes)
+        with self.assertRaises(self.gm.GameError):  # only the host replays
+            self.call(self.gm.REPLAY_GAME, 1, GID=(INT, game.gid))
+        self.assertEqual(game.state, self.gm.POST_GAME)
+        body, notes = self.call(self.gm.REPLAY_GAME, GID=(INT, game.gid))
+        self.assertEqual(body, b'')
+        self.assertEqual(game.state, self.gm.PRE_GAME)
+        self.assertEqual(game.players, players)  # same participants, slots and attributes
+        self.assertEqual(game.attributes, attributes)
+        self.assertNotEqual(game.gsid, game.gid)
+        states = self.bodies(notes, self.gm.NOTIFY_GAME_STATE_CHANGE)
+        self.assertEqual([s['GSTA'] for s in states], [(INT, self.gm.PRE_GAME)] * 2)
+        reporting = self.bodies(notes, self.gm.NOTIFY_GAME_REPORTING_ID_CHANGE)
+        self.assertEqual([r['GRID'] for r in reporting], [(INT, game.gsid)] * 2)
+        self.assertEqual(len(notes), 4)  # both notifications reach both players
+        # A duplicate replay is a no-op; the reused room starts the next fight without re-finalizing.
+        self.assertEqual(self.call(self.gm.REPLAY_GAME, GID=(INT, game.gid)), (b'', []))
+        self.call(self.gm.ADVANCE_GAME_STATE, GID=(INT, game.gid), GSTA=(INT, self.gm.IN_GAME))
+        with self.assertRaises(self.gm.GameError):  # not from a fight in progress
+            self.call(self.gm.REPLAY_GAME, GID=(INT, game.gid))
+
     def test_host_settings_and_attributes_keep_ufc_notification_shapes(self):
         from blaze_tdf import MAP
         game = self.room()
