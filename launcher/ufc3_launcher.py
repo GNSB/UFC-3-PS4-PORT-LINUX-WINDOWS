@@ -23,17 +23,19 @@ RESOLUTIONS = [('1280x720', '1280x720'), ('1920x1080', '1920x1080'),
                ('2560x1440', '2560x1440 (2K, experimental)'),
                ('3840x2160', '3840x2160 (4K, experimental)')]
 CSS = """
-window, scrolledwindow, viewport { background-color: #0B0B0D; color: #F2F2F2; }
+window, window * { font-family: "Inter", "Cantarell", "Noto Sans", "DejaVu Sans", sans-serif; }
+window, scrolledwindow, viewport { background-color: #0B0B0D; background-image: none; color: #F2F2F2; opacity: 1; }
 label { color: #F2F2F2; }
 .ufc-panel { background-color: #16161A; border: 1px solid #2A2A30; border-radius: 10px; padding: 14px; }
-.ufc-section { color: #C9A24A; font-weight: bold; }
-.ufc-banner-title { color: #C9A24A; font-size: 22px; font-weight: bold; }
+.ufc-section { color: #C9A24A; font-weight: 700; }
+.ufc-banner-title { color: #C9A24A; font-size: 22px; font-weight: 700; }
 .ufc-secondary { color: #A0A0A8; }
 .ufc-error { color: #D20A0A; }
-entry, text, combobox > button { background-color: #16161A; color: #F2F2F2; border: 1px solid #2A2A30; }
-entry:focus, text:focus { border-color: #C9A24A; }
-button { background-color: #16161A; color: #F2F2F2; border: 1px solid #2A2A30; padding: 6px 12px; }
-button:hover { border-color: #C9A24A; color: #E8C872; }
+entry, combobox button, dropdown > button { background-color: #0F0F12; background-image: none; color: #F2F2F2; border: 1px solid #2A2A30; }
+entry text, combobox popover contents, combobox cellview, dropdown popover contents, dropdown listview { background-color: #0F0F12; color: #F2F2F2; }
+entry:focus-within, combobox button:focus, dropdown > button:focus { border-color: #C9A24A; }
+button { background-color: #1E1E24; background-image: none; color: #F2F2F2; border: 1px solid #2A2A30; padding: 6px 12px; }
+button:hover { border-color: #E8C872; }
 checkbutton check { background-color: #16161A; border: 1px solid #2A2A30; }
 checkbutton check:checked { background-color: #C9A24A; border-color: #C9A24A; }
 .ufc-red { background-color: #D20A0A; border-color: #D20A0A; color: #F2F2F2; }
@@ -60,8 +62,8 @@ class Launcher(Gtk.Application):
         provider = Gtk.CssProvider()
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_display(self.window.get_display(), provider,
-                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        self.window.set_default_size(720, 700)
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+        self.window.set_default_size(900, 900)
         self.window.connect('close-request', self.close_request)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for name in ('top', 'bottom', 'start', 'end'):
@@ -76,6 +78,7 @@ class Launcher(Gtk.Application):
         self.game = self.entry_row(game_panel, 'Game folder', self.settings['game'])
         browse = Gtk.Button(label='Choose game folder…')
         browse.connect('clicked', self.choose_folder)
+        browse.set_halign(Gtk.Align.END)
         game_panel.append(browse)
         self.inputs.append(browse)
         self.player = self.entry_row(game_panel, 'Player name', self.settings['player'])
