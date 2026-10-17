@@ -19,6 +19,14 @@ namespace VideoCore {
 struct UffdImpl;
 struct SignalImpl;
 
+/// ufc3: Filled by the synchronous GPU command serving a CPU read fault. The handler owns this
+/// object until ReadMemory returns; ordinary reads and write faults pass no diagnostics.
+struct ReadFaultDownload {
+    u64 write_tick = 0, current_tick = 0, bytes = 0, downloads = 0;
+    u64 page_gpu_bytes = 0, gpu_distance = ~u64{0};
+    double wait_ms = 0;
+};
+
 class PageManager {
     // PAGE_SIZE and PAGE_BITS conflicts with machine/param.h definitions on freebsd!
     // Use the same page size as the tracker.
@@ -36,6 +44,7 @@ public:
     /// bbport: the guest code behind write faults on tracked pages over the last window (frame
     /// stats): which game functions write GPU memory, to replace tracking by explicit hooks.
     static void ReportFaultSites();
+    static ReadFaultDownload* CurrentReadFaultDownload();
     /// ufc3: a write fault on this thread became a readback (reason: 0 host copy, 1 page over
     /// the step limit, 2 near GPU bytes, 3 other); reported with the fault sites.
     static void NoteReadbackSite(u32 reason, VAddr address, u64 gpu_bytes);
@@ -48,11 +57,16 @@ public:
     /// false when this thread is not stepping one (the trap is not ours).
     static bool OnStepTrap(void* context);
 
-    /// ufc3 (BB_WRITE_WINDOW=1): GPU-written pages the CPU writes beside the GPU bytes stay open
+    /// bbport (ufc3, BB_WRITE_WINDOW): modes 1/2 keep GPU-written pages open for writes beside GPU bytes
     /// for the CPU until the game's next submission, then their changed words go to VRAM.
     static bool WriteWindowsEnabled();
+    /// bbport (ufc3, BB_WRITE_WINDOW): mode 2 requires a known exact write range to open a window.
+    static bool WriteWindowsExactOnly();
     /// Whether the write fault being handled on this thread comes from the game's code.
     static bool FaultFromGuest();
+    /// bbport (ufc3): the bytes the guest instruction of this thread's write fault writes, when it was decoded
+    /// as one plain store (false otherwise).
+    static bool GuestStoreRange(VAddr* begin, VAddr* end);
     /// DecideWriteStep: open a window for this fault instead of single-stepping it.
     static void RequestWindow();
     /// Closes every open window (the submitting thread, before the GPU side sees the submission).
