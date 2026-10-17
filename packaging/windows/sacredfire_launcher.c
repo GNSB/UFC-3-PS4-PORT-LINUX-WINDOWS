@@ -1790,8 +1790,61 @@ static void set_running(int on) {
     online_controls();
     video_controls();
 }
+/* Small screens (a 768p laptop, 125 % and up on 1080p): when the window does not fit the work
+ * area of its monitor, gui() clamps it there and the layout scrolls vertically. scroll_page is
+ * the visible client height then, 0 when the window fits (and nothing here runs). */
+static int scroll_y, scroll_page, wheel_rest;
+static void scroll_to(HWND window, int y) {
+    if (!scroll_page) return;
+    const int max = sx(CLIENT_H) - scroll_page;
+    if (y > max) y = max;
+    if (y < 0) y = 0;
+    if (y == scroll_y) return;
+    ScrollWindowEx(window, 0, scroll_y - y, NULL, NULL, NULL, NULL, SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+    scroll_y = y;
+    SCROLLINFO info = {.cbSize = sizeof info, .fMask = SIF_POS, .nPos = y};
+    SetScrollInfo(window, SB_VERT, &info, TRUE);
+    /* The panels and the banner are painted at the scroll offset; everything is repainted so no
+     * partly scrolled child or panel edge is left behind. */
+    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+/* Tab (or a click) into a control outside the visible part scrolls it into view. */
+static void scroll_to_focus(void) {
+    static HWND last;
+    HWND focus = GetFocus();
+    if (!scroll_page || focus == last) return;
+    last = focus;
+    while (focus && GetParent(focus) && GetParent(focus) != main_window) focus = GetParent(focus); /* the edit inside a combo box */
+    if (!focus || GetParent(focus) != main_window) return;
+    RECT r; GetWindowRect(focus, &r); MapWindowPoints(NULL, main_window, (POINT *)&r, 2);
+    if (r.top < 0) scroll_to(main_window, scroll_y + r.top - sx(8));
+    else if (r.bottom > scroll_page) scroll_to(main_window, scroll_y + r.bottom - scroll_page + sx(8));
+}
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
+    case WM_VSCROLL: {
+        SCROLLINFO info = {.cbSize = sizeof info, .fMask = SIF_TRACKPOS};
+        GetScrollInfo(window, SB_VERT, &info);
+        switch (LOWORD(wparam)) {
+        case SB_LINEUP: scroll_to(window, scroll_y - sx(30)); break;
+        case SB_LINEDOWN: scroll_to(window, scroll_y + sx(30)); break;
+        case SB_PAGEUP: scroll_to(window, scroll_y - scroll_page); break;
+        case SB_PAGEDOWN: scroll_to(window, scroll_y + scroll_page); break;
+        case SB_TOP: scroll_to(window, 0); break;
+        case SB_BOTTOM: scroll_to(window, sx(CLIENT_H)); break;
+        case SB_THUMBTRACK: case SB_THUMBPOSITION: scroll_to(window, info.nTrackPos); break;
+        }
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        if (!scroll_page) break;
+        /* 90 px a notch; a touchpad's smaller deltas add up. */
+        wheel_rest += GET_WHEEL_DELTA_WPARAM(wparam) * sx(90);
+        const int pixels = wheel_rest / WHEEL_DELTA;
+        wheel_rest -= pixels * WHEEL_DELTA;
+        scroll_to(window, scroll_y - pixels);
+        return 0;
+    }
     case WM_COMMAND: {
         const int id = LOWORD(wparam), code = HIWORD(wparam);
         /* Owner-drawn check boxes toggle themselves (a quick second click arrives as a double click). */
@@ -1868,7 +1921,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         RECT client; GetClientRect(window, &client);
         HDC dc = CreateCompatibleDC(screen); HBITMAP buffer = CreateCompatibleBitmap(screen, client.right, client.bottom);
         HGDIOBJ old = SelectObject(dc, buffer);
-        paint_window(dc, client);
+        /* The layout is drawn scroll_y higher (0 when the window fits: the plain client area). */
+        SetViewportOrgEx(dc, 0, -scroll_y, NULL);
+        paint_window(dc, (RECT){0, 0, client.right, client.bottom + scroll_y});
+        SetViewportOrgEx(dc, 0, 0, NULL);
         BitBlt(screen, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
         SelectObject(dc, old); DeleteObject(buffer); DeleteDC(dc);
         EndPaint(window, &ps);
@@ -1948,6 +2004,38 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
         logw(L"Window: %ld,%ld %ldx%ld, client %ldx%ld, frame +%d+%d, DPI %u, caption %d\n", window_rect.left, window_rect.top,
              window_rect.right - window_rect.left, window_rect.bottom - window_rect.top, client_rect.right, client_rect.bottom, dw, dh,
              GetDpiForWindow(main_window), GetSystemMetrics(SM_CYCAPTION));
+        /* Kept inside the work area of its monitor. Taller than it (884 px at 96 DPI is more than a
+         * 768p screen, 1105 px at 125 %): clamped to its height, with a vertical scroll bar and the
+         * window widened by the bar, so the layout itself stays the same. */
+        MONITORINFO monitor = {.cbSize = sizeof monitor};
+        if (GetMonitorInfoW(MonitorFromWindow(main_window, MONITOR_DEFAULTTONEAREST), &monitor)) {
+            const RECT work = monitor.rcWork;
+            const int work_w = work.right - work.left, work_h = work.bottom - work.top;
+            int w = window_rect.right - window_rect.left, h = window_rect.bottom - window_rect.top, flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE;
+            if (h > work_h) {
+                const int frame_h = h - client_rect.bottom;
+                SetWindowLongPtrW(main_window, GWL_STYLE, GetWindowLongPtrW(main_window, GWL_STYLE) | WS_VSCROLL);
+                SCROLLINFO info = {.cbSize = sizeof info, .fMask = SIF_RANGE | SIF_PAGE | SIF_POS, .nMin = 0, .nMax = client_h - 1,
+                                   .nPage = (UINT)(work_h - frame_h), .nPos = 0};
+                SetScrollInfo(main_window, SB_VERT, &info, FALSE);
+                SetWindowPos(main_window, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                GetWindowRect(main_window, &window_rect); GetClientRect(main_window, &client_rect);
+                const int frame_w = (window_rect.right - window_rect.left) - client_rect.right;
+                w = client_w + (frame_w >= 0 && frame_w < 300 ? frame_w : dw + GetSystemMetrics(SM_CXVSCROLL));
+                h = work_h; flags &= ~SWP_NOSIZE;
+            }
+            const int x = window_rect.left + w > work.right ? work.right - w : window_rect.left;
+            const int y = window_rect.top + h > work.bottom ? work.bottom - h : window_rect.top;
+            SetWindowPos(main_window, NULL, x < work.left || w > work_w ? work.left : x, y < work.top ? work.top : y, w, h, flags);
+            if (!(flags & SWP_NOSIZE)) {
+                GetClientRect(main_window, &client_rect);
+                scroll_page = client_rect.bottom;
+                SCROLLINFO info = {.cbSize = sizeof info, .fMask = SIF_PAGE, .nPage = (UINT)scroll_page};
+                SetScrollInfo(main_window, SB_VERT, &info, TRUE);
+                logw(L"Window: taller than the work area (%dx%d): %dx%d, client %ldx%d of %d, scrolls\n", work_w, work_h, w, h,
+                     client_rect.right, scroll_page, client_h);
+            }
+        }
     }
     /* GAME (left column; content x 28..430) */
     int y = 134 + 34;
@@ -2040,6 +2128,7 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
         if (ctl_capture_key(&msg)) continue;
         if (ctl_window && IsDialogMessageW(ctl_window, &msg)) continue;
         if (!IsDialogMessageW(main_window, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        scroll_to_focus();
     }
     return 0;
 }
