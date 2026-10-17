@@ -24,6 +24,7 @@ CREATE_GAME, DESTROY_GAME, ADVANCE_GAME_STATE, SET_GAME_SETTINGS = 0x1, 0x2, 0x3
 SET_GAME_ATTRIBUTES, JOIN_GAME, REMOVE_PLAYER = 0x7, 0x9, 0xB
 START_MATCHMAKING, CANCEL_MATCHMAKING, FINALIZE_GAME_CREATION = 0xD, 0xE, 0xF
 START_MATCHMAKING_SCENARIO, CANCEL_MATCHMAKING_SCENARIO, LEAVE_GAME_BY_GROUP = 0x10, 0x11, 0x16
+REPLAY_GAME = 0x13  # replayGame in UFC's command-name switch (table 0x1f2ae38, id 19)
 MESH_ENDPOINTS_CONNECTED, MESH_ENDPOINTS_DISCONNECTED, MESH_ENDPOINTS_CONNECTION_LOST = 0x41, 0x42, 0x43
 # (UFC's own command table: the eboot's GameManager command-name switch.)
 
@@ -34,6 +35,7 @@ NOTIFY_MATCHMAKING_FAILED, NOTIFY_MATCHMAKING_CONNECTION_VALIDATED = 0xA, 0xB
 NOTIFY_GAME_SETUP, NOTIFY_PLAYER_JOINING, NOTIFY_PLAYER_JOIN_COMPLETED = 0x14, 0x15, 0x1E
 NOTIFY_PLAYER_REMOVED, NOTIFY_PLATFORM_HOST_INITIALIZED = 0x28, 0x47
 NOTIFY_GAME_ATTRIB_CHANGE, NOTIFY_GAME_STATE_CHANGE, NOTIFY_GAME_SETTINGS_CHANGE = 0x50, 0x64, 0x6E
+NOTIFY_GAME_REPORTING_ID_CHANGE = 0x71  # UFC's notification-name switch, id 113
 NOTIFY_GAME_PLAYER_STATE_CHANGE = 0x74
 NOTIFY_GAME_REMOVED = 0x10
 
@@ -61,6 +63,8 @@ RESERVED, QUEUED, ACTIVE_CONNECTING, ACTIVE_MIGRATING, ACTIVE_CONNECTED = 0, 1, 
 
 _game_ids = itertools.count(1)
 _scenario_ids = itertools.count(1)
+# Reporting ids handed out on replay: outside the game-id space the first fight uses.
+_reporting_ids = itertools.count(1 << 32)
 
 class GameError(ValueError):
     def __init__(self, message, code=ERR_SYSTEM):
@@ -181,6 +185,7 @@ class Game:
         self.version = field(common, 'GVER', STRING, '')
         self.state = INITIALIZING
         self.finalized = False
+        self.gsid = self.gid  # gameReportingId; replayGame rotates it for the next fight
         host.state = ACTIVE_CONNECTED
         host.joined_at = int(time.time() * 1_000_000)
         self.host = host
@@ -204,7 +209,7 @@ class Game:
             CAP=(LIST, (INT, pcap)), CRIT=(MAP, (STRING, STRING, [])),
             DSTR=(MAP, (STRING, STRING, [])), ESNM=(STRING, ''),
             GID=(INT, self.gid), GMRG=(INT, 0), GNAM=(STRING, self.host.account.name),
-            GPVH=(INT, 0x1A2B3C4D), GSET=(INT, self.gset), GSID=(INT, self.gid),
+            GPVH=(INT, 0x1A2B3C4D), GSET=(INT, self.gset), GSID=(INT, self.gsid),
             GSTA=(INT, self.state), GTYP=(STRING, self.gtype), GURL=(STRING, ''),
             HNET=(LIST, (UNION, [self.host.pnet])), MCAP=(INT, self.capacity),
             NQOS=(STRUCT, Struct(DBPS=(INT, 0), NATT=(INT, 0), UBPS=(INT, 0))),
@@ -381,7 +386,8 @@ def handle(command, request, account, writer, peer_ip, log):
 
     supported = {ADVANCE_GAME_STATE, FINALIZE_GAME_CREATION, SET_GAME_ATTRIBUTES, SET_GAME_SETTINGS,
                  MESH_ENDPOINTS_CONNECTED, MESH_ENDPOINTS_DISCONNECTED, MESH_ENDPOINTS_CONNECTION_LOST,
-                 LEAVE_GAME_BY_GROUP, DESTROY_GAME, REMOVE_PLAYER, UPDATE_PRIMARY_EXTERNAL_SESSION}
+                 LEAVE_GAME_BY_GROUP, DESTROY_GAME, REMOVE_PLAYER, UPDATE_PRIMARY_EXTERNAL_SESSION,
+                 REPLAY_GAME}
     if command not in supported:
         return None
     # updatePrimaryExternalSessionForUser uses CGID, not GID, in UFC.
@@ -391,7 +397,7 @@ def handle(command, request, account, writer, peer_ip, log):
     if game.find(account.id).writer is not writer:
         raise GameError('request from an obsolete connection')
     if command in {ADVANCE_GAME_STATE, FINALIZE_GAME_CREATION, SET_GAME_ATTRIBUTES,
-                   SET_GAME_SETTINGS, DESTROY_GAME} and game.host.account.id != account.id:
+                   SET_GAME_SETTINGS, DESTROY_GAME, REPLAY_GAME} and game.host.account.id != account.id:
         raise GameError('host authority required')
 
     if command == ADVANCE_GAME_STATE:
@@ -410,6 +416,27 @@ def handle(command, request, account, writer, peer_ip, log):
         change = encode_struct(Struct(GID=(INT, game.gid), GSTA=(INT, game.state)))
         for p in game.players:
             notes.append((p.writer, Frame(GAME_MANAGER, NOTIFY_GAME_STATE_CHANGE, 0, NOTIFICATION, change)))
+        return b'', notes
+
+    if command == REPLAY_GAME:
+        # replayGame: request is only GID and the reply is empty (PocketRelay's ReplayGame route).
+        # The host takes a finished room back to PRE_GAME for the rematch; players, slots and
+        # attributes stay, and the reporting id rotates so the next fight reports under its own id
+        # (Blaze's NotifyGameReportingIdChange, in UFC's notification switch as id 0x71).
+        if game.state == PRE_GAME:
+            return b'', []  # duplicate/retry of a replay that already applied
+        if game.state != POST_GAME:
+            raise GameError('replay requires a finished game')
+        game.state = PRE_GAME
+        game.gsid = next(_reporting_ids)
+        log(f'game {game.gid} replay requested by {account.name}: state -> {PRE_GAME:#x}, '
+            f'reporting id {game.gsid}')
+        change = encode_struct(Struct(GID=(INT, game.gid), GSTA=(INT, game.state)))
+        reporting = encode_struct(Struct(GID=(INT, game.gid), GRID=(INT, game.gsid)))
+        for p in game.players:
+            notes.append((p.writer, Frame(GAME_MANAGER, NOTIFY_GAME_STATE_CHANGE, 0, NOTIFICATION, change)))
+            notes.append((p.writer, Frame(GAME_MANAGER, NOTIFY_GAME_REPORTING_ID_CHANGE, 0,
+                                          NOTIFICATION, reporting)))
         return b'', notes
 
     if command == FINALIZE_GAME_CREATION:
