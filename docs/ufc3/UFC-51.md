@@ -136,6 +136,10 @@ normal).
 
 **Arreglo de los FPS:** ninguno todavía. No hay una causa única demostrada.
 
+**Compilación:** Linux `ufc3-build` exit 0 (`ufc3-v0.1.4-66-g5082e57`). No hice el build de
+Windows ni el zip: el entorno del agente no tuvo permiso para tomar el lock de compilación
+compartido. La prueba de abajo no los necesita.
+
 **La prueba (una sola, con el zip de 2e700eb que ya está en esa PC, sin compilar nada):**
 
 ```
@@ -154,8 +158,8 @@ Cómo leer el resultado:
   en esta prueba; eso confirma UFC-49 en Windows.
 - **Sigue en ~47 FPS:** PREUPLOAD no es la causa. La diferencia con test5 está en la ejecución:
   los readbacks near-GPU de `+0x431c4f` (mirar `Readback sites`), el log/CSV en `Z:` o la caché.
-  Siguiente paso: el zip de esta rama con la carpeta de log local, o el mismo test con la carpeta
-  de log en `C:`.
+  Siguiente paso: el mismo test con la carpeta de log en `C:` (o un zip de esta rama, con el CSV
+  vaciado una vez por segundo).
 - En los dos casos, anotar en `Readback sites` de la pelea si sigue `+0x431c4f [near GPU]`. Si
   aparece con ~48/s y la pelea sigue lenta, el siguiente sospechoso es ese sitio.
 
