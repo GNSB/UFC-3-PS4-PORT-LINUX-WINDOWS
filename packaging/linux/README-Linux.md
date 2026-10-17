@@ -38,3 +38,17 @@ example: `BB_LOG_DIR="$HOME/UFC3-logs" ./ufc3.sh`.
 
 Problems: attach the newest log from `~/.local/share/UFC3Native/logs`.
 GPL-2.0-or-later; not affiliated with Electronic Arts, Sony or the UFC.
+
+## Graphical launcher and private online play
+
+Open `UFC3.sh` (mark it executable if your file manager asks), or run `./ufc3.sh` without arguments. The GUI requires Python 3, PyGObject and GTK 4 (`python-gobject gtk4` on Arch; `python3-gi gir1.2-gtk-4.0` on Debian/Ubuntu). The command line remains available: `./ufc3.sh --play /path/to/CUSA06534`, or the existing positional game-folder command.
+
+Choose the game folder once. The launcher remembers the folder, player name, language, video settings and online mode in `~/.local/share/UFC3Native/launcher.json` (or `BB_DATA_DIR`). Existing `ufc3.conf` and `game-folder` settings are imported on first use. Environment variables retain priority; remove `BB_ONLINE_SERVER` when using the GUI's Offline mode. The in-game menu still provides controller and advanced graphics settings.
+
+- **Offline**: play locally.
+- **Join server**: enter the address shared by the host.
+- **Host server**: select this PC's LAN IP, or VPN IP for a friend outside the LAN, and click **Play**. Share that IP. The launcher starts and checks the server, then starts the game. The server stops with the session, Stop, or closing the launcher.
+
+For Internet play both PCs need a VPN such as Tailscale, installed separately. Both games must use the host's VPN address, including the host's own game; do not use `127.0.0.1`. Use the same game build on both PCs, choose compatible Quick Fight settings and search at nearly the same time. VPN Internet play still needs validation outside a LAN. No public matchmaking service or automatic router configuration is included.
+
+Server and game logs are under `~/.local/share/UFC3Native/logs/`. An occupied port is reported instead of taking over another server. Allow the game and Python server through the firewall on your LAN/VPN interface.

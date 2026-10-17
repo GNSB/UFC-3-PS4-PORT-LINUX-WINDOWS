@@ -7,6 +7,9 @@
 # counter and the overlay menu's options: bbport.ini in the same folder. Logs: logs/ there.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
+# No arguments opens the GUI; --play and the existing positional folder keep CLI use.
+if [[ $# == 0 ]]; then exec python3 "$here/launcher/ufc3_launcher.py"; fi
+if [[ ${1:-} == --play ]]; then shift; fi
 data=${BB_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/UFC3Native}
 mkdir -p "$data"
 command -v python3 >/dev/null || { echo "UFC 3: python3 is needed (install it with your package manager)" >&2; exit 1; }
