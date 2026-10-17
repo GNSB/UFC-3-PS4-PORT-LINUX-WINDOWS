@@ -19,14 +19,22 @@ the native Bloodborne port. All code is GPL-2.0-or-later.
 
 ## Status
 
-**Current release: [0.1.4](../../releases)** (a hotfix on top of 0.1.3).
+**Current release: [0.1.5](../../releases)** ([notes](docs/ufc3/releases/0.1.5.md)). What's new:
+write windows on Windows again (a Career fight on an RTX 3060 laptop goes from about 30 to
+60–70 FPS), blood and sweat on hits are back, a fixed GPU hang in the Career fighter editor, a
+possible fix for AMD freezes, new Windows and Linux launchers, private online play with working
+rematches, and experimental 2K/4K.
 
 **Playable.** Menus, loading, fights (including the menu's attract-mode fight), sound, controller
 and saves. What works today:
 
-- **Career**: it saves, and it no longer crashes on entry.
+- **Career**: it saves, it no longer crashes on entry, and changing hair/head repeatedly in the
+  fighter editor no longer hangs the GPU.
+- **Blood and sweat** on hits, with the created fighter's skin still correct.
 - **PS4 Pro mode** (the game renders 1080p instead of 900p), with a checkbox in the Windows
   launcher (`BB_NEO=1` on Linux).
+- **2K / 4K (experimental)**: 2560x1440 and 3840x2160 internal resolution in the launcher (validated
+  on Linux only; see *Launcher settings*).
 - **90 FPS** in the launcher's FPS limit, next to 60 / 120 / 144 / 240 / Unlimited.
 - **Hair and beards** with proper coverage instead of square cards.
 - **Created-fighter skin** that survives repeated editing (no black or garbled patches).
@@ -34,11 +42,15 @@ and saves. What works today:
 - **Career portraits and the post-fight screen**: your fighter shows up on the post-fight menu,
   in the career pause menu and on the Saved Careers cards.
 - **Game language** selector in the Windows launcher.
+- **Launchers** on both systems (Windows: UFC3.exe; Linux: a GTK launcher), with Offline / Join
+  server / Host server.
+- **Online between friends** (private hosting, rematch included); see *Online*.
 
 | Scene | Linux · Ryzen 5 5600 + RTX 4070 | Windows · Omen 16 (RTX 3060 Laptop, 6 GB) |
 |---|---|---|
 | Menus / loading screens | 240 FPS (the game's own cap) | 240 FPS (*Immediate* present mode) |
-| Fight, no FPS limit | **137–196 FPS** (write windows on) | 66–83 FPS (measured without write windows, the Windows default) |
+| Career fight, no FPS limit | — | **60–70 FPS** (0.1.5, write windows on, log folder on a local disk) |
+| Fight, no FPS limit | **137–196 FPS** (write windows on) | 66–83 FPS (0.1.4, a Quick Fight without write windows) |
 | Fight, 120 FPS limit | steady 120 FPS | — |
 
 - Tested by the maintainer on NVIDIA (Linux and Windows); AMD fixes come from @luscamovi's
@@ -48,13 +60,16 @@ and saves. What works today:
 
 **Known issues**
 
+- Fights on Windows still run below Linux.
+- Keep the log folder on a local disk for the best FPS.
+- "Clear the shader cache at start" recompiles every shader on each start: leave it off.
+- AMD freezes and closes may be fixed in 0.1.5 (late EOS labels were being dropped): **AMD users,
+  please report** whether it helps.
 - Moving the window to another monitor *during startup* can crash the NVIDIA driver
   (`Swapchain::Destroy`).
 - Some long hairstyles leave a slightly lighter line at the base of the neck.
 - Portuguese (Portugal) (`BB_LANGUAGE=7`) is listed but the game has no text for it: pick
   Portuguese (Brazil) (`17`).
-- No online play yet: the online code is experimental (see *Online (experimental)*); login
-  reaches a local server, a fight between two PCs does not.
 
 ## Requirements
 
@@ -83,12 +98,15 @@ and saves. What works today:
 
 ### Launcher settings (God of War III port style)
 
+Since 0.1.5 the launcher has a UFC 3 dark/gold look, with your dump's own artwork in the banner.
+
 | Setting | Values | Notes |
 |---|---|---|
 | Player name | text (16 ASCII characters) | The name the game shows. |
 | Game language | English (US), French, German, Italian, Spanish (Spain / Latin America), Portuguese (Brazil / Portugal), Polish, Russian, Japanese, Chinese (Traditional) | `BB_LANGUAGE`. Portugal has no text in the game: use Brazil. |
 | Controls... | per PS4 input | Keyboard key (click, then press it) and gamepad button. Saved to `bbport.ini`. |
-| Game resolution | 720p / 1080p | What the game renders. |
+| Online play | **Offline** / Join server / Host server | Join: the host's address in *Join address*. Host: pick this PC's address in *Host address* (Rescan, **Copy IP** to share it); the server starts with Play and stops with the game. See *Online*. |
+| Game resolution | 720p / 1080p / 2560x1440 (2K, experimental) / 3840x2160 (4K, experimental) | What the game renders. 2K/4K use PS4 Pro mode with a 4K output; in game choose VIDEO → RESOLUTION → *Favor Resolution* (the option only appears in these modes). Validated on Linux only. |
 | Display resolution | Same / 1080p / 1440p (2K) / 4K | Window size; the game's frame is scaled to it (use FSR 1.0 + sharpening). Fullscreen uses the monitor's size. |
 | PS4 Pro mode | on / **off** | `BB_NEO`: the game renders 1080p instead of 900p, at a lower frame rate. |
 | FPS limit | 60 / 90 / 120 / 144 / 240 / **Unlimited** | Saved by value; the game never goes above 240. |
@@ -97,6 +115,8 @@ and saves. What works today:
 | Sharpness (RCAS) | Off / Low / Medium / High | |
 | FPS counter | on / off | Top left. |
 | Frame statistics | on / off | Periodic FPS, readback and (on Windows) memory figures in the log; useful in crash reports. |
+| Clear the shader cache at start | on / **off** | Recompiles every shader on each start: leave it off. |
+| Log folder | a folder (empty: `%LOCALAPPDATA%\UFC3Native\logs`) | Where the run logs and frame/readback CSVs go; `BB_LOG_DIR` wins over it. A network drive works, but a local disk gives the best FPS. |
 
 Environment variables you already have set take precedence over the launcher (for example a
 `.bat` with `set BB_WRITE_WINDOW=0` before starting `UFC3.exe`).
@@ -115,23 +135,30 @@ BB_GAME_DIR=/path/PS4/CUSA06534-merged bash run.sh  # defaults to orig/CUSA06534
 `run.sh` detects the `ufc3` profile and applies the game's defaults; any variable can be
 overridden on the command line (`BB_FPS_LIMIT=0 bash run.sh`).
 
+There is also a GTK 4 launcher (game folder, player name, language, resolution, Offline / Join /
+Host) that needs Python PyGObject and GTK 4: `python3 launcher/ufc3_launcher.py` from the repo,
+or `./ufc3.sh` with no arguments in the Linux package (`./ufc3.sh --play /path/to/CUSA06534`
+plays from the command line). Logs go to `~/.local/share/UFC3Native/logs/`.
+
 ## Online (experimental)
 
-Off unless `BB_ONLINE_SERVER` is set: without it the console stays offline, as in 0.1.4. With it,
-the game's EA servers are replaced by a local server (`tools/ufc3_server.py`) that one player
-runs. Login and the lobby reach that server; **a fight between two PCs does not work yet**, and
-FighterNet and friend invitations are unfinished.
+Private hosting between friends: one player runs the server on their own PC, with no public
+matchmaking. Either Windows or Linux can host, and the two PCs may run different systems; both
+need the same port build and the same game dump/update.
 
-```bash
-python3 tools/ufc3_server.py --bind 0.0.0.0            # on the hosting PC (Linux)
-BB_ONLINE_SERVER=127.0.0.1 bash run.sh                 # the host's own game
-BB_ONLINE_SERVER=192.168.1.20 bash run.sh              # another Linux PC: the host's address
-```
+- The host picks **Host server** in the launcher, selects their address, shares it (**Copy IP**)
+  and presses **Play**. The friend picks **Join server**, enters that address and presses **Play**.
+- Both enter Online → Quick Fight and search at about the same time. **Rematch works.**
+- Outside your LAN, use a VPN such as [Tailscale](https://tailscale.com) on both PCs and share the
+  host's VPN IP (never `127.0.0.1`).
 
-On Windows there is no launcher field for it yet: start `UFC3.exe` from a `.bat` with
-`set BB_ONLINE_SERVER=192.168.1.20`. The server listens on TCP 42230, 40443, 40080, 10041 and
-10744 and UDP 17502 (the game's 443/80 go to +40000); the games talk to each other over UDP 3659.
-Give each PC a different player name. `BB_NET_LOG=0` silences the network log (on by default in
+Step by step: [`docs/ufc3/HOW-TO-PLAY-ONLINE.md`](docs/ufc3/HOW-TO-PLAY-ONLINE.md); ports, logs and
+troubleshooting: [`docs/ufc3/ONLINE-HOSTING.md`](docs/ufc3/ONLINE-HOSTING.md).
+
+Advanced: the launchers set `BB_ONLINE_SERVER=<host address>` for the game (without it the
+console stays offline). An inherited `BB_ONLINE_SERVER` overrides the launcher's Offline/Join
+choice. You can also run the server yourself (`python3 tools/ufc3_server.py --bind 0.0.0.0`)
+and have both players use Join server. `BB_NET_LOG=0` silences the network log (on by default in
 this mode). Details: [`docs/ufc3/ONLINE_IMPLEMENTATION.md`](docs/ufc3/ONLINE_IMPLEMENTATION.md).
 
 ## Building the Windows zip (on Linux)
@@ -254,8 +281,8 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
   [FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), Dear ImGui.
 
-Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md) and
-[`0.1.4`](docs/ufc3/releases/0.1.4.md).
+Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md),
+[`0.1.4`](docs/ufc3/releases/0.1.4.md) and [`0.1.5`](docs/ufc3/releases/0.1.5.md).
 
 ## License
 
