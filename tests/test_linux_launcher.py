@@ -1,15 +1,125 @@
 from pathlib import Path
+import contextlib
+import io
+import os
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'launcher'))
 from ufc3_online import (DEFAULTS, HostServer, TCP_PORTS, QOS_PORT, load_settings,
-                        local_addresses, run_session, save_settings, session_environment, validate_host)
+                        local_addresses, play_saved, resolve_play_folder, run_session,
+                        save_settings, session_environment, validate_host)
+
+
+class HeadlessPlayTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.data = Path(temporary.name)
+        self.saved = self.data / 'saved game'
+        self.legacy = self.data / 'legacy game'
+        for folder in (self.saved, self.legacy):
+            folder.mkdir()
+            (folder / 'eboot.bin').touch()
+        (self.data / 'game-folder').write_text(str(self.legacy) + '\n')
+        self.settings = dict(DEFAULTS, game=str(self.saved), player='Saved player',
+                             language='3', fps='90', resolution='2560x1440',
+                             present='Fifo', fullscreen=True, neo=True,
+                             skip_movies=False, mode='join', join_address='192.0.2.1')
+        save_settings(self.data, self.settings)
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_saved_folder_wins_over_legacy(self):
+        self.assertEqual(resolve_play_folder(self.data, load_settings(self.data)), str(self.saved))
+
+    def test_empty_or_missing_saved_folder_falls_back_to_legacy(self):
+        for folder in ('', str(self.data / 'missing'), str(self.data)):
+            with self.subTest(folder=folder):
+                save_settings(self.data, dict(self.settings, game=folder))
+                self.assertEqual(resolve_play_folder(self.data, load_settings(self.data)), str(self.legacy))
+
+    def test_environment_overrides_saved_folder(self):
+        with patch.dict(os.environ, BB_GAME_DIR=str(self.legacy)):
+            self.assertEqual(resolve_play_folder(self.data, self.settings), str(self.legacy))
+        with patch.dict(os.environ, BB_GAME_DIR=str(self.data / 'missing')):
+            self.assertEqual(resolve_play_folder(self.data, self.settings), str(self.legacy))
+
+    def test_no_valid_folder_gives_actionable_error_without_starting_session(self):
+        (self.saved / 'eboot.bin').unlink()
+        (self.legacy / 'eboot.bin').unlink()
+        errors = io.StringIO()
+        with patch.dict(os.environ, BB_DATA_DIR=str(self.data)), \
+                patch('ufc3_online.run_session') as session, contextlib.redirect_stderr(errors):
+            self.assertEqual(play_saved(), 1)
+        session.assert_not_called()
+        self.assertIn('Set the folder in the launcher', errors.getvalue())
+        self.assertIn('./ufc3.sh --play /path/to/CUSA06534', errors.getvalue())
+
+    def test_headless_session_receives_all_saved_settings_and_reports_failures(self):
+        for result in (0, 7, RuntimeError('host failed')):
+            with self.subTest(result=result), patch.dict(os.environ, BB_DATA_DIR=str(self.data)), \
+                    patch('ufc3_online.run_session') as session, \
+                    contextlib.redirect_stdout(io.StringIO()) as output, \
+                    contextlib.redirect_stderr(io.StringIO()) as errors:
+                session.return_value = result
+                if isinstance(result, Exception):
+                    session.side_effect = result
+                else:
+                    session.side_effect = lambda *args: (args[4]('Preparing session'), result)[1]
+                self.assertEqual(play_saved(), 1 if isinstance(result, Exception) else result)
+                root, data, settings, cancel, notify = session.call_args.args
+                self.assertEqual((root, data, settings), (ROOT, self.data, self.settings))
+                self.assertIsInstance(cancel, threading.Event)
+                self.assertFalse(cancel.is_set())
+                if result:
+                    self.assertTrue(errors.getvalue())
+                else:
+                    self.assertEqual(errors.getvalue(), '')
+                    self.assertIn('Preparing session', output.getvalue())
+
+    def test_packaged_script_routes_saved_and_explicit_folders_without_gtk(self):
+        package = self.data / 'package'
+        for directory in ('bin', 'launcher', 'scripts'):
+            (package / directory).mkdir(parents=True)
+        (package / 'bin/sacredfire').touch()  # layout marker only; never executed
+        shutil.copy(ROOT / 'packaging/linux/ufc3.sh', package)
+        shutil.copy(ROOT / 'packaging/linux/ufc3.conf.example', package)
+        shutil.copy(ROOT / 'launcher/ufc3_online.py', package / 'launcher')
+        (package / 'launcher/ufc3_launcher.py').write_text('raise AssertionError("GTK entry used")\n')
+        (package / 'scripts/merge_update.py').write_text('import sys\nprint(sys.argv[1])\n')
+        (package / 'run.sh').write_text(
+            '#!/usr/bin/env bash\nprintf "%s\\n" "$BB_GAME_DIR" "$BB_PREBUILT" "$BB_USER_NAME" '
+            '"$BB_LANGUAGE" "$BB_FPS_LIMIT" "$BB_PRESENT_MODE" "$BB_FULLSCREEN" '
+            '"$BB_NEO" "$BB_SKIP_MOVIES" "$BB_ONLINE_SERVER" "$BB_INTERNAL_WIDTH" '
+            '> "$BB_TEST_CAPTURE"\nexit 7\n')
+        (package / 'run.sh').chmod(0o755)
+        capture = self.data / 'captured environment'
+        env = dict(os.environ, PATH=os.defpath + os.pathsep + str(Path(sys.executable).parent),
+                   BB_DATA_DIR=str(self.data), BB_TEST_CAPTURE=str(capture))
+        for arguments in (['--play'], ['--play', str(self.legacy)], [str(self.saved)]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(['bash', str(package / 'ufc3.sh'), *arguments],
+                                        env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 7, result.stderr)
+                values = capture.read_text().splitlines()
+                self.assertEqual(values[:2], [str(self.legacy if len(arguments) == 2 else self.saved), '1'])
+                if arguments == ['--play']:
+                    self.assertEqual(values[2:], ['Saved player', '3', '90', 'Fifo', '1', '1',
+                                                  '0', '192.0.2.1', '2560'])
+                    self.assertIn('game exited with code 7', result.stderr)
+                else:
+                    self.assertEqual(load_settings(self.data)['game'], arguments[-1])
+                    self.assertEqual(load_settings(self.data)['player'], 'Saved player')
 
 
 class LauncherSettingsTests(unittest.TestCase):

@@ -14,7 +14,8 @@ source at the commit in `VERSION` (https://github.com/GNSB/UFC-3-PS4-PORT-LINUX-
 
 ```bash
 tar xf UFC3Native-*-linux-x86_64.tar.gz && cd UFC3Native
-./ufc3.sh /path/to/PS4/CUSA06534      # first time; then just ./ufc3.sh
+./ufc3.sh                           # open the launcher and save the game folder/settings
+./ufc3.sh --play                    # play with those settings, without opening GTK
 ```
 
 The update folder next to the base game (`CUSA06534-patch`, `-PATCH`, `-update`…) is merged
@@ -25,7 +26,8 @@ example: `BB_LOG_DIR="$HOME/UFC3-logs" ./ufc3.sh`.
 
 ## Settings
 
-- `~/.local/share/UFC3Native/ufc3.conf`: fullscreen, FPS limit, present mode, 2K/4K window
+- `~/.local/share/UFC3Native/launcher.json`: saved GUI settings, also used by `./ufc3.sh --play`.
+- `~/.local/share/UFC3Native/ufc3.conf`: legacy CLI settings: fullscreen, FPS limit, present mode, 2K/4K window
   (`BB_WINDOW_SIZE`) with FSR 1.0 + RCAS, player name, monitor.
 - Controls: `bbport.ini` in the same folder, lines `key.<input>=<key>` and
   `pad.<input>=<button>`. Inputs: cross circle square triangle l1 r1 l2 r2 l3 r3 options
@@ -41,7 +43,7 @@ GPL-2.0-or-later; not affiliated with Electronic Arts, Sony or the UFC.
 
 ## Graphical launcher and private online play
 
-Open `UFC3.sh` (mark it executable if your file manager asks), or run `./ufc3.sh` without arguments. The GUI requires Python 3, PyGObject and GTK 4 (`python-gobject gtk4` on Arch; `python3-gi gir1.2-gtk-4.0` on Debian/Ubuntu). The command line remains available: `./ufc3.sh --play /path/to/CUSA06534`, or the existing positional game-folder command.
+Open `UFC3.sh` (mark it executable if your file manager asks), or run `./ufc3.sh` without arguments. The GUI requires Python 3, PyGObject and GTK 4 (`python-gobject gtk4` on Arch; `python3-gi gir1.2-gtk-4.0` on Debian/Ubuntu). Use `./ufc3.sh --play` to play with the saved GUI settings without GTK (also suitable for Steam shortcuts). `BB_GAME_DIR` overrides the saved folder; an empty or invalid folder falls back to the legacy `game-folder` file. The legacy command line remains available: `./ufc3.sh --play /path/to/CUSA06534`, or `./ufc3.sh /path/to/CUSA06534`; both remember the folder for the GUI too.
 
 Choose the game folder once. The launcher remembers the folder, player name, language, video settings and online mode in `~/.local/share/UFC3Native/launcher.json` (or `BB_DATA_DIR`). Existing `ufc3.conf` and `game-folder` settings are imported on first use. Environment variables retain priority; remove `BB_ONLINE_SERVER` when using the GUI's Offline mode. The in-game menu still provides controller and advanced graphics settings.
 
