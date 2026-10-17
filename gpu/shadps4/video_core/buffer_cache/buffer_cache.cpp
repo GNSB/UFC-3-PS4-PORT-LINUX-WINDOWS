@@ -127,6 +127,7 @@ struct ReadbackLog {
     FILE* file = nullptr;
     std::mutex mutex;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point flushed = start;
 };
 ReadbackLog* Readbacks() {
     static ReadbackLog* const log = [] () -> ReadbackLog* {
@@ -1097,7 +1098,13 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                 }
             }
         }
-        std::fflush(log->file);
+        // UFC-51: written on the GPU command thread while the draw pipe is drained for this
+        // readback: flushed once a second, not per line (the launcher's log folder may be a
+        // network drive: a flush per line put a file write there into every drain).
+        if (now - log->flushed >= std::chrono::seconds{1}) {
+            std::fflush(log->file);
+            log->flushed = now;
+        }
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
 }
