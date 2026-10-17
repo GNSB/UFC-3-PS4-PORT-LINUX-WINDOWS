@@ -277,7 +277,49 @@ def run_session(root, data, settings, cancel, notify):
                     raise RuntimeError(f'The hosted server stopped unexpectedly. See {server.log_path}')
             if not cancel.is_set():
                 notify(f'Game exited with code {game.returncode}. Logs: {logs}')
+                return game.returncode
     finally:
         terminate_owned(game)
         if server:
             server.stop()
+
+
+def resolve_play_folder(data, settings):
+    """Use the GUI's environment override, then fall back to the old CLI folder."""
+    folder = os.environ.get('BB_GAME_DIR') or settings['game']
+    if folder and (Path(folder).expanduser() / 'eboot.bin').is_file():
+        return str(Path(folder).expanduser().resolve())
+    try:
+        folder = (data / 'game-folder').read_text().strip()
+    except OSError:
+        folder = ''
+    if folder and (Path(folder).expanduser() / 'eboot.bin').is_file():
+        return str(Path(folder).expanduser().resolve())
+    raise ValueError('No valid UFC 3 game folder. Set the folder in the launcher, '
+                     'or run ./ufc3.sh --play /path/to/CUSA06534 (containing eboot.bin).')
+
+
+def play_saved():
+    """Headless equivalent of the launcher's Play button; never imports GTK."""
+    try:
+        data = data_dir()
+        settings = load_settings(data)
+        settings['game'] = resolve_play_folder(data, settings)
+        code = run_session(ROOT, data, settings, threading.Event(),
+                           lambda message: print(message, flush=True))
+        if code:
+            print(f'UFC 3: game exited with code {code}. See {data / "logs"}', file=sys.stderr)
+            return code if code > 0 else 1
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'UFC 3: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Play UFC 3 with the saved launcher settings (no GTK).')
+    parser.add_argument('--play', action='store_true', required=True)
+    parser.parse_args()
+    sys.exit(play_saved())

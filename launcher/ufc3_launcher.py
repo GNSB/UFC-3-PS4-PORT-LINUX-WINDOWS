@@ -13,7 +13,7 @@ try:
     gi.require_version('Gtk', '4.0')
     from gi.repository import Gtk, Gio, GLib
 except (ImportError, ValueError):
-    sys.exit('UFC 3 launcher needs Python PyGObject and GTK 4. Install python-gobject + gtk4 (Arch), or python3-gi + gir1.2-gtk-4.0 (Debian/Ubuntu). CLI: ./ufc3.sh --play /path/to/game')
+    sys.exit('UFC 3 launcher needs Python PyGObject and GTK 4. Install python-gobject + gtk4 (Arch), or python3-gi + gir1.2-gtk-4.0 (Debian/Ubuntu). CLI: ./ufc3.sh --play (saved settings), or ./ufc3.sh --play /path/to/CUSA06534')
 
 ROOT = Path(__file__).resolve().parent.parent
 MODES = [('Offline', 'offline'), ('Join server', 'join'), ('Host server', 'host')]

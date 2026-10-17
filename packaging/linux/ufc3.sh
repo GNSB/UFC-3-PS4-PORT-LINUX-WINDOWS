@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # UFC 3 native port (Linux release). Usage:
-#   ./ufc3.sh /path/to/PS4/CUSA06534    first time: the base game folder (the -patch folder next
-#                                       to it is merged automatically); remembered afterwards
-#   ./ufc3.sh                           plays again with the remembered folder
-# Settings: ~/.local/share/UFC3Native/ufc3.conf (created on the first start). Controls, the FPS
-# counter and the overlay menu's options: bbport.ini in the same folder. Logs: logs/ there.
+#   ./ufc3.sh                          opens the graphical launcher
+#   ./ufc3.sh --play                   plays with the saved launcher settings (no GTK)
+#   ./ufc3.sh [--play] /path/to/CUSA06534  legacy CLI; remembers the base game folder
+#                                       (the adjacent -patch folder is merged automatically)
+# Settings: ~/.local/share/UFC3Native/launcher.json (GUI / --play); ufc3.conf (legacy CLI).
+# Controls and overlay: bbport.ini in the same folder. Logs: logs/ there.
 set -euo pipefail
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 # No arguments opens the GUI; --play and the existing positional folder keep CLI use.
 if [[ $# == 0 ]]; then exec python3 "$here/launcher/ufc3_launcher.py"; fi
-if [[ ${1:-} == --play ]]; then shift; fi
+if [[ ${1:-} == --play ]]; then
+    shift
+    if [[ $# == 0 ]]; then exec python3 "$here/launcher/ufc3_online.py" --play; fi
+fi
 data=${BB_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/UFC3Native}
 mkdir -p "$data"
 command -v python3 >/dev/null || { echo "UFC 3: python3 is needed (install it with your package manager)" >&2; exit 1; }
@@ -17,6 +21,16 @@ command -v python3 >/dev/null || { echo "UFC 3: python3 is needed (install it wi
 if [[ $# -gt 0 && -d $1 ]]; then
     game=$(cd -- "$1" && pwd); shift
     printf '%s\n' "$game" > "$data/game-folder"
+    python3 - "$here/launcher" "$data" "$game" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from ufc3_online import load_settings, save_settings
+data = Path(sys.argv[2])
+settings = load_settings(data)
+settings['game'] = sys.argv[3]
+save_settings(data, settings)
+PY
 elif [[ -f $data/game-folder ]]; then
     game=$(cat "$data/game-folder")
 else
