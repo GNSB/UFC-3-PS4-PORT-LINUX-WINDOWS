@@ -65,13 +65,11 @@ if [[ $BB_GAME_PROFILE == ufc3 ]]; then
     # readback waits for); off for this game.
     export BB_GPU_WRITE_TWINS=${BB_GPU_WRITE_TWINS:-0}
     # Write windows (CPU writes beside GPU-written bytes keep their page open until the next
-    # submission: fights 105-113 -> 140-190 FPS on an RTX 4070, GROK_HANDOFF §17) are on here and
-    # off in the Windows launcher: the crashes with them (the guest heap's free list corrupted
-    # after a fight, guest fault at 0x1262a2a) were only reported on Windows (RX 9070, RTX 4090);
-    # on Linux (RTX 4070) 20-minute sessions played without a crash. Pre-upload restores blood
-    # and sweat on hits (UFC-49); Linux also verified correct created/career skin with it on
-    # and single-stepped writes off. Keep single-stepped writes off for the skin regression.
-    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1} BB_PREUPLOAD=${BB_PREUPLOAD:-1} BB_WRITE_STEP=${BB_WRITE_STEP:-0}
+    # submission: fights 105-113 -> 140-190 FPS on an RTX 4070, GROK_HANDOFF §17) with
+    # single-stepped writes, and pre-upload (blood and sweat on hits, UFC-49): the same defaults
+    # as the Windows launcher. UFC-48 made the windows coherent; validated on Windows 2026-10-16
+    # (RTX 3060) with blood, created fighter's skin and a second fight without a crash.
+    export BB_WRITE_WINDOW=${BB_WRITE_WINDOW:-1} BB_PREUPLOAD=${BB_PREUPLOAD:-1} BB_WRITE_STEP=${BB_WRITE_STEP:-1}
     # The EA intro and the 2.5-minute first-start video play a short black clip instead.
     export BB_SKIP_MOVIES=${BB_SKIP_MOVIES:-1} BB_SKIP_MOVIE_FILE=${BB_SKIP_MOVIE_FILE:-$PWD/share/skip_movie.mkv}
     # Frame rate: the game asks for flip rate 1 (30 Hz) through its present-interval setter

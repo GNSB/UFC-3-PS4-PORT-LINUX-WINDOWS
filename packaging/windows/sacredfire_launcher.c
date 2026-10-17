@@ -912,18 +912,16 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
      * answered as uncompressed by the runtime). */
     game_env(L"BB_NEO", settings.neo || experiment ? L"1" : L"0"); /* 2K / 4K: always Pro (its 4K VideoOut) */
     game_env(L"BB_READBACKS", L"2"); game_env(L"BB_READBACK_LINEAR", L"1"); game_env(L"BB_GPU_WRITE_TWINS", L"0");
-    /* Write windows off by default on Windows: with them on, Windows corrupts the game's heap
-     * (crashes loading the second fight or signing the career contract). Five cases so far:
-     * RX 9070, RTX 4090, RTX 3060 and RX 7800 XT x2, even with BB_WRITE_STEP=0. With
-     * BB_WRITE_WINDOW=0 the RX 7800 XT user stopped crashing. Linux has no reports and keeps
-     * them on (run.sh). Set BB_WRITE_WINDOW=1 before starting the launcher to re-enable them. */
-    game_env(L"BB_WRITE_WINDOW", L"0");
+    /* Write windows and single-stepped writes on, as on Linux (run.sh): UFC-48 made the windows
+     * coherent (the heap corruption of 0.1.4 is gone). Validated on Windows 2026-10-16 (RTX 3060):
+     * Career fight ~47 FPS, blood and sweat, created fighter's skin, second fight and contract
+     * without a crash. Their audit (BB_WRITE_WINDOW_DIAG) stays in the test launcher only. */
+    game_env(L"BB_WRITE_WINDOW", L"1"); game_env(L"BB_WRITE_STEP", L"1");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
-    /* Pre-upload restores blood and sweat on hits (UFC-49). Linux verified correct created/
-     * career skin with pre-upload on and single-stepped writes off; Windows validation pending.
-     * Keep single-stepped writes off for the skin regression. The user's environment wins. */
-    game_env(L"BB_PREUPLOAD", L"1"); game_env(L"BB_WRITE_STEP", L"0");
+    /* Pre-upload restores blood and sweat on hits (UFC-49); validated on Windows together with
+     * the write windows above. The user's environment wins over all three. */
+    game_env(L"BB_PREUPLOAD", L"1");
 #ifdef UFC3_WRITE_WINDOWS_TEST
     /* UFC-48 test launcher (UFC3-WRITE-WINDOWS-TEST.exe; UFC3.exe is the release one, unchanged):
      * write windows and single steps on, with their audit, to measure the coherent windows. */

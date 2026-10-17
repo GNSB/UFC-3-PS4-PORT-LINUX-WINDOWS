@@ -43,16 +43,13 @@ and saves. What works today:
 
 - Tested by the maintainer on NVIDIA (Linux and Windows); AMD fixes come from @luscamovi's
   RX 9070, and players have reported on other AMD and NVIDIA cards (RX 7800 XT, RTX 4090…).
-- **Write windows** (a faster CPU/GPU memory path, see *Performance*) are **on on Linux and off
-  on Windows**: on Windows they corrupted the game's heap (crashes loading the second fight or
-  signing the career contract). Windows fights are therefore slower than Linux ones.
+- **Write windows** (a faster CPU/GPU memory path, see *Performance*) are **on on both Linux and
+  Windows** since 0.1.5: UFC-48 fixed the Windows heap corruption of 0.1.4.
 
 **Known issues**
 
 - Moving the window to another monitor *during startup* can crash the NVIDIA driver
   (`Swapchain::Destroy`).
-- Write windows stay off on Windows (a performance limitation, no longer a crash); the cause is
-  still under investigation, and `BB_WRITE_WINDOW=1` brings the crash risk back.
 - Some long hairstyles leave a slightly lighter line at the base of the neck.
 - Portuguese (Portugal) (`BB_LANGUAGE=7`) is listed but the game has no text for it: pick
   Portuguese (Brazil) (`17`).
@@ -102,7 +99,7 @@ and saves. What works today:
 | Frame statistics | on / off | Periodic FPS, readback and (on Windows) memory figures in the log; useful in crash reports. |
 
 Environment variables you already have set take precedence over the launcher (for example a
-`.bat` with `set BB_WRITE_WINDOW=1` before starting `UFC3.exe`).
+`.bat` with `set BB_WRITE_WINDOW=0` before starting `UFC3.exe`).
 
 ## Linux
 
@@ -162,9 +159,9 @@ bash scripts/release.sh <version>   # tags ufc3-v<version>, builds, packages, pu
 | `BB_PRESENT_MODE` | Immediate (Windows) | `Mailbox`, `Fifo` or `Immediate`. |
 | `BB_VBLANK_HZ` / `BB_FLIP_RATE` | 480 / 0 | The game asks for 30 Hz; with flip rate 0 and a high virtual vblank it runs at the real rate (the simulation follows real frame time). |
 | `BB_READBACKS` / `BB_READBACK_LINEAR` | 2 / 1 | Precise reads of GPU-written memory (without them the fight renders black, as UFC 4 does in shadPS4). |
-| `BB_WRITE_STEP` | 0 | CPU writes next to a few GPU-written bytes are single-stepped instead of waiting for the GPU. Off: created/career fighters' skin came out black or garbled. |
-| `BB_WRITE_WINDOW` | **1 on Linux** (`run.sh`), **0 on Windows** (launcher) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). On Windows it corrupted the game's heap (crashes loading the second fight or signing the career contract), so the launcher turns it off; Linux has no reports. `BB_WRITE_WINDOW=1` before the launcher re-enables it on Windows, at the risk of those crashes. |
-| `BB_PREUPLOAD` | 1 | Background upload of rewritten game memory into VRAM (1 = resident memory, 2 = all of it). Restores blood/sweat on hits (UFC-49); Linux verified created/career skin with `BB_WRITE_STEP=0`. Windows validation pending. A user-set value overrides the default. |
+| `BB_WRITE_STEP` | 1 | CPU writes next to a few GPU-written bytes are single-stepped instead of waiting for the GPU; write windows need it. Validated on Windows (UFC-48 coherent windows) with correct created/career skin. |
+| `BB_WRITE_WINDOW` | 1 (`run.sh` and the Windows launcher, since 0.1.5) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). The 0.1.4 Windows heap corruption is fixed by UFC-48's coherent windows (validated on an RTX 3060: second fight and contract without a crash). `BB_WRITE_WINDOW=0` turns it off. |
+| `BB_PREUPLOAD` | 1 | Background upload of rewritten game memory into VRAM (1 = resident memory, 2 = all of it). Restores blood/sweat on hits (UFC-49); validated on Linux and Windows. A user-set value overrides the default. |
 | `BB_ALPHA_TO_MASK` | on | Hair/beard coverage (`DB_ALPHA_TO_MASK` emulated as a shader dither). `0` turns it off; `coverage` uses Vulkan alpha-to-coverage on MSAA targets; `colourmap` limits it to draws sampling the hair colour map (Create Fighter only). |
 | `SHADPS4_BC_MODE` | 3 | GPU-compressed textures go through memory (created-fighter skin). `0` restores the older compressed-view/copy behaviour, for comparison. |
 | `BB_T4_PRESERVE_ALIAS` | 1 | Keeps the portrait the game draws into a larger render target when it re-reads it at the portrait's size (post-fight fighter, career portraits). `0` disables it. |
@@ -205,8 +202,7 @@ in the [release notes](docs/ufc3/releases/).
 3. **`BB_WRITE_STEP`.** A CPU write to a page with ≤ 256 GPU-written bytes runs with the trap
    flag (TF) set, and only the words it changed are uploaded to VRAM, instead of waiting for the
    GPU and downloading the page. Menus no longer sync with the GPU every frame (240 FPS).
-   Off by default (with it, created fighters' skin came out black or garbled);
-   `BB_WRITE_STEP=1` turns it back on.
+   On by default (write windows need it); `BB_WRITE_STEP=0` turns it off.
 4. **`BB_WRITE_WINDOW`** (the big fight improvement). A new per-site counter ("Readback sites" in
    the log) showed that almost every wait came from the EA engine: its dynamic buffers (a lock
    with discard at `0x64b50` → `0xf4120`, e.g. the fighters' 48-byte bone matrices) share pages
@@ -216,16 +212,11 @@ in the [release notes](docs/ufc3/releases/).
    opened, and only the changed words are uploaded (skipping the GPU's). Result on Linux:
    readbacks 380 → 120 per second and fights from **105–113 to roughly 140–190 FPS**
    on an RTX 4070 (the detailed run recorded 137–196 FPS uncapped).
-   Known risk: if the game read the GPU bytes of an open page, it would see the previous
-   submission's data. On Windows that actually happens: write windows corrupt the game's
-   heap (crashes loading the second fight or signing the career contract; five cases with
-   RX 9070, RTX 4090, RTX 3060 and RX 7800 XT ×2, even with `BB_WRITE_STEP=0`; with
-   `BB_WRITE_WINDOW=0` the RX 7800 XT user stopped crashing). So the default is
-   **`BB_WRITE_WINDOW=1` on Linux** (`run.sh`), where no crashes were reported (20-minute
-   sessions on an RTX 4070 completed fine), **and `0` on Windows** (launcher, since 0.1.4).
-   To re-enable it on Windows at the cost of those crashes, set `BB_WRITE_WINDOW=1` before
-   starting the launcher, for example from a `.bat` with `set BB_WRITE_WINDOW=1`. An
-   explicit value wins on either platform.
+   In 0.1.4 the windows corrupted the game's heap on Windows (crashes loading the second fight
+   or signing the career contract), so that launcher turned them off. UFC-48 made them
+   coherent; since 0.1.5 **`BB_WRITE_WINDOW=1` is the default on Linux and Windows**
+   (validated on an RTX 3060: second fight and contract without a crash). An explicit value
+   (`BB_WRITE_WINDOW=0`) wins on either platform.
 
 The full technical write-up (diagnostics, failed experiments, measurements) is in
 [`docs/ufc3/GROK_HANDOFF.md`](docs/ufc3/GROK_HANDOFF.md), [`docs/ufc3/HANDOFF.md`](docs/ufc3/HANDOFF.md)

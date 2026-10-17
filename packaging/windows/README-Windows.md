@@ -65,9 +65,9 @@ If the game crashes, send the newest `.log` from `%LOCALAPPDATA%\UFC3Native\logs
 launcher's **Open logs folder**) with a short description; checking **Frame statistics** first
 makes the log more useful.
 
-Write windows (a faster memory path) are off on Windows because they corrupted the game's heap
-(crashes loading the second fight or signing the career contract). `set BB_WRITE_WINDOW=1` in a
-`.bat` before starting `UFC3.exe` turns them back on, at the risk of those crashes.
+Write windows (a faster memory path) are on by default since 0.1.5 (`BB_WRITE_WINDOW=1`,
+`BB_WRITE_STEP=1`, `BB_PREUPLOAD=1`). If the game crashes loading a second fight or signing the
+career contract, `set BB_WRITE_WINDOW=0` in a `.bat` before starting `UFC3.exe` and report it.
 
 If the launcher's log says a program "could not start" (Windows error 0xC0000022, access
 denied): allow the file in your antivirus (Windows Security > Protection history), extract the
