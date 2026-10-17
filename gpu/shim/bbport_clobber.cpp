@@ -74,6 +74,9 @@ LastWrite& LastWriteSlot(std::uint64_t address) {
     return last_writes[(address >> 2) % last_writes.size()];
 }
 
+// The last label GuardLabel dropped (ReportLongWait).
+std::atomic<std::uint64_t> dropped_address{0}, dropped_value{0}, dropped_ns{0};
+
 // BB_COPY_PROTECT: the read-only copies.
 struct Protected {
     std::atomic<std::uint64_t> base{0}, bytes{0}, seq{0};
@@ -128,7 +131,30 @@ void NoteDecoding(std::uint64_t seq) {
     decoding.store(seq, std::memory_order_relaxed);
 }
 
+namespace {
+void NoteLastWrite(std::uint64_t address, std::uint64_t value, std::uint64_t now) {
+    LastWrite& last = LastWriteSlot(address);
+    last.address.store(address, std::memory_order_relaxed);
+    last.value.store(value, std::memory_order_relaxed);
+    last.ns.store(now, std::memory_order_release);
+}
+bool IsFence(Source source) {
+    return source == Eop || source == Eos || source == ReleaseMem;
+}
+} // namespace
+
 void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, Source source) {
+    if (bytes == 0 || address == 0) {
+        return;
+    }
+    // ufc3 (UFC-47): the last write per address is what GuardLabel tells the port's own label
+    // writes by, so it is kept whatever BB_CLOBBER_CHECK says. A fence label is noted by
+    // GuardLabel itself once the write is let through: noted here, before the guard, it was the
+    // write being judged, and a label the port bumps 2 -> 3 inside the buffer read as rebuilt.
+    const std::uint64_t now = NowNs();
+    if (!IsFence(source)) {
+        NoteLastWrite(address, value, now);
+    }
     // ufc3: the guest write ring and its reports are part of the issue-#2 diagnostics.
     static const bool enabled = [] {
         const char* e = std::getenv("BB_CLOBBER_CHECK");
@@ -137,20 +163,10 @@ void NoteWrite(std::uint64_t address, std::uint64_t value, std::uint32_t bytes, 
     if (!enabled) {
         return;
     }
-    if (bytes == 0 || address == 0) {
-        return;
-    }
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
-    const std::uint64_t now = NowNs();
     const std::uint64_t decoding_now = decoding.load(std::memory_order_relaxed);
     writes[writes_head.fetch_add(1, std::memory_order_relaxed) % writes.size()] =
         Write{address, value, now, decoding_now, bytes, source, tid, 0};
-    {
-        LastWrite& last = LastWriteSlot(address);
-        last.address.store(address, std::memory_order_relaxed);
-        last.value.store(value, std::memory_order_relaxed);
-        last.ns.store(now, std::memory_order_release);
-    }
     // The newest submitted buffer the write lands in.
     const Range* hit = nullptr;
     const std::uint64_t head = ranges_head.load(std::memory_order_relaxed);
@@ -250,8 +266,14 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
         }
     }
     if (!rebuilt) {
+        // The write goes ahead: the slot now holds the port's value (the next label to it, a
+        // counter's next step, is told from a rebuilt slot by this).
+        NoteLastWrite(address, value, NowNs());
         return false;
     }
+    dropped_address.store(address, std::memory_order_relaxed);
+    dropped_value.store(value, std::memory_order_relaxed);
+    dropped_ns.store(NowNs(), std::memory_order_relaxed);
     static std::atomic<std::uint64_t> guarded{0};
     const std::uint64_t n = guarded.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n <= 16 || n % 100 == 0) {
@@ -289,6 +311,34 @@ bool GuardLabel(std::uint64_t address, std::uint64_t value, std::uint32_t bytes,
         AskForReport();
     }
     return true;
+}
+
+void ReportLongWait(std::uint64_t address, std::uint32_t function, std::uint32_t ref,
+                    std::uint32_t mask, unsigned seconds) {
+    static std::atomic<bool> reported{false};
+    if (reported.exchange(true)) {
+        return;
+    }
+    static const char* const functions[] = {"always", "<", "<=", "==", "!=", ">=", ">", "?"};
+    const std::uint32_t now = *reinterpret_cast<const volatile std::uint32_t*>(address);
+    std::fprintf(stderr,
+                 "GPU wait not met for %u s: WAIT_REG_MEM on %#llx, which holds %#x, waits for "
+                 "(value & %#x) %s %#x; decoding submission %llu; the game is frozen while this "
+                 "lasts (UFC-47)\n",
+                 seconds, (unsigned long long)address, now, mask, functions[function & 7], ref,
+                 (unsigned long long)decoding.load(std::memory_order_relaxed));
+    const std::uint64_t last = dropped_address.load(std::memory_order_relaxed);
+    if (last != 0) {
+        std::fprintf(stderr,
+                     "  last label the late-label guard dropped: value %#llx to %#llx, %.2f s ago%s\n",
+                     (unsigned long long)dropped_value.load(std::memory_order_relaxed),
+                     (unsigned long long)last,
+                     (NowNs() - dropped_ns.load(std::memory_order_relaxed)) / 1e9,
+                     last == address ? " (the address this wait reads)" : "");
+    } else {
+        std::fprintf(stderr, "  the late-label guard has dropped no label\n");
+    }
+    std::fflush(stderr);
 }
 
 void DumpWritesInto(std::uint64_t address, std::uint64_t bytes) {

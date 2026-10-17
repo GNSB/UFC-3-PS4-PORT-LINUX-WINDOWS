@@ -33,6 +33,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -1940,7 +1941,11 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    // UFC-48 (BB_WRITE_WINDOW_DIAG): which shader reads what a window left GPU-owned.
+    VideoCore::PageManager::SetDiagShader(cs.pgm_hash);
+    const bool bound = BindResources(pipeline);
+    VideoCore::PageManager::SetDiagShader(0);
+    if (!bound) {
         return;
     }
 
@@ -2001,7 +2006,11 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     scheduler.PopPendingOperations();
     const u32 offset = 0;
 
-    if (!BindResources(pipeline)) {
+    VideoCore::PageManager::SetDiagShader(
+        pipeline->GetStage(Shader::SwStage::Compute).pgm_hash); // UFC-48 diagnostics
+    const bool bound = BindResources(pipeline);
+    VideoCore::PageManager::SetDiagShader(0);
+    if (!bound) {
         return;
     }
 
@@ -4367,8 +4376,12 @@ bool Rasterizer::OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip, bool
     return true;
 }
 
-void Rasterizer::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes) {
-    buffer_cache.NoteSteppedWrite(addr, std::move(bytes));
+u64 Rasterizer::NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window) {
+    return buffer_cache.NoteSteppedWrite(addr, std::move(bytes), from_window);
+}
+
+std::vector<std::pair<VAddr, VAddr>> Rasterizer::GpuModifiedRangesIn(VAddr addr, u64 size) const {
+    return buffer_cache.GpuModifiedRangesIn(addr, size);
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {

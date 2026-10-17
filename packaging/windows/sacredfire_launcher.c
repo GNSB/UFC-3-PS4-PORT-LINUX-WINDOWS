@@ -490,6 +490,14 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
      * background pre-upload or the single-stepped writes on, those textures came out black or
      * garbled (career, fighter creation); with both off they draw correctly in fights. */
     game_env(L"BB_PREUPLOAD", L"0"); game_env(L"BB_WRITE_STEP", L"0");
+#ifdef UFC3_WRITE_WINDOWS_TEST
+    /* UFC-48 test launcher (UFC3-WRITE-WINDOWS-TEST.exe; UFC3.exe is the release one, unchanged):
+     * write windows and single steps on, with their audit, to measure the coherent windows. */
+    SetEnvironmentVariableW(L"BB_WRITE_STEP", L"1");
+    SetEnvironmentVariableW(L"BB_WRITE_WINDOW", L"1");
+    SetEnvironmentVariableW(L"BB_WRITE_WINDOW_DIAG", L"1");
+    SetEnvironmentVariableW(L"BB_WRITE_WINDOW_DIAG_MAX", L"1000");
+#endif
     game_env(L"BB_COPY_GPU_BUFFERS", L"1");
     game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
@@ -550,6 +558,9 @@ static DWORD play(const wchar_t *const *extra, int extra_count) {
     for (int i = 0; i < extra_count; ++i) append_argument(line, 32768, extra[i]);
     char version[64]; read_version(version, sizeof(version));
     logf("SacredFire %s (Windows)\n", version);
+#ifdef UFC3_WRITE_WINDOWS_TEST
+    logw(L"UFC-48 write windows test: BB_WRITE_STEP=1 BB_WRITE_WINDOW=1 BB_WRITE_WINDOW_DIAG=1 BB_WRITE_WINDOW_DIAG_MAX=1000 (UFC3-WRITE-WINDOWS-TEST.exe).\n");
+#endif
     const DWORD code = run(line, NULL, 0, 1, INFINITE);
     logf("sacredfire-game.exe exited with code %lu%s\n", code,
          code == 0 ? "" : code == 3 ? " (a fault; the report is above)" : code == 142 ? " (watchdog)" : code == 23 ? " (GPU library assertion)" : "");
@@ -1108,7 +1119,12 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     /* The client area is 760x828 at 96 DPI: the window is created, measured, and resized by the
      * difference (the frame metrics of the running system, whatever they are). */
     const int client_w = sx(760), client_h = sx(828);
-    main_window = CreateWindowExW(0, wc.lpszClassName, L"EA SPORTS UFC 3 - native PC port", style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
+#ifdef UFC3_WRITE_WINDOWS_TEST
+    const wchar_t *title = L"EA SPORTS UFC 3 - native PC port (UFC-48 write windows test)";
+#else
+    const wchar_t *title = L"EA SPORTS UFC 3 - native PC port";
+#endif
+    main_window = CreateWindowExW(0, wc.lpszClassName, title, style, CW_USEDEFAULT, CW_USEDEFAULT, client_w + 16, client_h + 64,
                                   NULL, NULL, instance, NULL);
     if (!main_window) return 1;
     open_log_file(L"launcher.log");

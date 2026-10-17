@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache//region_definitions.h"
@@ -56,6 +57,46 @@ public:
     static void RequestWindow();
     /// Closes every open window (the submitting thread, before the GPU side sees the submission).
     static void CloseWriteWindows();
+
+    /// UFC-48: faults on pages already open in a window since the last call (protected again
+    /// while open; each such fault re-opens the page instead of retrying forever).
+    static u64 TakeWindowReprotects();
+    /// UFC-48: whether the write fault being handled on this thread comes from a site (instruction
+    /// and caller) barred from windows: one of its windows changed GPU-owned bytes. A window
+    /// cannot see a CPU write that leaves the stale guest value over GPU bytes (VRAM keeps the
+    /// GPU's); a site that writes over GPU data reads the page back first, as without windows.
+    static bool WindowSiteBarred();
+    /// UFC-48: GPU bytes left GPU-owned, since the last call, on pages where a window's CPU writes
+    /// took over others (the bytes a window cannot tell were rewritten unchanged).
+    static u64 TakeWindowAmbiguousBytes();
+
+    /// ufc3 (UFC-48): what a buffer readback beginning now may write over: the guest bytes, and
+    /// on a page open in a write window the bytes as the window opened (the CPU's since are kept
+    /// even if the window closes before the readback writes).
+    static void ReadbackSnapshot(VAddr addr, u8* out, u64 size);
+    /// ufc3 (UFC-48): writes a buffer readback's payload to guest memory through `write`, except
+    /// the bytes the CPU changed since the download began (`at_start`: ReadbackSnapshot then,
+    /// or null) or since their page's write window opened. Returns the bytes kept.
+    using ReadbackWriter = void (*)(void* context, VAddr addr, const u8* data, u64 size);
+    static u64 WriteReadback(VAddr addr, const u8* payload, const u8* at_start, u64 size,
+                             ReadbackWriter write, void* context);
+
+    /// BB_WRITE_WINDOW_DIAG=1: audit a readback (after it wrote) or a skipped upload against
+    /// active/recent window snapshots. Observational only; a matching page does not establish
+    /// CPU ownership.
+    static void DiagnoseWindowWrite(VAddr address, std::span<const u8> data, bool upload_skip);
+    /// BB_WRITE_WINDOW_DIAG=1: a binding the GPU writes covers [address, +size) (after the
+    /// windows over it closed: their CPU bytes there are superseded, not lost to a readback).
+    static void DiagnoseGpuWrite(VAddr address, u64 size);
+    /// BB_WRITE_WINDOW_DIAG=1 (UFC-48): a binding the GPU reads (or writes) covers
+    /// [address, +size): notes whether it covers GPU-owned bytes a closed window left as they
+    /// were (the CPU may have rewritten them with the stale guest value: VRAM's is used).
+    static void DiagnoseGpuRead(VAddr address, u64 size, bool written);
+    /// The compute shader whose bindings this thread is about to obtain (0: none or a draw).
+    static void SetDiagShader(u64 hash);
+    /// GPU hang report: the recent DiagnoseGpuRead hits of the stuck shader.
+    static void ReportWindowHazards(u64 hash);
+    static void DumpWindowFault(void* context);
 
     /// Register a range of mapped gpu memory.
     void OnGpuMap(VAddr address, size_t size);

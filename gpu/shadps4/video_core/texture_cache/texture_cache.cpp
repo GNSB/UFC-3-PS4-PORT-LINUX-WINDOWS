@@ -296,6 +296,38 @@ std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
     return out;
 }
 
+namespace {
+// UFC-48 (BB_WRITE_WINDOW): an image download writes over the guest bytes as they were when it
+// was requested (PageManager::ReadbackSnapshot); those the CPU wrote since, through a write
+// window without a fault, stay (PageManager::WriteReadback), as for buffer readbacks. Written
+// straight before: a window's CPU bytes over a GPU-written image were lost to its download.
+std::vector<u8> ImageReadbackStart(VAddr address, u64 size) {
+    std::vector<u8> at_start;
+    if (PageManager::WriteWindowsEnabled()) {
+        at_start.resize(size);
+        PageManager::ReadbackSnapshot(address, at_start.data(), size);
+    }
+    return at_start;
+}
+
+bool WriteImageReadback(VAddr address, const u8* data, u64 size,
+                        const std::vector<u8>& at_start) {
+    if (at_start.empty()) {
+        return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(address), data, size);
+    }
+    bool written = true;
+    PageManager::WriteReadback(
+        address, data, at_start.data(), size,
+        [](void* context, VAddr at, const u8* bytes, u64 n) {
+            *static_cast<bool*>(context) &=
+                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(at), bytes, n);
+        },
+        &written);
+    PageManager::DiagnoseWindowWrite(address, std::span<const u8>{data, size}, false);
+    return written;
+}
+} // namespace
+
 void TextureCache::ProcessDownloadImages() {
     // bbport: called for every fence (~450 a frame): the lock only when something is queued.
     if (!downloads_queued.load(std::memory_order_acquire)) {
@@ -346,6 +378,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
+    auto at_start = ImageReadbackStart(image.info.guest_address, download_size);
     const vk::BufferImageCopy image_download = {
         .bufferOffset = download.offset,
         .bufferRowLength = image.info.pitch,
@@ -371,8 +404,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                            BbFreeCheck::ImageDownload);
         BbClobber::NoteWrite(image.info.guest_address, 0, u32(download_size),
                              BbClobber::ImageDownload);
-        const bool written = Core::Memory::Instance()->TryWriteBacking(
-            std::bit_cast<u8*>(image.info.guest_address), download.mapped, download_size);
+        const bool written = WriteImageReadback(image.info.guest_address, download.mapped,
+                                                download_size, at_start);
         LogT4Image(image, written ? "guest-written" : "guest-write-failed",
                    scheduler.CurrentTick(), readback_linear_images);
         if (!WriteTracking()) {
@@ -380,13 +413,13 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         }
     } else {
         scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
+            [this, device_addr = image.info.guest_address, download, download_size,
+             at_start = std::move(at_start)] {
                 download.Invalidate();
                 BbFreeCheck::Check(device_addr, download_size, download.mapped,
                                    BbFreeCheck::ImageDownload);
                 BbClobber::NoteWrite(device_addr, 0, u32(download_size), BbClobber::ImageDownload);
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                          download.mapped, download_size);
+                WriteImageReadback(device_addr, download.mapped, download_size, at_start);
                 if (!WriteTracking()) {
                     buffer_cache.InvalidateMemory(device_addr, download_size);
                 }

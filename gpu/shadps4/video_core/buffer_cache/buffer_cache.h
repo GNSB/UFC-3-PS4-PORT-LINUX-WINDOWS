@@ -192,7 +192,12 @@ public:
     /// the next binding.
     void NoteLateCommandWrite(VAddr addr, const void* data, u64 size);
     /// ufc3 (BB_WRITE_STEP): bytes a single-stepped CPU write changed beside GPU data.
-    void NoteSteppedWrite(VAddr addr, std::vector<u8> bytes);
+    /// from_window (BB_WRITE_WINDOW, UFC-48): a closing window's changed words. They are newer
+    /// than the GPU bytes they touch (WindowMerge): those stop being GPU-modified now, and the
+    /// words reach VRAM whole. Returns the GPU bytes a window's words took over (0 otherwise).
+    u64 NoteSteppedWrite(VAddr addr, std::vector<u8> bytes, bool from_window = false);
+    /// UFC-48: the GPU-modified ranges in [addr, addr + size), clipped (gpu_ranges_mutex).
+    std::vector<std::pair<VAddr, VAddr>> GpuModifiedRangesIn(VAddr addr, u64 size) const;
     /// bbport, without write tracking (any thread): the CPU wrote [addr, addr + size) next to data
     /// the GPU keeps in VRAM. Exactly those bytes are copied into VRAM from the game's memory at the
     /// next binding: no readback of the GPU's data, nothing uploaded over it.
@@ -319,6 +324,9 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// gpu_modified_ranges.Intersects under gpu_ranges_mutex (other threads write the ranges).
+    bool GpuRangesIntersect(VAddr addr, u64 size) const;
+
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
 
@@ -418,6 +426,7 @@ private:
     std::mutex late_writes_mutex;
     std::vector<std::pair<VAddr, std::vector<u8>>> late_writes;
     std::vector<std::pair<VAddr, std::vector<u8>>> stepped_writes;
+    std::vector<std::pair<VAddr, std::vector<u8>>> window_writes; ///< UFC-48: CPU-owned
     std::vector<std::pair<VAddr, u64>> precise_uploads;
     std::atomic<bool> late_writes_pending{false};
     u64 bind_wait_tick = 0;                            ///< the next arena binds wait for it
