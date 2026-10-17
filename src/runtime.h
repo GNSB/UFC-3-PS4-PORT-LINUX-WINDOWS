@@ -26,6 +26,8 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 /* The CPU is about to write the range outside guest code (a file read): tells the GPU side. */
 void runtime_memory_note_write(uintptr_t address, uint64_t size);
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
+/* ufc3: the destination of the guest memcpy/memmove/memset running on this thread (0 if none). */
+int runtime_guest_copy_range(uintptr_t *begin, uintptr_t *end);
 /* bbport (frame stats): a guest thread was blocked `ns` in the runtime (0 cond, 1 mutex, 2 sema, 3 sleep). */
 void runtime_wait_note(int kind, uint64_t ns);
 void runtime_wait_report(double frames);

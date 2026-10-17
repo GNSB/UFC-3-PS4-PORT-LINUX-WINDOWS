@@ -42,6 +42,7 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+struct ReadFaultDownload;
 
 /// bbport: an IntervalList whose every change advances `generation`: lookups of the buffer
 /// cache's residency remember their answers for as long as nothing changed (ResidencyMemo).
@@ -322,7 +323,8 @@ private:
     /// in (no CPU copy, no VRAM buffer copy), when the range is contiguous there.
     std::optional<std::pair<const Buffer*, u64>> GuestChunkSource(VAddr address, u64 size);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size,
+                        ReadFaultDownload* read_fault = nullptr);
 
     /// gpu_modified_ranges.Intersects under gpu_ranges_mutex (other threads write the ranges).
     bool GpuRangesIntersect(VAddr addr, u64 size) const;

@@ -41,6 +41,8 @@ extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, 
 extern "C" int runtime_memory_direct_phys(uintptr_t address, uint64_t* phys, uintptr_t* end);
 
 extern "C" void runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
+// bbport (ufc3): a host copy can expose its whole guest destination to the fault handler.
+extern "C" int runtime_guest_copy_range(uintptr_t* begin, uintptr_t* end);
 
 namespace VideoCore {
 
@@ -329,10 +331,14 @@ std::atomic<u64> stepped_write_faults{0}, stepped_write_uploads{0}, stepped_writ
 // ufc3: why GPU-page write faults were not stepped (frame stats "Stepped writes").
 std::atomic<u64> step_no_host{0}, step_no_near{0}, step_no_big{0}, step_no_burst{0}, step_no_other{0};
 std::atomic<u64> window_opens{0};
+// bbport (ufc3): exact-range decisions and windows refused by BB_WRITE_WINDOW=2.
+std::atomic<u64> window_no_exact{0}, exact_near_copies{0}, exact_near_stores{0};
 // UFC-48: GPU-modified bytes a closing window's CPU words took over; readback bytes kept for the CPU.
 std::atomic<u64> window_cpu_bytes{0}, readback_kept_bytes{0};
 // UFC-48: faults of barred window sites; window bytes ProcessLateWrites could not put in VRAM.
 std::atomic<u64> window_barred_faults{0}, window_unuploaded_bytes{0};
+// bbport (ufc3): distinguish an empty download from a real payload in frame statistics.
+std::atomic<u64> empty_downloads{0}, payload_downloads{0}, payload_download_bytes{0};
 
 // ufc3 (BB_WRITE_STEP): gpu_modified_ranges is written on the GPU side; faulting threads read
 // it under this lock to decide a single step themselves (a command to the GPU thread drains the
@@ -689,20 +695,66 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
     const VAddr near_begin = std::max(page, device_addr - std::min(device_addr - page, Margin));
     const VAddr near_end =
         std::min(page + TRACKER_BYTES_PER_PAGE, device_addr + std::max<u64>(size, 8) + Margin);
-    bool near = false;
+    // bbport (ufc3): use known write bytes instead of the margin, both ways. A write over GPU
+    // bytes reads back even when it faults far from them: a same-value write would escape the
+    // window diff). BB_WRITE_WINDOW: a guest memcpy/memset's whole destination, rounded out to 16
+    // bytes. A guest instruction decoded as one plain store (PageManager::GuestStoreRange), in
+    // 4-byte words: GPU bytes just below it, as at the end of a buffer the GPU wrote before the
+    // one the game fills (guest 0x4219b8), cannot be touched by it.
+    VAddr exact_begin = 0, exact_end = 0;
+    bool copy = false;
+    if (windows && !from_guest && runtime_guest_copy_range(&exact_begin, &exact_end) &&
+        exact_begin <= device_addr && device_addr < exact_end) {
+        copy = true;
+        exact_begin = std::max(page, Common::AlignDown(exact_begin, 16));
+        exact_end = std::min(page + TRACKER_BYTES_PER_PAGE, Common::AlignUp(exact_end, 16));
+    } else if (from_guest && (!windows_on || PageManager::WriteWindowsExactOnly()) &&
+               PageManager::GuestStoreRange(&exact_begin, &exact_end) &&
+               exact_begin <= device_addr && device_addr < exact_end) {
+        // ufc3: BB_WRITE_WINDOW=1 keeps the upstream margin for guest instructions.
+        exact_begin = std::max(page, Common::AlignDown(exact_begin, 4));
+        exact_end = std::min(page + TRACKER_BYTES_PER_PAGE, Common::AlignUp(exact_end, 4));
+    } else {
+        exact_begin = exact_end = 0;
+    }
+    bool near = false, near_exact = false;
     {
         std::shared_lock rl{gpu_ranges_mutex};
         gpu_modified_ranges.ForEachInRange(page, TRACKER_BYTES_PER_PAGE,
                                            [&](VAddr a, VAddr b) { gpu_bytes += b - a; });
         gpu_modified_ranges.ForEachInRange(near_begin, near_end - near_begin,
                                            [&](VAddr, VAddr) { near = true; });
+        if (exact_begin < exact_end) {
+            bool covers = false;
+            gpu_modified_ranges.ForEachInRange(exact_begin, exact_end - exact_begin,
+                                               [&](VAddr, VAddr) { covers = true; });
+            near_exact = near && !covers;
+            near = covers;
+        }
     }
-    // BB_WRITE_WINDOW: past the step limit (or a host copy, which cannot be stepped) the page
+    const auto note_exact = [&] {
+        if (near_exact) {
+            (copy ? exact_near_copies : exact_near_stores).fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    // ufc3 (BB_WRITE_WINDOW): past the step limit (or a host copy, which cannot be stepped) the page
     // stays open until the next submission.
+    const bool window_range_ok = !PageManager::WriteWindowsExactOnly() || exact_begin < exact_end;
     if (windows && !near && gpu_bytes != 0 && (!from_guest || gpu_bytes > WriteStepMaxGpuBytes())) {
-        window_opens.fetch_add(1, std::memory_order_relaxed);
-        PageManager::RequestWindow();
-        return true;
+        if (window_range_ok) {
+            window_opens.fetch_add(1, std::memory_order_relaxed);
+            PageManager::RequestWindow();
+            note_exact();
+            return true;
+        }
+        window_no_exact.fetch_add(1, std::memory_order_relaxed);
+        // ufc3 (BB_WRITE_WINDOW): a rejected host window must read back, never single-step.
+        if (!from_guest) {
+            step_no_host.fetch_add(1, std::memory_order_relaxed);
+            why = 0;
+            out();
+            return false;
+        }
     }
     if (near || gpu_bytes == 0 || gpu_bytes > WriteStepMaxGpuBytes()) {
         (near ? step_no_near : gpu_bytes == 0 ? step_no_other : step_no_big)
@@ -721,9 +773,13 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
     }
     if (burst.second >= 8) {
         if (windows) {
-            window_opens.fetch_add(1, std::memory_order_relaxed);
-            PageManager::RequestWindow();
-            return true;
+            if (window_range_ok) {
+                window_opens.fetch_add(1, std::memory_order_relaxed);
+                PageManager::RequestWindow();
+                note_exact();
+                return true;
+            }
+            window_no_exact.fetch_add(1, std::memory_order_relaxed);
         }
         step_no_burst.fetch_add(1, std::memory_order_relaxed);
         why = 3;
@@ -732,6 +788,7 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
     }
     ++burst.second;
     stepped_write_faults.fetch_add(1, std::memory_order_relaxed);
+    note_exact();
     return true;
 }
 
@@ -791,7 +848,32 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         pthread_getname_np(pthread_self(), requester.data(), requester.size());
     }
     (void)step; // ufc3: steps are decided before (DecideWriteStep)
-    const auto flush_request = [this, device_addr, size, is_write, requester] {
+    auto* read_fault = is_write ? nullptr : PageManager::CurrentReadFaultDownload();
+    if (read_fault) {
+        std::shared_lock rl{gpu_ranges_mutex};
+        gpu_modified_ranges.ForEachInRange(PageManager::GetPageAddr(device_addr),
+            TRACKER_BYTES_PER_PAGE, [&](VAddr a, VAddr b) { read_fault->page_gpu_bytes += b - a; });
+        // ufc3: lower_bound finds the overlapping range or its successor; only that and the
+        // predecessor can be nearest. No scan of the address space or extra write tracking.
+        const auto& ranges = gpu_modified_ranges.m_ranges_set;
+        auto next = ranges.lower_bound(RangeSet::IntervalType{device_addr, device_addr + 1});
+        const auto measure = [&](const auto& range) {
+            const VAddr a = range.lower(), b = range.upper();
+            const u64 gap = device_addr < a ? a - device_addr
+                           : device_addr >= b ? device_addr - (b - 1) : 0;
+            read_fault->gpu_distance = std::min(read_fault->gpu_distance, gap);
+        };
+        if (next != ranges.end()) {
+            measure(*next);
+        }
+        if (next != ranges.begin()) {
+            measure(*std::prev(next));
+        }
+    }
+    const auto flush_request = [this, device_addr, size, is_write, requester, read_fault] {
+        if (read_fault) {
+            read_fault->current_tick = scheduler.CurrentTick();
+        }
         readback_requester = requester.data();
         readback_is_write = is_write;
         BbStats::readbacks.fetch_add(1, std::memory_order_relaxed);
@@ -920,7 +1002,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             }
         }
         if (!skip_download) {
-            DownloadMemory(arena, download_start, download_end - download_start);
+            DownloadMemory(arena, download_start, download_end - download_start, read_fault);
         }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -940,7 +1022,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
-void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size,
+                                 ReadFaultDownload* read_fault) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -963,6 +1046,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
+        empty_downloads.fetch_add(1, std::memory_order_relaxed);
         // UFC-48: GPU-modified pages with no GPU bytes left (a write window's close took them
         // all for the CPU) stop being GPU-modified here too. Left marked, the write fault that
         // got here marked them CPU-modified as well: write-only protection (an assert on
@@ -970,6 +1054,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
         return;
     }
+    payload_downloads.fetch_add(1, std::memory_order_relaxed);
+    payload_download_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     // UFC-48 (BB_WRITE_WINDOW): a page open in a write window takes CPU writes without a fault,
     // also while this download waits for the GPU (and across the window's close). The bytes
     // it may write over, as of now: the write back skips those changed since (the CPU's, newer).
@@ -1060,6 +1146,14 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         }
         download.buffer->Invalidate(download.offset, download.size);
         write_back(download.mapped, download.offset);
+    }
+    if (read_fault) {
+        read_fault->write_tick = std::max(read_fault->write_tick, write_tick);
+        read_fault->current_tick = tick_before;
+        read_fault->bytes += total_size_bytes;
+        ++read_fault->downloads;
+        read_fault->wait_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wait_start).count();
     }
     if (auto* log = Readbacks()) {
         const auto now = std::chrono::steady_clock::now();
@@ -2345,6 +2439,28 @@ void BufferCache::ProcessLateWrites() {
         windowed.swap(window_writes);
         late_writes_pending.store(false, std::memory_order_release);
     }
+    // bbport (ufc3): NoteSteppedWrite removed closed windows' CPU words from the byte ranges
+    // immediately, under windows_mutex (UFC-48). Reconcile the page bits on the GPU side too:
+    // an empty page must not keep a read watcher until a later, blocking ReadMemory request.
+    // Check the whole page NOW: a GPU binding since the close may have claimed bytes again.
+    boost::container::small_vector<VAddr, 16> clear_window_pages;
+    {
+        std::shared_lock rl{gpu_ranges_mutex};
+        for (const auto& [addr, bytes] : windowed) {
+            for (VAddr page = Common::AlignDown(addr, TRACKER_BYTES_PER_PAGE);
+                 page < addr + bytes.size(); page += TRACKER_BYTES_PER_PAGE) {
+                if (!gpu_modified_ranges.Intersects(page, TRACKER_BYTES_PER_PAGE) &&
+                    (clear_window_pages.empty() || clear_window_pages.back() != page)) {
+                    clear_window_pages.push_back(page);
+                }
+            }
+        }
+    }
+    // bbport (ufc3): region/page locks precede gpu_ranges_mutex elsewhere. Release it before
+    // touching the tracker; only the GPU side adds ranges, so none can appear in this gap.
+    for (const VAddr page : clear_window_pages) {
+        memory_tracker->UnmarkRegionAsGpuModified(page, TRACKER_BYTES_PER_PAGE);
+    }
     // ufc3 (BB_WRITE_STEP): the changed bytes of a single-stepped CPU write, in 4-byte words
     // (vkCmdUpdateBuffer). A word with GPU-owned bytes is not uploaded (the guest copy of the GPU
     // part is stale); such conflicts are counted (frame stats "stepped writes").
@@ -2683,7 +2799,26 @@ void BufferCache::Maintain() {
     static auto last_report = std::chrono::steady_clock::now();
     if (const auto now = std::chrono::steady_clock::now(); now - last_report > std::chrono::seconds(5)) {
         last_report = now;
+        // bbport (ufc3): payload/empty requests are separate from write-fault site reports.
+        const u64 empty = empty_downloads.exchange(0), payloads = payload_downloads.exchange(0);
+        const u64 downloaded = payload_download_bytes.exchange(0);
+        if (empty || payloads) {
+            std::printf("Buffer downloads (5 s): %llu empty, %llu with payload, %llu bytes\n",
+                        (unsigned long long)empty, (unsigned long long)payloads,
+                        (unsigned long long)downloaded);
+        }
         const u64 faults = stepped_write_faults.exchange(0, std::memory_order_relaxed);
+        // bbport (ufc3): count exact ranges that avoided the conservative GPU margin.
+        const u64 near_copies = exact_near_copies.exchange(0);
+        const u64 near_stores = exact_near_stores.exchange(0);
+        if (near_copies || near_stores) {
+            std::printf("Writes beside GPU bytes, not over them (no readback): %.1f/s host copies, "
+                        "%.1f/s guest stores\n", near_copies / 5.0, near_stores / 5.0);
+        }
+        if (const u64 no_exact = window_no_exact.exchange(0)) {
+            std::printf("Write windows: %.1f/s rejected without an exact write range "
+                        "(BB_WRITE_WINDOW=2)\n", no_exact / 5.0);
+        }
         if (faults != 0) {
             std::printf("Stepped writes: %.1f/s instead of a readback, %.1f uploads/s, %llu conflicts; "
                         "not stepped/s: host copy %.1f, near GPU bytes %.1f, page > max bytes %.1f, "

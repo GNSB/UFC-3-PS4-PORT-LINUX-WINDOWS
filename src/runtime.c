@@ -167,17 +167,37 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     fputs("STOP: guest stack protector detected corruption\n", stderr);
     exit(22);
 }
+/* ufc3 (BB_WRITE_WINDOW): the destination of the guest copy running on this thread. A write fault
+ * inside the host's memcpy then knows every byte the copy writes (runtime_guest_copy_range): a
+ * copy beside GPU bytes that does not cover them can open its page instead of a readback (the
+ * D3D-style Map(WRITE_DISCARD) + memcpy of UFC 3, guest 0x431ba0). The signal fences keep the
+ * stores on the right side of the copy for a handler on this thread. */
+static _Thread_local uintptr_t copy_begin, copy_end;
+int runtime_guest_copy_range(uintptr_t *begin, uintptr_t *end) {
+    *begin=copy_begin; *end=copy_end; return copy_begin<copy_end;
+}
+static inline void copy_range_set(void *dst, size_t size) {
+    copy_begin=(uintptr_t)dst; copy_end=(uintptr_t)dst+size;
+    atomic_signal_fence(memory_order_seq_cst);
+}
+static inline void copy_range_clear(void) {
+    atomic_signal_fence(memory_order_seq_cst);
+    copy_end=0;
+}
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    memset(dst, value, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
+    copy_range_set(dst, size); memset(dst, value, size); copy_range_clear();
+    runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    memcpy(dst, src, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
+    copy_range_set(dst, size); memcpy(dst, src, size); copy_range_clear();
+    runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    memmove(dst, src, size); runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
+    copy_range_set(dst, size); memmove(dst, src, size); copy_range_clear();
+    runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);

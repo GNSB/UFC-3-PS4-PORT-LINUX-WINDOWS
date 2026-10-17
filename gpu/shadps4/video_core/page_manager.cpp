@@ -10,6 +10,7 @@
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/range_lock.h"
+#include <Zydis/Zydis.h> // bbport (ufc3): independent fault-handler decoder
 #include "common/signal_context.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -29,6 +30,7 @@
 #include <set>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #ifndef _WIN32
 #include <sys/uio.h>
 #endif
@@ -117,6 +119,83 @@ std::string SiteName(u64 key) {
 
 /// The write fault this thread is handling (guest offsets; 0: none).
 thread_local u64 current_fault_rip = 0, current_fault_caller = 0;
+thread_local ReadFaultDownload* current_read_download = nullptr;
+
+struct ReadFaultSite {
+    u64 rip = 0, caller = 0, count = 0, address = 0, gpu_bytes = 0, distance = ~u64{0};
+    int window_open = -1;
+    ReadFaultDownload download;
+    double total_ms = 0, max_ms = 0, last_ms = 0;
+};
+std::mutex read_fault_mutex;
+std::array<ReadFaultSite, 256> read_fault_sites{};
+u64 read_fault_sites_dropped = 0;
+
+void CompleteReadFault(u64 rip, u64 caller, VAddr address, u64 gpu_bytes, u64 distance,
+                       int window_open, const ReadFaultDownload& download, double elapsed_ms,
+                       bool handled) {
+    {
+        std::scoped_lock lk{read_fault_mutex};
+        bool found = false;
+        for (auto& site : read_fault_sites) {
+            if ((site.rip == rip && site.caller == caller) || site.rip == 0) {
+                site.rip = rip;
+                site.caller = caller;
+                ++site.count;
+                site.address = address;
+                site.gpu_bytes = gpu_bytes;
+                site.distance = distance;
+                site.window_open = window_open;
+                site.download = download;
+                site.total_ms += elapsed_ms;
+                site.max_ms = std::max(site.max_ms, elapsed_ms);
+                site.last_ms = elapsed_ms;
+                found = true;
+                break;
+            }
+        }
+        read_fault_sites_dropped += !found;
+    }
+}
+
+void ReportReadFaultSites() {
+    std::array<ReadFaultSite, 256> rows{};
+    u64 dropped;
+    {
+        std::scoped_lock lk{read_fault_mutex};
+        rows = read_fault_sites;
+        // ufc3: Keep keys; reset counters only, as for write sites.
+        for (auto& site : read_fault_sites) {
+            site.count = 0;
+            site.total_ms = site.max_ms = 0;
+        }
+        dropped = std::exchange(read_fault_sites_dropped, 0);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+    u64 total = 0;
+    for (const auto& row : rows) {
+        total += row.count;
+    }
+    if (!total && !dropped) {
+        return;
+    }
+    std::printf("Read fault sites (this window): %llu faults, %llu unlisted",
+                (unsigned long long)total, (unsigned long long)dropped);
+    for (std::size_t i = 0; i < rows.size() && rows[i].count; ++i) {
+        const auto& r = rows[i];
+        std::printf("%s %s (from +%#llx) %llu at %#llx [GPU %llu B, distance %lld B, "
+                    "window_open=%d recent_window=unknown, ms avg/max/last %.3f/%.3f/%.3f, "
+                    "download_ms %.3f, write_tick %llu current_tick %llu age %lld]",
+                    i ? ";" : ":", SiteName(r.rip).c_str(), (unsigned long long)r.caller,
+                    (unsigned long long)r.count, (unsigned long long)r.address,
+                    (unsigned long long)r.gpu_bytes, r.distance == ~u64{0} ? -1LL : (long long)r.distance,
+                    r.window_open, r.total_ms / r.count, r.max_ms, r.last_ms, r.download.wait_ms,
+                    (unsigned long long)r.download.write_tick, (unsigned long long)r.download.current_tick,
+                    r.download.write_tick && r.download.current_tick >= r.download.write_tick
+                        ? (long long)(r.download.current_tick - r.download.write_tick) : -1LL);
+    }
+    std::printf("\n");
+}
 
 /// Guest code that wrote image (texture) memory: keyed by instruction and image.
 struct ImageFaultSite {
@@ -276,6 +355,7 @@ void ReportReadbackSites() {
 
 void PageManager::ReportFaultSites() {
     ReportReadbackSites();
+    ReportReadFaultSites();
     struct Row {
         u64 rip, caller, count, address;
     };
@@ -284,7 +364,7 @@ void PageManager::ReportFaultSites() {
     u64 total = 0;
     for (auto& site : fault_sites) {
         const u64 count = site.count.exchange(0, std::memory_order_relaxed);
-        if (count != 0) {
+        if (count != 0 && !(site.rip.load() & ReadSite)) {
             rows[n++] = {site.rip.load(), site.caller.load(), count, site.last_address.load()};
             total += count;
         }
@@ -375,6 +455,103 @@ void NoteRepeatedWriteFault(VAddr addr, u64 rip) {
 std::atomic<u32> open_window_count{0};
 thread_local bool want_window = false, fault_from_guest = false;
 constexpr std::size_t MaxWindows = 512;
+
+// bbport (ufc3): the bytes the faulting guest instruction writes, when it is one plain store (one
+// explicit memory destination of at most 32 bytes: no REP string, stack, state save or masked
+// store), with its address computed from the registers. 0 when unknown.
+thread_local VAddr store_begin = 0, store_end = 0;
+
+bool GprValue(void* context, ZydisRegister reg, u64& value) {
+    using R = Common::FaultRegister;
+    R r;
+    switch (reg) {
+    case ZYDIS_REGISTER_NONE: value = 0; return true;
+    case ZYDIS_REGISTER_RAX: r = R::Rax; break;
+    case ZYDIS_REGISTER_RBX: r = R::Rbx; break;
+    case ZYDIS_REGISTER_RCX: r = R::Rcx; break;
+    case ZYDIS_REGISTER_RDX: r = R::Rdx; break;
+    case ZYDIS_REGISTER_RSI: r = R::Rsi; break;
+    case ZYDIS_REGISTER_RDI: r = R::Rdi; break;
+    case ZYDIS_REGISTER_RBP: r = R::Rbp; break;
+    case ZYDIS_REGISTER_RSP: r = R::Rsp; break;
+    case ZYDIS_REGISTER_R8: r = R::R8; break;
+    case ZYDIS_REGISTER_R9: r = R::R9; break;
+    case ZYDIS_REGISTER_R10: r = R::R10; break;
+    case ZYDIS_REGISTER_R11: r = R::R11; break;
+    case ZYDIS_REGISTER_R12: r = R::R12; break;
+    case ZYDIS_REGISTER_R13: r = R::R13; break;
+    case ZYDIS_REGISTER_R14: r = R::R14; break;
+    case ZYDIS_REGISTER_R15: r = R::R15; break;
+    default: return false;
+    }
+    value = Common::GetFaultRegister(context, r);
+    return true;
+}
+
+void DecodeGuestStore(void* context, u64 rip, VAddr fault) {
+    store_begin = store_end = 0;
+    // ufc3: Not Common::Decoder: its singleton is created on first use, unguarded (fault handlers run
+    // on many threads at once).
+    static const ZydisDecoder decoder = [] {
+        ZydisDecoder d;
+        ZydisDecoderInit(&d, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+        return d;
+    }();
+    ZydisDecodedInstruction inst;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(rip),
+                                             std::min<u64>(15, GuestImageEnd - rip), &inst, ops)) ||
+        (inst.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) ||
+        inst.address_width != 64) {
+        return;
+    }
+    switch (inst.mnemonic) {
+    case ZYDIS_MNEMONIC_ENTER:
+    case ZYDIS_MNEMONIC_MASKMOVQ:
+    case ZYDIS_MNEMONIC_MASKMOVDQU:
+    case ZYDIS_MNEMONIC_VMASKMOVPS:
+    case ZYDIS_MNEMONIC_VMASKMOVPD:
+    case ZYDIS_MNEMONIC_VPMASKMOVD:
+    case ZYDIS_MNEMONIC_VPMASKMOVQ:
+        return;
+    default:
+        break;
+    }
+    const ZydisDecodedOperand* store = nullptr;
+    for (u8 i = 0; i < inst.operand_count; ++i) {
+        const auto& op = ops[i];
+        if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || !(op.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE)) {
+            continue;
+        }
+        if (store || op.visibility != ZYDIS_OPERAND_VISIBILITY_EXPLICIT) {
+            return; // ufc3: several destinations, or an implicit one (push, call, string ops)
+        }
+        store = &op;
+    }
+    if (!store || store->mem.type != ZYDIS_MEMOP_TYPE_MEM || store->mem.segment == ZYDIS_REGISTER_FS ||
+        store->mem.segment == ZYDIS_REGISTER_GS) {
+        return;
+    }
+    const u64 bytes = store->size / 8;
+    if (bytes == 0 || bytes > 32) {
+        return; // ufc3: xsave/fxsave areas and the like
+    }
+    u64 base = 0, index = 0;
+    if (store->mem.base == ZYDIS_REGISTER_RIP) {
+        base = rip + inst.length;
+    } else if (!GprValue(context, store->mem.base, base)) {
+        return;
+    }
+    if (!GprValue(context, store->mem.index, index)) {
+        return;
+    }
+    const VAddr address = base + index * store->mem.scale + u64(store->mem.disp.value);
+    if (fault < address || fault - address >= bytes) {
+        return;
+    }
+    store_begin = address;
+    store_end = address + bytes;
+}
 
 // UFC-48: BB_WRITE_WINDOW_DIAG_MAX=<n> reports per event kind (default 64).
 u32 WindowAuditMax() {
@@ -888,6 +1065,12 @@ struct PageManager::Impl {
             const bool guest_store = rip >= GuestImage && rip < GuestImageEnd;
             fault_from_guest = guest_store;
             want_window = false;
+            // bbport (ufc3): retain only this fault's decoded guest destination.
+            if (guest_store) {
+                DecodeGuestStore(context, rip, addr);
+            } else {
+                store_begin = store_end = 0;
+            }
             NoteRepeatedWriteFault(addr, rip);
             const bool windows = WriteWindowsEnabled() && !is_gpu_thread;
             bool handled = rasterizer->OnWriteFault(addr, is_gpu_thread, rip,
@@ -907,7 +1090,30 @@ struct PageManager::Impl {
         } else {
             BbStats::read_faults.fetch_add(1, std::memory_order_relaxed);
             BbStats::Timer timer{BbStats::t_read_faults};
-            return rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            const auto start = std::chrono::steady_clock::now();
+            // ufc3: Read-fault-only observation, before the download removes the GPU ranges. No
+            // additional tracking of writes/submissions: past closed windows are unknown.
+            const u64 rip = current_fault_rip, caller = current_fault_caller;
+            const VAddr page = GetPageAddr(addr);
+            int window_open = -1; // ufc3: diagnostic must not wait for a closing window
+            if (windows_mutex.try_lock()) {
+                window_open = 0;
+                for (const auto& window : open_windows) {
+                    window_open |= window->page == page;
+                }
+                windows_mutex.unlock();
+            }
+            ReadFaultDownload download;
+            auto* previous = std::exchange(current_read_download, &download);
+            const bool handled = rasterizer->ReadMemory(addr, 8, is_gpu_thread);
+            current_read_download = previous;
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            CompleteReadFault(rip, caller, addr, download.page_gpu_bytes, download.gpu_distance,
+                              window_open, download,
+                              elapsed_ms, handled);
+            current_fault_rip = 0;
+            return handled;
         }
         return false;
     }
@@ -1522,10 +1728,14 @@ bool PageManager::OnStepTrap(void* context) {
     return Impl::OnStepTrap(context);
 }
 
+ReadFaultDownload* PageManager::CurrentReadFaultDownload() {
+    return current_read_download;
+}
+
 bool PageManager::WriteWindowsEnabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("BB_WRITE_WINDOW");
-        const bool on = env && env[0] == '1';
+        const bool on = env && (env[0] == '1' || env[0] == '2');
         if (on) {
             // Windows are decided in BufferCache::DecideWriteStep after its BB_WRITE_STEP gate:
             // with steps off none opens (UFC-2: 0.1.3 logs read as windows on).
@@ -1540,8 +1750,27 @@ bool PageManager::WriteWindowsEnabled() {
     return enabled;
 }
 
+// bbport (ufc3): mode 2 opens only writes with a known destination range.
+bool PageManager::WriteWindowsExactOnly() {
+    static const bool exact_only = [] {
+        const char* env = std::getenv("BB_WRITE_WINDOW");
+        const bool on = env && env[0] == '2';
+        if (on) {
+            std::printf("GPU: write windows require an exact write range (BB_WRITE_WINDOW=2)\n");
+        }
+        return on;
+    }();
+    return exact_only;
+}
+
 bool PageManager::FaultFromGuest() {
     return fault_from_guest;
+}
+
+bool PageManager::GuestStoreRange(VAddr* begin, VAddr* end) {
+    *begin = store_begin;
+    *end = store_end;
+    return store_begin < store_end;
 }
 
 void PageManager::RequestWindow() {

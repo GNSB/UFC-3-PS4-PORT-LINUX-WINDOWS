@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -2525,30 +2531,68 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
                                                  ccb_gpu_addrs, ccb_sizes_in_bytes);
 }
 
+// bbport: guest pacing for UFC 3.
+// ufc3 (BB_GUEST_FPS_LIMIT): a frame limit on the game's own frame loop. BB_FPS_LIMIT holds
+// finished frames in the flip queue, so each one is older when shown (input latency); here the
+// submitting thread waits once per frame, after handing its frame over and before its next frame
+// reads the pad, and finished frames flip at once. Past a hitch the cadence restarts (no burst).
+static void PaceGuestFrame() {
+    using Clock = std::chrono::steady_clock;
+    static const u32 limit = [] {
+        const char* env = std::getenv("BB_GUEST_FPS_LIMIT");
+        const u32 fps = env ? u32(std::max(0, std::atoi(env))) : 0u;
+        std::printf("Guest frame limit: %u FPS (BB_GUEST_FPS_LIMIT)\n", fps);
+        return fps;
+    }();
+    if (limit == 0) {
+        return;
+    }
+    static const auto period = std::chrono::nanoseconds(1'000'000'000 / limit);
+    static std::mutex pace_mutex;
+    static Clock::time_point next{};
+    std::scoped_lock lk{pace_mutex};
+    auto now = Clock::now();
+    if (now < next) {
+        // ufc3: The OS timer is 1 ms (timeBeginPeriod): sleep to within it, then yield to the slot.
+        if (next - now > std::chrono::milliseconds(2)) {
+            std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
+        }
+        while ((now = Clock::now()) < next) {
+            std::this_thread::yield();
+        }
+    }
+    // ufc3: On time: the next slot. Late by more than a period: a new cadence from now.
+    next = now - next < period ? next + period : now + period;
+}
+
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     BbStats::submit_done_calls.fetch_add(1, std::memory_order_relaxed);
     BbTimeline::Note(BbTimeline::GuestSubmitDone, u64(frames_submitted) + 1);
     LOG_DEBUG(Lib_GnmDriver, "called");
-    std::scoped_lock lk{m_submit_lock};
-    if (SubmitLockOnDecode()) {
-        // A frame without submissions waits here, as the lock made sceGnmSubmitDone wait.
-        WaitPreviousFrame();
-        submits_this_frame = 0;
-        WatchOverlapLeak();
-        ++frames_submitted;
-        liverpool->SubmitDone(u64(frames_submitted));
-    } else {
-        WaitGpuIdle();
-        if (!liverpool->IsGpuIdle()) {
-            submission_lock = true;
+    {
+        std::scoped_lock lk{m_submit_lock};
+        if (SubmitLockOnDecode()) {
+            // A frame without submissions waits here, as the lock made sceGnmSubmitDone wait.
+            WaitPreviousFrame();
+            submits_this_frame = 0;
+            WatchOverlapLeak();
+            ++frames_submitted;
+            liverpool->SubmitDone(u64(frames_submitted));
+        } else {
+            WaitGpuIdle();
+            if (!liverpool->IsGpuIdle()) {
+                submission_lock = true;
+            }
+            BbTimeline::Note(BbTimeline::GuestLockSet, submission_lock ? 1 : 0, u64(frames_submitted) + 1);
+            ++frames_submitted;
+            liverpool->SubmitDone();
         }
-        BbTimeline::Note(BbTimeline::GuestLockSet, submission_lock ? 1 : 0, u64(frames_submitted) + 1);
-        ++frames_submitted;
-        liverpool->SubmitDone();
+        send_init_packet = true;
+        DebugState.IncGnmFrameNum();
     }
-    send_init_packet = true;
-    DebugState.IncGnmFrameNum();
+    // ufc3: Outside the submit lock: other threads' submissions do not wait for the pacing.
+    PaceGuestFrame();
     return ORBIS_OK;
 }
 
