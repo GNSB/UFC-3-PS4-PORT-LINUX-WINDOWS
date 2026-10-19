@@ -1015,7 +1015,8 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     }
     const DWORD code = run(line, NULL, 0, 1, INFINITE);
     logf("sacredfire-game.exe exited with code %lu%s\n", code,
-         code == 0 ? "" : code == 3 ? " (a fault; the report is above)" : code == 142 ? " (watchdog)" : code == 23 ? " (GPU library assertion)" : "");
+         code == 0 ? "" : code == 3 ? " (a fault; the report is above)" : code == 142 ? " (watchdog)" : code == 23 ? " (GPU library assertion)" :
+         code == 24 ? " (this CPU lacks BMI1/MOVBE/LZCNT: the game needs Intel Haswell (4th gen) or newer, or AMD Ryzen)" : "");
     return code;
 }
 

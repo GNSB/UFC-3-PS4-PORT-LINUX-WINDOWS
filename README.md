@@ -73,7 +73,8 @@ and saves. What works today:
 
 ## Requirements
 
-- x86-64 CPU with AVX (the game code, built for the PS4's Jaguar, uses AVX).
+- x86-64 CPU with AVX2, BMI1, MOVBE and LZCNT (Intel Haswell / 4th-gen Core or newer, or AMD
+  Ryzen). Older CPUs with only AVX (Sandy/Ivy Bridge, Xeon E5 v1/v2) are not supported yet.
 - GPU with Vulkan 1.3. ≥ 6 GB of VRAM recommended (below that a more aggressive texture
   collector kicks in).
 - A dump of the game: the `CUSA06534` base folder and the 1.14 update, for example:
