@@ -664,6 +664,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr, "Fault: exception 0x%08lx at %s (thread %lu %s)\n", record->ExceptionCode, where, GetCurrentThreadId(), thread);
     fprintf(stderr, "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    fprintf(stderr, "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+            c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
     if (fault_extra) fault_extra(info);
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp = (uintptr_t)c->Rbp;
@@ -714,6 +716,12 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
+void platform_fault_registers(void *context, uint64_t out[17]) {
+    const CONTEXT *c = ((EXCEPTION_POINTERS *)context)->ContextRecord;
+    const DWORD64 r[17] = {c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi,
+                           c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15, c->Rip};
+    for (int i = 0; i < 17; ++i) out[i] = r[i];
+}
 void platform_install_fault_handlers(PlatformGpuFault gpu, PlatformRecoverPoint recover, PlatformFaultExtra extra, const unsigned char *image, uint64_t image_size) {
     gpu_fault = gpu; recover_point = recover; fault_extra = extra; guest_image = image; guest_image_size = image_size;
     static int installed;

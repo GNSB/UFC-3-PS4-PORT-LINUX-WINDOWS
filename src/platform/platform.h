@@ -189,6 +189,9 @@ typedef bb_fault_jmp_buf *(*PlatformRecoverPoint)(void);
 typedef void (*PlatformFaultExtra)(void *context);
 void platform_install_fault_handlers(PlatformGpuFault gpu, PlatformRecoverPoint recover,
                                      PlatformFaultExtra extra, const unsigned char *image, uint64_t image_size);
+/* The general registers of a fault context (the one PlatformFaultExtra receives), in the order
+ * rax rcx rdx rbx rsp rbp rsi rdi r8..r15, then rip: 17 values. */
+void platform_fault_registers(void *context, uint64_t out[17]);
 /* ufc3 (BB_WRITE_STEP): the handler of single-step traps (Linux SIGTRAP, Windows
  * EXCEPTION_SINGLE_STEP); it returns nonzero for its own steps, others go on as before. */
 typedef int (*PlatformStepHandler)(void *context);
