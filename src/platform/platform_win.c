@@ -648,6 +648,41 @@ static void describe_rip(char *out, size_t size, uintptr_t address) {
     else platform_describe_address(address, out, size);
 }
 static LONG fatal_reported;
+/* UFC-58: the appearance producer exhausts a four-node guest pool. Capture its
+ * state only at the verified fault instruction; never repair or grow guest data
+ * from an exception handler. ReadProcessMemory keeps bad pool pointers harmless. */
+static void report_appearance_pool(const CONTEXT *c) {
+    static const unsigned char instruction[] = {0x4d, 0x89, 0x10}; /* mov [r8],r10 */
+    unsigned char actual[sizeof(instruction)];
+    if (!guest_image || c->Rip - (uintptr_t)guest_image != 0x402882 || c->R8 ||
+        !platform_safe_read((uintptr_t)c->Rip, actual, sizeof(actual)) ||
+        memcmp(actual, instruction, sizeof(actual))) return;
+    /* Snapshot +0x178..+0x1bf: sequence, consumed sequence, list sentinel,
+     * count, free head, bump cursor, bump end, node stride. */
+    uint64_t pool[9];
+    if (c->R13 > UINTPTR_MAX - 0x1c0 ||
+        !platform_safe_read((uintptr_t)c->R13 + 0x178, pool, sizeof(pool))) {
+        fprintf(stderr, "UFC-58 appearance pool: unreadable owner %016llx\n", c->R13);
+        return;
+    }
+    fprintf(stderr, "UFC-58 appearance pool: owner=%016llx sequence=%" PRIu64
+            " consumed=%" PRIu64 " count=%" PRIu64 " free=%016" PRIx64
+            " cursor=%016" PRIx64 " end=%016" PRIx64 " stride=%" PRIu64 "\n",
+            c->R13, pool[0], pool[1], pool[4], pool[5], pool[6], pool[7], pool[8]);
+    uint64_t node = pool[2], sentinel = c->R13 + 0x188;
+    for (unsigned i = 0; i < 4 && node != sentinel; ++i) {
+        uint64_t fields[7]; /* 0x38-byte node, taken byte at +0x30 */
+        if (!platform_safe_read((uintptr_t)node, fields, sizeof(fields))) {
+            fprintf(stderr, "UFC-58 appearance node %u: unreadable %016" PRIx64 "\n", i, node);
+            break;
+        }
+        fprintf(stderr, "UFC-58 appearance node %u: address=%016" PRIx64
+                " next=%016" PRIx64 " prev=%016" PRIx64 " sequence=%" PRIu64
+                " slot=%u taken=%u\n", i, node, fields[0], fields[1], fields[2],
+                (unsigned)((fields[3] >> 32) & 0xffff), (unsigned)(fields[6] & 0xff));
+        node = fields[0];
+    }
+}
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (InterlockedExchange(&fatal_reported, 1)) { Sleep(INFINITE); }
     const EXCEPTION_RECORD *record = info->ExceptionRecord;
@@ -664,6 +699,9 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr, "Fault: exception 0x%08lx at %s (thread %lu %s)\n", record->ExceptionCode, where, GetCurrentThreadId(), thread);
     fprintf(stderr, "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    fprintf(stderr, "  r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+            c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
+    report_appearance_pool(c);
     if (fault_extra) fault_extra(info);
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp = (uintptr_t)c->Rbp;
