@@ -119,7 +119,55 @@ static int gpu_fault(void *context, void *address) {
 }
 static int gpu_step(void *context) { return gpu_enabled && bbgpu_handle_step(context); }
 static bb_fault_jmp_buf *recover_point(void) { bb_fault_jmp_buf *r = runtime_fault_recover; runtime_fault_recover = NULL; return r; }
-static void fault_extra(void *context) { if (gpu_enabled) bbgpu_dump_guest_writes(context); }
+/* UFC-57: Career crashes with a null write at +0x1a3d204, in the UI scene's snapshot builder
+ * (+0x1a3d100, this in r13). Each update it copies every node of its list at this+0x20 into a
+ * 0x1e8-byte block from the allocator at this+0x18 (+0x1a3d442) and stores the block in
+ * node+0x20 without checking for NULL; the next build writes through it. The allocator ran dry.
+ * Built snapshots wait for the renderer in the vector at this+0xc0 (count +0xc8), finished ones
+ * in this+0xf0 (count +0xf8); +0x108 counts builds. This names the allocator and shows whether
+ * snapshots piled up (renderer not consuming) or the heap is simply full. */
+static void ui_snapshot_report(void *context) {
+    uint64_t r[17];
+    platform_fault_registers(context, r);
+    const uintptr_t base = (uintptr_t)image;
+    if (r[16] != base + 0x1a3d204) return;
+    const uintptr_t scene = r[13];
+    uint64_t f[0x110 / 8];
+    if (!platform_safe_read(scene, f, sizeof(f))) { fprintf(stderr, "  UFC-57: UI scene %#" PRIxPTR " unreadable\n", scene); return; }
+    fprintf(stderr, "  UFC-57: UI scene %#" PRIxPTR ": snapshots waiting for the renderer %" PRIu64 ", finished not yet freed %" PRIu64
+            ", stack %" PRIu64 ", builds %" PRIu64 "\n", scene, f[0xc8 / 8], f[0xf8 / 8], f[0xb0 / 8], f[0x108 / 8]);
+    for (int slot = 0; slot < 2; ++slot) {
+        const uintptr_t allocator = f[slot ? 0x18 / 8 : 0];
+        uint64_t vtable = 0, entry = 0;
+        if (allocator) platform_safe_read(allocator, &vtable, 8);
+        if (vtable) platform_safe_read(vtable + (slot ? 0x58 : 0x50), &entry, 8);
+        fprintf(stderr, "  UFC-57: allocator at scene+%#x: %#" PRIxPTR ", vtable +%#" PRIx64 ", alloc +%#" PRIx64 "\n",
+                slot ? 0x18 : 0, allocator, vtable ? vtable - base : 0, entry ? entry - base : 0);
+    }
+    /* Oldest and newest waiting snapshot (their build number is at +0x48). */
+    const uint64_t waiting = f[0xc8 / 8];
+    if (waiting && waiting < (1u << 24)) {
+        uint64_t first = 0, last = 0, n_first = 0, n_last = 0;
+        platform_safe_read(f[0xc0 / 8], &first, 8);
+        platform_safe_read(f[0xc0 / 8] + (waiting - 1) * 8, &last, 8);
+        if (first) platform_safe_read(first + 0x48, &n_first, 8);
+        if (last) platform_safe_read(last + 0x48, &n_last, 8);
+        fprintf(stderr, "  UFC-57: waiting snapshots span builds %" PRIu64 "..%" PRIu64 "\n", n_first, n_last);
+    }
+    /* Nodes of the list at scene+0x20, and how many got no copy. */
+    uint64_t nodes = 0, empty = 0, node = f[0x28 / 8];
+    while (node && node != scene + 0x20 && nodes < 100000) {
+        uint64_t n[5];
+        if (!platform_safe_read(node, n, sizeof(n))) break;
+        ++nodes; empty += !n[4];
+        node = n[1];
+    }
+    fprintf(stderr, "  UFC-57: %" PRIu64 " nodes, %" PRIu64 " without a copy\n", nodes, empty);
+}
+static void fault_extra(void *context) {
+    if (gpu_enabled) bbgpu_dump_guest_writes(context);
+    ui_snapshot_report(context);
+}
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
     FILE *f=fopen(path,"rb");
@@ -370,6 +418,7 @@ int main(int argc, char **argv) {
     /* Fault reports and thread dumps name guest offsets from here on. */
     platform_install_fault_handlers(gpu_fault, recover_point, fault_extra, image, round_page(size));
     platform_watchdog_start(0, image);
+    runtime_ui_backpressure_init(image, size); /* UFC-57 */
     if (!cpu_only) {
         char title[128]="PS4 game", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;

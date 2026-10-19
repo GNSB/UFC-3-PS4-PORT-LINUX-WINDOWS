@@ -227,6 +227,17 @@ static void fault(int sig, siginfo_t *info, void *context) {
         snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n", sig, (unsigned long)(rip - (uintptr_t)guest_image), info->si_addr);
     else { platform_describe_address(rip, where, sizeof(where)); snprintf(line, sizeof(line), "Host fault (signal %d) in %s, address %p\n", sig, where, info->si_addr); }
     write_all(line);
+    {
+        const greg_t *g = uc->uc_mcontext.gregs;
+        snprintf(line, sizeof(line), "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
+                 (unsigned long long)g[REG_RAX], (unsigned long long)g[REG_RBX], (unsigned long long)g[REG_RCX], (unsigned long long)g[REG_RDX],
+                 (unsigned long long)g[REG_RSI], (unsigned long long)g[REG_RDI], (unsigned long long)g[REG_RBP], (unsigned long long)g[REG_RSP]);
+        write_all(line);
+        snprintf(line, sizeof(line), "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+                 (unsigned long long)g[REG_R8], (unsigned long long)g[REG_R9], (unsigned long long)g[REG_R10], (unsigned long long)g[REG_R11],
+                 (unsigned long long)g[REG_R12], (unsigned long long)g[REG_R13], (unsigned long long)g[REG_R14], (unsigned long long)g[REG_R15]);
+        write_all(line);
+    }
     if (fault_extra) fault_extra(context);
     Dl_info dl;
     if (rip - (uintptr_t)guest_image >= guest_image_size && !(dladdr((void *)rip, &dl) && dl.dli_fname)) {
@@ -252,6 +263,12 @@ static void fault(int sig, siginfo_t *info, void *context) {
         snprintf(line, sizeof(line), "  #%d %s\n", i, where); write_all(line);
     }
     _exit(128 + sig);
+}
+void platform_fault_registers(void *context, uint64_t out[17]) {
+    static const int order[17] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+                                  REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15, REG_RIP};
+    const greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
+    for (int i = 0; i < 17; ++i) out[i] = (uint64_t)g[order[i]];
 }
 static PlatformStepHandler step_handler;
 static struct sigaction previous_trap;

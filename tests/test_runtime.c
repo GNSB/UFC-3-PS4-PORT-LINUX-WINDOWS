@@ -355,6 +355,38 @@ static void rw_timeouts(void) {
     assert(rw_unlock(&f.lock)==0);
     fixture_destroy(&f);
 }
+/* UFC-57: a UI scene built more than the budget since the last guest flip waits for the next
+ * flip, or for the timeout (and then the following build waits again). */
+static uint64_t ms_since(const struct timespec *t0) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)((t.tv_sec-t0->tv_sec)*1000+(t.tv_nsec-t0->tv_nsec)/1000000);
+}
+static void *late_flip(void *arg) { (void)arg; usleep(10000); runtime_ui_guest_flip(); return NULL; }
+static void ui_backpressure(void) {
+    static const unsigned char call[]={0x49,0x8b,0x7d,0x48,0x48,0x83,0xc7,0x10,0x48,0x89,0x7d,0xa8,0xe8,0xfb,0xcd,0x3b,0x00};
+    const uint64_t size=0x1a3d200;
+    unsigned char *image=calloc(1,size); assert(image);
+    runtime_ui_backpressure_init(image,size); assert(!runtime_ui_build_site); /* another executable */
+    memcpy(image+0x1a3d134,call,sizeof(call));
+    setenv("BB_UI_BACKPRESSURE_BUILDS","2",1); setenv("BB_UI_BACKPRESSURE_MS","50",1);
+    runtime_ui_backpressure_init(image,size); assert(runtime_ui_build_site==(uintptr_t)image+0x1a3d145);
+    int scene, other; struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    for (int i=0;i<10;++i) runtime_ui_before_build(&scene); /* no flip yet: no renderer to wait for */
+    runtime_ui_guest_flip();
+    runtime_ui_before_build(&scene); runtime_ui_before_build(&scene); runtime_ui_before_build(&other);
+    assert(ms_since(&t0)<40);
+    runtime_ui_before_build(&scene); assert(ms_since(&t0)>=45); /* third build: the 50 ms timeout */
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    runtime_ui_before_build(&scene); assert(ms_since(&t0)>=45); /* still no flip: waits again */
+    pthread_t flipper; assert(pthread_create(&flipper,NULL,late_flip,NULL)==0);
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    runtime_ui_before_build(&scene); assert(ms_since(&t0)<40); /* the flip ended the wait */
+    assert(pthread_join(flipper,NULL)==0);
+    runtime_ui_before_build(&scene); assert(ms_since(&t0)<40); /* first build since that flip... */
+    runtime_ui_before_build(&scene); assert(ms_since(&t0)>=45); /* ...then the budget again */
+    runtime_ui_build_site=0; free(image);
+}
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
@@ -381,7 +413,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
-    rw_lifecycle(); rw_concurrency(); rw_timeouts();
-    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
+    rw_lifecycle(); rw_concurrency(); rw_timeouts(); ui_backpressure();
+    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope, UI back-pressure");
     return 0;
 }

@@ -321,7 +321,11 @@ static ABI int32_t posix_attr_type(GuestAttr **attr,int type) { return posix_res
 static ABI int32_t posix_attr_destroy(GuestAttr **attr) { return posix_result(attr_destroy(attr)); }
 static ABI int32_t posix_mutex_init(GuestMutex **out,GuestAttr **attr) { return posix_result(mutex_init(out,attr,NULL)); }
 static ABI int32_t posix_mutex_destroy(GuestMutex **m) { return posix_result(mutex_destroy(m)); }
-static ABI int32_t posix_mutex_lock(GuestMutex **m) { return posix_result(mutex_lock(m)); }
+static ABI int32_t posix_mutex_lock(GuestMutex **m) {
+    /* UFC-57: the UI snapshot builder waits here, before its scene lock, for the renderer. */
+    if ((uintptr_t)__builtin_return_address(0)==runtime_ui_build_site) runtime_ui_before_build(m);
+    return posix_result(mutex_lock(m));
+}
 static ABI int32_t posix_mutex_trylock(GuestMutex **m) { return posix_result(mutex_trylock(m)); }
 static ABI int32_t posix_mutex_unlock(GuestMutex **m) { return posix_result(mutex_unlock(m)); }
 static ABI int32_t posix_cond_init(GuestCond **c, void **a) { return posix_result(cond_init(c, a, NULL)); }

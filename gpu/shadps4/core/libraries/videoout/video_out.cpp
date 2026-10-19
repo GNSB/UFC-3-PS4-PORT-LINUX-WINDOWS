@@ -19,6 +19,8 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
+// UFC-57 (src/runtime_ui.c): each guest flip lets the UI snapshot builder go on.
+extern "C" void runtime_ui_guest_flip(void);
 
 namespace Libraries::VideoOut {
 
@@ -191,6 +193,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
               flipArg);
 
     BbTimeline::Note(BbTimeline::GuestFlip, 0, u64(bufferIndex));
+    runtime_ui_guest_flip();
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
@@ -364,6 +367,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
     }
 
     BbTimeline::Note(BbTimeline::GuestFlip, 1, buf_id);
+    runtime_ui_guest_flip();
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
