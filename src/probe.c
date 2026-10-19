@@ -35,7 +35,8 @@ static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message);
 /* The game's code was compiled for the PS4's CPU (AMD Jaguar) and runs as it is: AVX, BMI1
  * (andn/bextr/blsr/tzcnt), MOVBE, LZCNT and POPCNT, thousands of each in eboot.bin. A CPU without
  * them stops at the first one with SIGILL (exit code 132, issue #26), and lzcnt/tzcnt even run as
- * bsr/bsf there, with other results. Said before the game starts; BB_SKIP_CPU_CHECK=1 skips it. */
+ * bsr/bsf there, with other results. Said before the game starts; BB_SKIP_CPU_CHECK=1 skips it.
+ * Exits with code 24 so the launchers can name the cause (GitHub #21). */
 static void check_cpu(void) {
     const char *skip = getenv("BB_SKIP_CPU_CHECK");
     if (skip && !strcmp(skip, "1")) return;
@@ -65,7 +66,7 @@ static void check_cpu(void) {
             "ERROR: this CPU lacks %s. The game's code was compiled for the PS4's CPU and uses "
             "these instructions directly: it needs an Intel Haswell (4th generation Core, 2013) or "
             "newer, or an AMD Ryzen. BB_SKIP_CPU_CHECK=1 starts anyway.\n", missing);
-    exit(1);
+    exit(24); /* a code of its own: the launchers explain it (GitHub #21) */
 }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
