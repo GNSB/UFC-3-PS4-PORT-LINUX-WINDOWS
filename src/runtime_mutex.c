@@ -189,6 +189,9 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     return e;
 }
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
+    /* UFC-58: the appearance pool's takes and publishes may wait here for its retire. */
+    if ((uintptr_t)__builtin_return_address(0) == runtime_appearance_lock_site && runtime_appearance_lock_site)
+        runtime_appearance_before_lock(mutex, runtime_appearance_lock_site);
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     int r = native_mutex_trylock(&(*mutex)->native);
@@ -202,6 +205,8 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
+    if ((uintptr_t)__builtin_return_address(0) == runtime_appearance_try_site && runtime_appearance_try_site)
+        runtime_appearance_before_lock(mutex, runtime_appearance_try_site);
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     e = orbis_error(native_mutex_trylock(&(*mutex)->native));

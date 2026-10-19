@@ -68,6 +68,16 @@ void runtime_ui_backpressure_init(const unsigned char *image, uint64_t size);
 void runtime_ui_before_build(const void *key);
 void runtime_ui_guest_flip(void);
 void runtime_ui_report(void);
+/* UFC-58 (runtime_appearance.c): takes and publishes of the appearance results wait for their
+ * retire before exhausting the pool. The sites are the return addresses of the game's lock wrapper
+ * into scePthreadMutexTrylock/Lock (0: off). */
+extern uintptr_t runtime_appearance_try_site, runtime_appearance_lock_site;
+void runtime_appearance_init(const unsigned char *image, uint64_t size);
+void runtime_appearance_before_lock(const void *mutex, uintptr_t site);
+/* Before the lock of the pool at `pool` (its this): one of these roles (tests call it directly). */
+enum { RUNTIME_APPEARANCE_PUBLISH, RUNTIME_APPEARANCE_TAKE, RUNTIME_APPEARANCE_RETIRE };
+void runtime_appearance_pool_lock(int role, uintptr_t pool);
+void runtime_appearance_report(void);
 uintptr_t runtime_sema_resolve(const char *name);
 uintptr_t runtime_eventflag_resolve(const char *name);
 uintptr_t runtime_json2_resolve(const char *name);

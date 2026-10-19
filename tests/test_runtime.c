@@ -387,6 +387,68 @@ static void ui_backpressure(void) {
     runtime_ui_before_build(&scene); assert(ms_since(&t0)>=45); /* ...then the budget again */
     runtime_ui_build_site=0; free(image);
 }
+/* UFC-58: a take that would leave the appearance pool's publisher no node, or a publish that would
+ * find none, waits until the retire (seen on another thread) frees nodes, at most the timeout;
+ * after a wait that ran out that pool goes on without waiting until it has room again. */
+static _Alignas(8) unsigned char appearance_obj[0x200], appearance_nodes[4*0x38];
+static void appearance_link(int count, int taken) { /* the oldest `count` nodes listed, the first `taken` taken */
+    const uintptr_t sentinel=(uintptr_t)appearance_obj+0x188;
+    uint64_t *obj=(uint64_t *)appearance_obj;
+    uintptr_t prev=sentinel;
+    for (int i=0;i<count;++i) {
+        unsigned char *node=appearance_nodes+i*0x38;
+        memcpy(node+8,&prev,8);
+        const uint64_t seq=10+i; memcpy(node+0x10,&seq,8);
+        node[0x30]=i<taken;
+        const uintptr_t next=i+1<count ? (uintptr_t)(node+0x38) : sentinel;
+        memcpy(node,&next,8);
+        prev=(uintptr_t)node;
+    }
+    obj[0x188/8]=count ? (uintptr_t)appearance_nodes : sentinel;
+    obj[0x190/8]=count ? prev : sentinel;
+    obj[0x180/8]=taken ? 10+taken-1 : 0; /* last sequence taken */
+    obj[0x198/8]=(uint64_t)count;
+    obj[0x1a0/8]=0; /* free list */
+    obj[0x1a8/8]=(uintptr_t)appearance_nodes+(uint64_t)count*0x38; /* cursor */
+    obj[0x1b0/8]=(uintptr_t)appearance_nodes+4*0x38; /* end */
+    obj[0x1b8/8]=0x38;
+}
+static void *appearance_retire(void *arg) {
+    if (arg) usleep(20000);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_RETIRE,(uintptr_t)appearance_obj);
+    if (arg) appearance_link(1,1); /* everything before the newest taken result retired */
+    return NULL;
+}
+static void appearance_backpressure(void) {
+    const uintptr_t pool=(uintptr_t)appearance_obj;
+    struct timespec t0; pthread_t retirer;
+    appearance_link(4,3); /* three held, the newest untaken: taking it leaves the publisher nothing */
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_TAKE,pool); assert(ms_since(&t0)<40); /* no retire seen yet */
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_RETIRE,pool);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_TAKE,pool); assert(ms_since(&t0)<40); /* retire on this thread */
+    assert(pthread_create(&retirer,NULL,appearance_retire,NULL)==0); assert(pthread_join(retirer,NULL)==0);
+    appearance_link(4,2);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_TAKE,pool); assert(ms_since(&t0)<40); /* two held: room enough */
+    appearance_link(4,3);
+    assert(pthread_create(&retirer,NULL,appearance_retire,(void *)1)==0);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_TAKE,pool); /* waits for that retire */
+    assert(pthread_join(retirer,NULL)==0);
+    assert(ms_since(&t0)>=15 && ms_since(&t0)<200);
+    appearance_link(4,4); /* nothing left for the publisher, and no retire comes: the timeout */
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_PUBLISH,pool); assert(ms_since(&t0)>=240);
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_PUBLISH,pool); assert(ms_since(&t0)<40); /* gave up on this pool */
+    appearance_link(2,1);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_PUBLISH,pool); /* room again: waits come back */
+    appearance_link(4,4);
+    assert(pthread_create(&retirer,NULL,appearance_retire,(void *)1)==0);
+    clock_gettime(CLOCK_MONOTONIC,&t0);
+    runtime_appearance_pool_lock(RUNTIME_APPEARANCE_PUBLISH,pool);
+    assert(pthread_join(retirer,NULL)==0);
+    assert(ms_since(&t0)>=15 && ms_since(&t0)<200);
+}
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
@@ -413,7 +475,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
-    rw_lifecycle(); rw_concurrency(); rw_timeouts(); ui_backpressure();
-    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope, UI back-pressure");
+    rw_lifecycle(); rw_concurrency(); rw_timeouts(); ui_backpressure(); appearance_backpressure();
+    puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope, UI back-pressure, appearance back-pressure");
     return 0;
 }

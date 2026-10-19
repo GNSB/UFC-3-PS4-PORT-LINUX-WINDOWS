@@ -419,6 +419,7 @@ int main(int argc, char **argv) {
     platform_install_fault_handlers(gpu_fault, recover_point, fault_extra, image, round_page(size));
     platform_watchdog_start(0, image);
     runtime_ui_backpressure_init(image, size); /* UFC-57 */
+    runtime_appearance_init(image, size); /* UFC-58 */
     if (!cpu_only) {
         char title[128]="PS4 game", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
