@@ -61,6 +61,13 @@ uint64_t runtime_fp_patch_image(unsigned char *image, uint64_t size, const uint6
                                 const uint64_t *seg_flags, uint64_t segments, const uint64_t *pointers, uint64_t pointer_count,
                                 void *(*map_near)(size_t), RuntimeFpStats *stats);
 int32_t *runtime_errno(void);
+/* UFC-57 (runtime_ui.c): the UI snapshot builder waits for the renderer once it is ahead.
+ * `runtime_ui_build_site` is the return address of the builder's lock call (0: off). */
+extern uintptr_t runtime_ui_build_site;
+void runtime_ui_backpressure_init(const unsigned char *image, uint64_t size);
+void runtime_ui_before_build(const void *key);
+void runtime_ui_guest_flip(void);
+void runtime_ui_report(void);
 uintptr_t runtime_sema_resolve(const char *name);
 uintptr_t runtime_eventflag_resolve(const char *name);
 uintptr_t runtime_json2_resolve(const char *name);
