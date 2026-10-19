@@ -1,12 +1,9 @@
 # UFC-58 — creación de peleador, null write en 0x402882
 
-Estado, segunda vuelta: **ticket sin resolver; no se implementó un arreglo del runtime**.
-Se amplió el seguimiento estático hasta los llamadores de toma y retiro y sus
-condiciones guest. No se identificó un fence/evento del port que las bloquee.
-No se ejecutó
-el juego. La causa inmediata es la falta de un nodo en un pool guest de cuatro
-resultados de cambios de aspecto. Falta determinar por qué el consumidor no libera
-resultados a tiempo; el log disponible no permite atribuirlo a una API del runtime.
+Estado, tercera vuelta (2026-10-19): **arreglo en el runtime** (`src/runtime_appearance.c`):
+contrapresión entre quienes toman/publican resultados de aspecto y quien los retira, enganchada
+en el lock del pool y verificada por bytes. Sin probar en el juego todavía. Las secciones de la
+primera y segunda vuelta quedan abajo como estaban; la tercera está al final.
 
 ## Evidencia y alcance
 
@@ -289,3 +286,109 @@ CMake de terceros. `git diff --check`: OK. Log de build local:
 figuraba modificado al comenzar; no se tocó manualmente. No se ejecutó el juego,
 no se usaron agentes paralelos y no se cambió el índice, la rama ni la historia
 git. Los cambios quedan en el worktree para el despachador.
+
+## Tercera vuelta — quién consume el pool, en qué hilo, y el arreglo (2026-10-19)
+
+Análisis estático sobre `out/boot-linked.bin` con las relocaciones aplicadas (imagen plana,
+offsets = offsets guest). No se ejecutó el juego.
+
+### Los tres actores del pool
+
+| rol | código | cuándo | hilo |
+|---|---|---|---|
+| **publica** (toma nodo; crash si no hay) | `0x402710`, desde `0x4021c0` (vtable `+0x30`) | cuando terminan los trabajos de GPU/deformación que lanzó (`+0x2e4` llega a 0) | **RenderThread** (log #26) |
+| **toma** (marca `node+0x30=1`, guarda la secuencia en `ctx+0x168`) | `0x403210` (vtable `+0x38`) desde la tarea `0x438270` | cada update del personaje: `0x437d40` → `0x437fc0` encola la tarea (prioridad 2) en la cola `obj+0x27f8`; la drena el sistema `0x444090` (vtable `0x2427008`, slot `+0x38`) → `0x465170` → `0x4655c0` | el que drena esa cola (lado sim) |
+| **retira** (libera todos los nodos hasta la secuencia de `ctx+0x168`) | `0x4032a0` (vtable `+0x40`) desde `0x409740` (`+0x118`) | update del componente `0x409280(dt)` → `0x121cbe0`, sólo si `skinning_method` (`+0xbd4`) y `0x698f0` dan true | el del update del componente |
+
+- El productor no corre "suelto": en #26 la pila es el bucle principal de RenderThread
+  (`0x450b9e` → tabla de callbacks `0x4a0987` → `0x62d20` → `0x630a0` → `0x1499f0`) que **entrega los
+  mensajes sim→render** de los stream groups (`0x68fc0` → callback global `[0x29828f8]+0x10`,
+  `0x69110`) al componente: el handler `0x407250..` compara FourCC y el mensaje `'RPOC'`
+  (`0x407381`) llama `0x405b70` → `0x4021c0` → publicar. Es decir, **cada paso de simulación
+  encolado puede publicar un resultado** cuando RenderThread lo procesa.
+- `0x698f0` (la condición del retiro, lo que faltaba): `[0x29828f0]` es el servicio
+  **`CoreSystems:IStreamGroups`** (registro `0x49fd79`, clase `0x2506b58` creada en `0x126f150`).
+  `+0x50` (`0x126f7f0`) copia el estado actual (24 bytes, `entry+0x98`) del grupo `component+0x3c`;
+  si está vacío devuelve false. `+0x38` (`0x126f760`) devuelve el objeto del grupo y se le pregunta
+  `+0xe0(handle=component+0x20, estado)`: **¿está esta entidad en el estado que el sim ya publicó
+  para este grupo?** Los grupos se configuran desde datos (`deltaCompression`, `liveCount`,
+  `replaySize`, `SimThread::GetLoopFrequency`…): es el streaming de estado del hilo de simulación
+  al de render. La clase concreta del objeto de grupo viene de esa configuración (campo `+0x40`
+  de cada entrada) y no se resolvió estáticamente; no hay en esa cadena labels, EOP ni esperas
+  de kernel.
+- El pool se agota sólo con **cuatro resultados tomados sin un retiro en medio**: el productor
+  recicla todo lo no tomado antes de pedir nodo, y el retiro libera hasta la última toma. Toma
+  y publicación avanzan con los pasos de simulación; el retiro va con el update del componente y
+  se salta si el estado del stream no está. Cuando RenderThread procesa varios pasos sim
+  atrasados de una vez (publica varias veces) mientras el lado sim sigue tomando, y el retiro no
+  llega entre medio, se juntan las cuatro tomas: es **el patrón de UFC-57** (el render del port
+  se queda atrás del sim; en la PS4 van parejos), con otro pool.
+
+### Qué lo atrasa en el port, y el límite de la evidencia
+
+El log de #26 no tiene esperas largas registradas (`Wait over`, readbacks de segundos como en
+#16): no se puede afirmar con ese log qué frenó al lado que retira. Lo que sí muestra justo antes
+del fault es un pico de readbacks (`Buffer downloads (5 s): 416 with payload, 29651200 bytes`, frente
+a ~650 KB en los intervalos previos) en el momento del cambio. Tampoco se pudo fijar estáticamente
+el hilo del update del componente (el que retira) frente al del drenaje de tareas (el que toma):
+**el arreglo lo mide en ejecución** y lo escribe en el log (abajo).
+
+### El arreglo (src/runtime_appearance.c)
+
+Contrapresión en el runtime, sin tocar el juego (no se agranda el pool ni se salta el null):
+
+- Publicar, tomar y retirar toman el mismo lock `this+0xd0` por el wrapper EA `0x443f0` →
+  `0x44470` → `scePthreadMutexTrylock` (retorno `0x444cc`) / `scePthreadMutexLock` (`0x444a4`).
+  En esas dos funciones del runtime (`runtime_mutex.c`), si la dirección de retorno es la del
+  wrapper, `runtime_appearance_before_lock` busca en la pila el slot de retorno del wrapper (marco
+  fijo: `[Z+0x40]` es el retorno de `0x44470`; si es `0x44420`, `[Z+0x70]` es el del llamador) y
+  reconoce a `0x4027a1` (publicar), `0x403239` (tomar) o `0x4032c9` (retirar). Todos esos bytes
+  (los marcos de `0x443f0`/`0x44470`, las tres llamadas, el `xor r8d,r8d; mov [r8],r10` y el
+  `mov byte [rax+0x30],1` de la toma) se verifican al arrancar; si no coinciden (otro eboot), queda apagado.
+- Antes del lock lee el pool (sin lock, enlaces validados dentro de los 4 nodos):
+  - una **toma** que dejaría al publicador sin nodo (`would_take` y espacio ≤ 1) **espera** a que
+    el retiro libere;
+  - una **publicación** que no encontraría nodo (espacio 0, el caso del crash) también espera.
+  Espacio = nodos no tomados (los recicla) + cabeza de la lista libre + cursor sin usar.
+- Sólo espera si el retiro ya se vio en **otro hilo** (si es el mismo, la espera no podría
+  terminar). Tope `BB_APPEARANCE_BACKPRESSURE_MS` (250 ms por defecto); si se agota, ese pool
+  sigue sin esperar hasta que vuelva a tener espacio (no se acumulan tirones).
+  `BB_APPEARANCE_BACKPRESSURE=0` lo apaga.
+- Log: `Appearance back-pressure (UFC-58): on…` al arrancar; una línea por pool con **el hilo de
+  publicar, tomar y retirar** (`publish on thread N RenderThread, take on …, retire on …`); la
+  primera espera, cada 256, y cada una que se agote; al salir, el total en el informe del runtime.
+- `tests/test_runtime.c` (`appearance_backpressure`): toma que espera hasta que otro hilo retira,
+  sin espera con espacio o con el retiro en el mismo hilo, publicación que se agota a los 250 ms
+  y no vuelve a esperar hasta recuperar espacio.
+
+No se hizo rebase/merge con UFC-57: el mecanismo no es el de `runtime_ui.c` (allí la señal es el
+flip; aquí el estado del pool en el lock), así que no hay código que compartir. Si se mergean
+las dos ramas, los conflictos son: la línea r8–r15 de `platform_win.c` (dejar una sola; la de
+UFC-58 imprime `r8 =`, la de UFC-57 `r8=`), los includes/declaraciones de `runtime.h`, las
+llamadas de init en `probe.c`, los reportes en `runtime.c`, `posix_mutex_lock` en
+`runtime_mutex.c` (UFC-57) junto a `mutex_lock`/`mutex_trylock` (UFC-58), y `ms_since` en
+`tests/test_runtime.c`, definida en ambas (dejar una).
+
+### Prueba
+
+Windows o Linux, una sesión: **Career > crear peleador > aspecto**; mover sliders entre extremos
+rápido y varias veces, cambiar presets varias veces, volver a los sliders y repetir; salir y volver
+a crear/editar. Debe aplicar los cambios y no aparecer el fault `0x402882`. En el log buscar:
+
+- `Appearance back-pressure (UFC-58): on` — si no aparece, el eboot no es el 1.14 verificado.
+- `pool …: publish on thread …, take on …, retire on …` — responde en qué hilo corre cada rol.
+- `a take/publish waited … ms for the retire` — el arreglo actuó. Si dice `ran out` y después
+  crashea, el retiro no estaba llegando (p. ej. `0x698f0` false) y el informe fatal de la primera
+  vuelta (`UFC-58 appearance pool` con los cuatro `taken=1`) más esa línea de hilos dicen qué falta.
+- Si crashea y **no** hay línea de hilos con `retire`, el retiro nunca corrió en ese pool:
+  la causa es la condición del retiro, no la velocidad, y la contrapresión no aplica.
+
+### Validación de la tercera vuelta
+
+`ufc3-build --test`: compila `out/sacredfire` (salida del build OK, versión
+`ufc3-v0.1.6-2-gca38d27-dirty` antes del commit); `runtime-test` **PASS** incluyendo
+`appearance back-pressure`. Después `file-mods-test` falla en `tests/test_file_mods.c:54`
+(`rmdir` de los directorios del usuario de prueba): esa prueba sólo enlaza `test_file_mods.c` y
+`platform_posix.c`, que no se tocaron; por el `set -e` no corrieron las pruebas siguientes
+(sema, eventflag, fp, red). La compilación Windows no se hizo aquí (el archivo entra por el glob
+`src/runtime*.c` de `gpu/CMakeLists.txt`). No se ejecutó el juego.

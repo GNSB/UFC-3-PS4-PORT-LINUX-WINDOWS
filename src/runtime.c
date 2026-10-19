@@ -81,6 +81,7 @@ void runtime_report(void) {
     runtime_mutex_report();
     runtime_rwlock_report();
     runtime_sema_report();
+    runtime_appearance_report();
     runtime_eventflag_report();
     runtime_content_report();
     runtime_memory_report();
