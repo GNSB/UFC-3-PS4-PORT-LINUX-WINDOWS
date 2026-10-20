@@ -7,14 +7,17 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include <SDL3/SDL.h>
 #include <cstdlib>
 #include <cstring>
 #include "bbport_settings.h"
 #include "imgui.h"
+#include "imgui_internal.h" // RegisterUserTexture (the trophy icons)
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -67,6 +70,24 @@ float base_scale = 1.0f;
 std::mutex prompt_mutex;
 std::atomic<bool> prompt_active{false};
 std::string prompt_title, prompt_text;
+
+// UFC-82: trophy toasts, one at a time for ToastSeconds each, queued by ShowTrophy (any thread).
+struct TrophyToast {
+    int id = -1;
+    std::string name;
+    std::vector<u8> rgba;
+    int w = 0, h = 0;
+};
+constexpr float ToastSeconds = 4.0f;
+constexpr int ToastIconSize = 128; // icons are scaled to this once (PS4 trophy icons: 240x240)
+std::mutex toast_mutex;
+std::deque<TrophyToast> toast_queue;
+std::atomic<bool> toast_waiting{false}, toast_showing{false};
+// Present thread (imgui_mutex): the toast on screen and the icon textures, one per trophy id,
+// created once and kept (a texture is never rewritten while a frame in flight may sample it).
+TrophyToast toast_current;
+std::chrono::steady_clock::time_point toast_start{};
+std::unordered_map<int, ImTextureData*> toast_icons;
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
@@ -606,6 +627,9 @@ void Menu() {
 
     ImGui::SeparatorText(BbSettings::MenuText("Other", "Прочее"));
     Checkbox(BbSettings::MenuText("FPS counter in corner", "Счётчик FPS в углу"), s.show_fps);
+    Checkbox(BbSettings::MenuText("Trophy notifications", "Уведомления о трофеях"), s.trophy_notifications);
+    Hint(BbSettings::MenuText("Unlocked trophies are saved to trophies.json either way.",
+                              "Полученные трофеи сохраняются в trophies.json в любом случае."));
     // SacredFire: the Steam Deck sometimes shows a controller connected after launch only to a
     // fresh enumeration; the runtime restarts SDL's gamepad subsystem on the next input sample.
     if (ImGui::Button(BbSettings::MenuText("Rescan controllers", "Переопознать контроллеры"))) {
@@ -690,7 +714,97 @@ void TextPrompt() {
     ImGui::End();
 }
 
+ImTextureData* ToastIcon(const TrophyToast& toast) {
+    if (toast.rgba.empty() || toast.w <= 0 || toast.h <= 0) {
+        return nullptr;
+    }
+    if (const auto it = toast_icons.find(toast.id); it != toast_icons.end()) {
+        return it->second;
+    }
+    auto* tex = IM_NEW(ImTextureData)();
+    tex->Create(ImTextureFormat_RGBA32, ToastIconSize, ToastIconSize);
+    u8* dst = static_cast<u8*>(tex->GetPixels());
+    // Box filter: each output pixel averages the source pixels it covers.
+    for (int y = 0; y < ToastIconSize; ++y) {
+        const int y0 = y * toast.h / ToastIconSize, y1 = std::max(y0 + 1, (y + 1) * toast.h / ToastIconSize);
+        for (int x = 0; x < ToastIconSize; ++x) {
+            const int x0 = x * toast.w / ToastIconSize, x1 = std::max(x0 + 1, (x + 1) * toast.w / ToastIconSize);
+            u32 sum[4] = {};
+            for (int sy = y0; sy < y1; ++sy) {
+                for (int sx = x0; sx < x1; ++sx) {
+                    const u8* src = &toast.rgba[(size_t(sy) * toast.w + sx) * 4];
+                    for (int c = 0; c < 4; ++c) sum[c] += src[c];
+                }
+            }
+            const u32 count = u32((y1 - y0) * (x1 - x0));
+            for (int c = 0; c < 4; ++c) dst[(size_t(y) * ToastIconSize + x) * 4 + c] = u8(sum[c] / count);
+        }
+    }
+    tex->UseColors = true;
+    ImGui::RegisterUserTexture(tex);
+    toast_icons.emplace(toast.id, tex);
+    return tex;
+}
+
+// The next queued toast once the current one has been shown for ToastSeconds.
+void NextToast(std::chrono::steady_clock::time_point now) {
+    if (toast_showing && std::chrono::duration<float>(now - toast_start).count() < ToastSeconds) {
+        return;
+    }
+    std::scoped_lock lock{toast_mutex};
+    toast_showing = !toast_queue.empty();
+    if (toast_showing) {
+        toast_current = std::move(toast_queue.front());
+        toast_queue.pop_front();
+        toast_start = now;
+        ToastIcon(toast_current); // registered before the frame that draws it
+    }
+    toast_waiting = !toast_queue.empty();
+}
+
+void Toast(std::chrono::steady_clock::time_point now) {
+    const float t = std::chrono::duration<float>(now - toast_start).count();
+    // Fades in and out over a quarter second.
+    const float alpha = std::clamp(std::min(t, ToastSeconds - t) / 0.25f, 0.0f, 1.0f);
+    ImTextureData* icon = ToastIcon(toast_current);
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 24.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, viewport->WorkPos.y + pad),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.85f * alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::Begin("##trophy", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    if (icon) {
+        const float side = 64.0f * base_scale;
+        ImGui::Image(ImTextureRef(icon), ImVec2(side, side));
+        ImGui::SameLine();
+    }
+    ImGui::BeginGroup();
+    ImGui::Text(BbSettings::MenuText("Trophy unlocked: #%d", "Трофей получен: #%d"), toast_current.id);
+    if (!toast_current.name.empty()) {
+        ImGui::TextUnformatted(toast_current.name.c_str());
+    }
+    ImGui::EndGroup();
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 } // namespace
+
+void ShowTrophy(int id, std::string name, std::vector<u8> rgba, int w, int h) {
+    if (!BbSettings::Get().trophy_notifications) {
+        return;
+    }
+    std::scoped_lock lock{toast_mutex};
+    if (toast_queue.size() >= 16) {
+        return; // a burst (a save unlocking many at once): the rest stay in the log
+    }
+    toast_queue.push_back({id, std::move(name), std::move(rgba), w, h});
+    toast_waiting = true;
+}
 
 void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
     {
@@ -743,7 +857,7 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     info.Device = instance.GetDevice();
     info.QueueFamily = instance.GetGraphicsQueueFamilyIndex();
     info.Queue = instance.GetGraphicsQueue();
-    info.DescriptorPoolSize = 16;
+    info.DescriptorPoolSize = 16 + 128; // UFC-82: + one icon per trophy (ORBIS_NP_TROPHY_NUM_MAX)
     info.MinImageCount = std::max(image_count, 2u);
     info.ImageCount = std::max(image_count, 2u);
     info.UseDynamicRendering = true;
@@ -869,7 +983,7 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps || toast_waiting || toast_showing);
 }
 
 bool MenuOpen() {
@@ -909,6 +1023,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         base_scale = scale;
     }
 
+    NextToast(now);
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (menu_open) {
@@ -919,6 +1034,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (prompt_active && !menu_open) {
         TextPrompt();
+    }
+    if (toast_showing) {
+        Toast(now);
     }
     ImGui::Render();
 

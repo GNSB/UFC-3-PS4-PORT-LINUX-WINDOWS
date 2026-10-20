@@ -3,6 +3,7 @@
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
+#include "common/aes.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
 #ifndef _WIN32
@@ -446,6 +447,30 @@ extern "C" int bbgpu_text_input_poll(char* out, uint64_t size) {
         out[n] = 0;
     }
     return state;
+}
+
+extern "C" void bbgpu_trophy_toast(int32_t id, const char* name, const void* png, uint64_t png_size) {
+    std::vector<u8> rgba;
+    int w = 0, h = 0;
+    if (png && png_size) {
+        const auto* bytes = static_cast<const u8*>(png);
+        if (!Frontend::DecodePngRgba(std::vector<u8>(bytes, bytes + png_size), rgba, w, h)) {
+            rgba.clear();
+            std::printf("Overlay: trophy %d icon is not a PNG the overlay reads\n", id);
+        }
+    }
+    BbOverlay::ShowTrophy(id, name ? name : "", std::move(rgba), w, h);
+}
+
+extern "C" int bbgpu_trophy_decrypt(const uint8_t key[16], const char np_comm_id[16], const uint8_t iv[16],
+                                    const uint8_t* in, uint64_t size, uint8_t* out) {
+    if (!size || size % 16) return 0;
+    u8 trophy_key[16];
+    const u8 zero_iv[16] = {};
+    if (aes::encrypt_cbc(reinterpret_cast<const u8*>(np_comm_id), 16, key, 16, zero_iv, trophy_key, 16, false) != aes::kErrorOk) return 0;
+    const bool ok = aes::decrypt_cbc(in, static_cast<unsigned long>(size), trophy_key, 16, iv, out, static_cast<unsigned long>(size), nullptr) == aes::kErrorOk;
+    std::memset(trophy_key, 0, sizeof trophy_key);
+    return ok ? 1 : 0;
 }
 
 #ifdef _WIN32

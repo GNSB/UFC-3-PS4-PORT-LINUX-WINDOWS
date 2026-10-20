@@ -66,6 +66,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
+    } else if (key == "trophy_notifications") {
+        v.trophy_notifications = i != 0;
     } else if (key == "fps_unlocked") {
         v.fps_unlocked = i != 0;
     } else if (key == "menu_pos") {
@@ -255,6 +257,7 @@ void Save() {
     put("reactive_max", fixed(v.reactive_max, 2));
     put("debug_view", std::to_string(v.debug_view.load()));
     put("show_fps", flag(v.show_fps));
+    put("trophy_notifications", flag(v.trophy_notifications));
     put("fps_unlocked", flag(v.fps_unlocked)); // read by run.sh and the Windows launcher at start
     put("fsr4_auto_exposure", flag(v.fsr4_auto_exposure));
     put("fsr4_invert_jitter", flag(v.fsr4_invert_jitter));

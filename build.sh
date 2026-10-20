@@ -149,6 +149,9 @@ if [[ ${1:-} == --test ]]; then
     out/deterministic-fp-test
     "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
+    # UFC-82: the .trp parser on a synthetic file and trophies.json (bbgpu stubbed in the test).
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_trophy.c src/runtime_trophy.c src/platform/platform_posix.c -o out/trophy-test
+    out/trophy-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_eventflag.c "${runtime[@]}" out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/eventflag-test
     out/eventflag-test
     # ufc3 online: the PS4 network ABI (without the local server) and the Blaze/EASO server.

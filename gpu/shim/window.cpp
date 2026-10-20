@@ -118,12 +118,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 // sacredfire: a small PNG reader for the window icon (8-bit RGB or RGBA, no interlace; the PS4's
 // icon0.png is 512x512 RGB). The game's files never enter the repository, so the icon is read from
 // the game folder at start. Anything unexpected leaves the default icon.
-static bool ReadPngRgba(const char* path, std::vector<u8>& rgba, int& width, int& height) {
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return false;
-    }
-    std::vector<u8> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+// UFC-82: the trophy icons in the .trp (the toast, bbgpu_trophy_toast) use it too.
+bool DecodePngRgba(const std::vector<u8>& data, std::vector<u8>& rgba, int& width, int& height) {
     static constexpr u8 signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
     if (data.size() < 8 + 25 || std::memcmp(data.data(), signature, 8) != 0) {
         return false;
@@ -207,7 +203,9 @@ static bool ReadPngRgba(const char* path, std::vector<u8>& rgba, int& width, int
 void WindowSDL::SetIcon(const char* png_path) {
     std::vector<u8> rgba;
     int w = 0, h = 0;
-    if (!ReadPngRgba(png_path, rgba, w, h)) {
+    std::ifstream file(png_path, std::ios::binary);
+    const std::vector<u8> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (!file || !DecodePngRgba(data, rgba, w, h)) {
         LOG_INFO(Frontend, "Window icon: {} not usable, keeping the default", png_path);
         return;
     }
