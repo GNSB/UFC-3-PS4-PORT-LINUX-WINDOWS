@@ -66,6 +66,18 @@ public:
         return (*first_level_map[l1_page])[l2_page];
     }
 
+    /// ufc3 (UFC-65): every allocated entry with its page number (diagnostics, slow).
+    template <typename Func>
+    void ForEachEntry(Func&& func) const {
+        for (size_t l1_page = 0; l1_page < first_level_map.size(); ++l1_page) {
+            if (const L1Page* l2 = first_level_map[l1_page]) {
+                for (size_t l2_page = 0; l2_page < NumEntriesPerL1Page; ++l2_page) {
+                    func((l1_page << SecondLevelBits) | l2_page, (*l2)[l2_page]);
+                }
+            }
+        }
+    }
+
 private:
     std::vector<L1Page*> first_level_map{};
     Common::ObjectPool<L1Page> page_alloc;

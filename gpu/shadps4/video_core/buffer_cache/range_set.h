@@ -45,6 +45,10 @@ struct RangeSet {
         return m_ranges_set.empty();
     }
 
+    size_t Count() const { // ufc3 (UFC-65): intervals held
+        return m_ranges_set.iterative_size();
+    }
+
     void Clear() {
         m_ranges_set.clear();
     }

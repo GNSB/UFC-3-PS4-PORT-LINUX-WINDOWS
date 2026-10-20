@@ -247,6 +247,8 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    /// ufc3 (UFC-65): every BB_GROWTH_SECONDS (60; 0 off), what the caches hold (OnSubmit).
+    void ReportGrowth();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;

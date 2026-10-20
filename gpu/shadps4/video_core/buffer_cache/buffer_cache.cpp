@@ -1799,6 +1799,24 @@ u32 BufferCache::VramIdleSeconds() {
     return seconds;
 }
 
+BufferCache::GrowthCounters BufferCache::CountGrowth() {
+    GrowthCounters c;
+    c.arenas = arenas.size();
+    c.resident_intervals = resident_ranges.Size();
+    c.in_place_intervals = in_place_blocks.Size();
+    c.gpu_written_intervals = gpu_written_bytes.Size();
+    c.asset_intervals = asset_bytes.Size();
+    c.gpu_write_ranges = gpu_write_frames.size();
+    c.residency_chunks = residency_chunks.size();
+    {
+        std::shared_lock rl{gpu_ranges_mutex};
+        c.gpu_ranges = gpu_modified_ranges.Count();
+    }
+    std::scoped_lock lk{dynamic_mutex};
+    c.cpu_write_blocks = cpu_write_frames.size();
+    return c;
+}
+
 void BufferCache::NoteUse(VAddr address, u64 size) {
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
     const u64 last = std::min<u64>((address + size - 1) >> USE_GROUP_BITS, group_use.size() - 1);

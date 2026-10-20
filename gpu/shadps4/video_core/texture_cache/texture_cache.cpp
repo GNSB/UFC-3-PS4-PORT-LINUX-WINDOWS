@@ -1738,6 +1738,44 @@ void TextureCache::GarbageCollectImages() {
     if (BbToggle::Disabled(BbToggle::TextureCollector)) {
         return;
     }
+    // ufc3 (UFC-65): below the trigger nothing was ever evicted. On integrated GPUs (Steam Deck,
+    // Radeon 680M) the trigger is 70 % of a budget of several GB, so the images of every fighter
+    // and arena stayed registered for the whole session (25 -> 3000 in 12 minutes of a Windows
+    // log, under the trigger all along), and the 1 MiB lookup pages of the game's texture pool
+    // collected them: each lookup miss, CPU write notice and GPU-written binding walks those
+    // lists. Every 5 s, up to 64 images the CPU has overwritten since their last use (CpuDirty:
+    // the next use uploads them again from memory anyway, so nothing is lost) and unused for
+    // BB_GC_STALE_SECONDS (60, 1..63; 0 off) go, at any memory usage. A CpuDirty image is never
+    // SafeToDownload (the CPU's write superseded any GPU data); MSAA images are never refreshed
+    // from memory, so they stay.
+    static const u64 stale_seconds = [] {
+        const char* env = std::getenv("BB_GC_STALE_SECONDS");
+        const u64 value = env ? std::strtoull(env, nullptr, 10) : 60;
+        return value == 0 ? 0 : std::clamp<u64>(value, 1, 63);
+    }();
+    const u64 stale_tick =
+        gc_tick_at_second[(second - stale_seconds) % gc_tick_at_second.size()];
+    if (stale_seconds != 0 && second - stale_scan_second >= 5 && stale_tick != 0) {
+        stale_scan_second = second;
+        std::scoped_lock lock{mutex};
+        ImageIds stale;
+        u32 visited = 0;
+        lru_cache.ForEachItemBelow(stale_tick, [&](ImageId image_id) {
+            if (++visited > 16384 || stale.size() >= 64) {
+                return true;
+            }
+            const Image& image = slot_images[image_id];
+            if (True(image.flags & ImageFlagBits::CpuDirty) && image.info.num_samples == 1 &&
+                !image.binding.is_bound && !image.binding.is_target) {
+                stale.push_back(image_id);
+            }
+            return false;
+        });
+        for (const ImageId image_id : stale) {
+            FreeImage(image_id);
+        }
+        stale_freed += stale.size();
+    }
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1891,6 +1929,44 @@ void TextureCache::GarbageCollectSamplers() {
         configure(true);
         sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+}
+
+TextureCache::GrowthCounters TextureCache::CountGrowth() {
+    GrowthCounters c;
+    {
+        std::scoped_lock lk{samplers_mutex};
+        c.samplers = samplers.size();
+    }
+    std::scoped_lock lock{mutex};
+    const u64 idle_tick = gc_tick_at_second[(gc_second - 60) % gc_tick_at_second.size()];
+    // Registered images are in the page lists (and not erased while registered); each is
+    // counted at its first page.
+    page_table.ForEachEntry([&](u64 page, const ImageIds& ids) {
+        if (ids.empty()) {
+            return;
+        }
+        ++c.pages;
+        c.page_entries += ids.size();
+        c.longest_page = std::max<u64>(c.longest_page, ids.size());
+        for (const ImageId image_id : ids) {
+            Image& image = slot_images[image_id];
+            if ((image.info.guest_address >> Traits::PageBits) != page) {
+                continue;
+            }
+            ++c.images;
+            c.image_mib += image.info.guest_size;
+            c.idle_images += idle_tick != 0 && image.lru_touched_tick < idle_tick;
+            c.dirty_images += True(image.flags & ImageFlagBits::CpuDirty);
+            c.gpu_images += image.SafeToDownload();
+            c.tracked_images += image.IsTracked();
+        }
+    });
+    c.image_mib >>= 20;
+    c.views = slot_image_views.size();
+    c.stale_freed = std::exchange(stale_freed, 0);
+    c.used_mib = total_used_memory >> 20;
+    c.trigger_mib = trigger_gc_memory >> 20;
+    return c;
 }
 
 void TextureCache::NoteVramShort() {

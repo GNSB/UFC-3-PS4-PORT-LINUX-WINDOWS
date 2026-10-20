@@ -2077,6 +2077,7 @@ void Rasterizer::OnSubmit() {
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
+    ReportGrowth();
 }
 
 const PreparedStage* Rasterizer::FindPreparedStage(const Shader::Info& stage) const {
