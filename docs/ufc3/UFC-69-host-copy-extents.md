@@ -9,11 +9,16 @@ literalmente en el mensaje del commit. Este worktree se entrega sin commit.
 ## Implementación
 
 - `src/runtime.c`, `src/runtime.h`, `src/runtime_memory.c`: las tres primitivas
-  guest `memcpy`, `memmove` y `memset` anuncian su destino durante la llamada
-  host, mediante `runtime_memory_host_copy_begin/end`. El extent es thread-local,
-  con signal fences, y al terminar se notifican las ventanas que siguen abiertas.
-  Se conserva `runtime_guest_copy_range`, que ya usa el port para comprobar
-  solapamientos exactos. `BB_HOST_COPY_EXTENTS=0` desactiva el mecanismo nuevo.
+  guest `memcpy`, `memmove` y `memset` usan el único rango thread-local
+  existente, `copy_begin/copy_end`, con sus signal fences. Tanto
+  `FaultInHostCopy` como `NoteFaultingHostCopy` consultan
+  `runtime_guest_copy_range()`, que también usa `DecideWriteStep`.
+  Después de `copy_range_clear()`, una única llamada a
+  `runtime_memory_host_copy_done(dst, size)` notifica las ventanas abiertas.
+  `runtime_memory.c` sólo conserva el hook de finalización, el contador de
+  ventanas abiertas y el interruptor `BB_HOST_COPY_EXTENTS=0`; no duplica el
+  rango. `runtime_memory_host_copy_enabled()` consulta si el hook está puesto:
+  sin hook, `FaultInHostCopy` devuelve false aunque haya una copia en curso.
 - `gpu/shadps4/video_core/page_manager.{cpp,h}`: cada `WriteWindow::known`
   recuerda los granules completos de 8 bytes escritos por una copia. Al cerrar,
   esos bytes pasan a la CPU aunque su valor no haya cambiado; el diff procesa el
@@ -30,8 +35,9 @@ literalmente en el mensaje del commit. Este worktree se entrega sin commit.
   conservar los granules conocidos sin exigir un cambio de valor.
 - Tests: `tests/test_write_window_merge.cpp`, `tests/test_runtime.c` y
   `tests/test_gpu_runtime_stubs.cpp`. Cubren reescrituras del mismo valor durante
-  un readback, payloads parciales, aislamiento entre threads, callbacks de las
-  tres primitivas y extents vacíos; conservan las regresiones UFC-48/UFC-61.
+  un readback, payloads parciales, callbacks de las tres primitivas después
+  de limpiar el rango, hook desactivado, ausencia de ventanas abiertas y rangos
+  vacíos o con overflow; conservan las regresiones UFC-48/UFC-61.
 
 Los modos `BB_WRITE_WINDOW=1` y `2` usan el mismo ownership nuevo. El modo 2
 sigue requiriendo rango exacto; no se relaja su comprobación de los bytes vecinos
@@ -39,7 +45,7 @@ que un cierre devolvería a la GPU. Sólo se marcan como conocidos granules
 completamente incluidos en la copia: los extremos parciales siguen por diff.
 
 La telemetría de ventanas, cada cinco segundos junto a las estadísticas
-existentes, incluye siempre (incluso en cero):
+existentes, incluye esta línea sólo si `copy_windows || copy_bytes`:
 
 ```text
 Write windows: N/s opened by libc copies, K KiB/s of their bytes known (no readback)
@@ -116,22 +122,29 @@ env -u BB_HOST_COPY_EXTENTS BB_WRITE_WINDOW=2 BB_FRAME_STATS=1 BB_SAVE_LOG=1 BB_
 
 Verificar la línea nueva de libc, altas de sitios bloqueados, `faults/s of barred
 sites read back`, `Readback sites`, tiempo en write faults, FPS y peores frames.
-Con extents apagados la línea nueva debe quedar en cero y aparecer el mensaje de
-apagado; con ellos activos debe registrar aperturas/bytes si se ejecuta ese
-camino. Buscar menor coste y menos readbacks de libc en las mismas escenas.
+Con extents apagados la línea nueva no debe aparecer, y debe aparecer el mensaje
+de apagado. Con ellos activos debe registrar aperturas/bytes si se ejecuta ese
+camino; tampoco se imprime si ambos contadores están en cero, para evitar
+líneas periódicas sin actividad (observación de PORTHEON 3.2.1). Buscar menor coste y menos readbacks de libc en las mismas escenas.
 Confirmar sangre/sudor, piel del luchador creado, ausencia de cuelgues y segunda
 pelea correcta en ambos modos. Este ticket no aporta mediciones de FPS del juego.
 
 ## Validación en este worktree
 
+Validación repetida tras la revisión del Jefe del 2026-10-20:
+
 - `ufc3-build`: OK, salida 0.
 - `ufc3-build --test`: OK, salida 0. Incluye `write window merge: ok`,
   tests de runtime con extents activos, y todos los demás checks del wrapper.
+- `env -u BB_HOST_COPY_EXTENTS out/gpu/write-window-merge-test`: OK,
+  `write window merge: ok`, salida 0.
+- `env BB_HOST_COPY_EXTENTS=0 out/gpu/write-window-merge-test`: OK,
+  `write window merge: ok`, salida 0. El test de merge es independiente de
+  variables de entorno; ejercita las regresiones de ambos modos.
 - `env BB_HOST_COPY_EXTENTS=0 out/runtime-test`: OK, salida 0. Verifica también
-  que no se publique un extent ni se llamen callbacks en el caso desactivado.
+  que el hook esté desactivado y no se llamen callbacks en ese caso.
 - `git diff --check`: OK.
 
-La compilación emitió warnings de políticas CMake y de ODR de FidelityFX; no
-hubo errores. No se ejecutó el juego. El A/B de rendimiento y la verificación
+La compilación emitió warnings de políticas CMake; no hubo errores. No se ejecutó el juego. El A/B de rendimiento y la verificación
 visual de sangre/sudor, piel y segunda pelea quedan para el usuario, con los
 cuatro comandos anteriores. No se cambió de rama ni se modificó el índice.

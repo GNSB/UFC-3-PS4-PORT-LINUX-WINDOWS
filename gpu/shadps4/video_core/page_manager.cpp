@@ -81,7 +81,8 @@ extern "C" void runtime_memory_set_write_watch(uintptr_t address, uint64_t size,
 extern "C" void runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
 // ufc4 (runtime_memory.c): the libc copy running on this thread (guest_memcpy and friends), and
 // the hook a finished copy calls while write windows are open.
-extern "C" int runtime_memory_host_copy_extent(uintptr_t* begin, uintptr_t* end);
+extern "C" int runtime_guest_copy_range(uintptr_t* begin, uintptr_t* end);
+extern "C" int runtime_memory_host_copy_enabled(void);
 extern "C" void runtime_memory_set_host_copy_hook(void (*hook)(uintptr_t, uint64_t),
                                                   const uint32_t* open_windows);
 
@@ -1234,7 +1235,8 @@ struct PageManager::Impl {
     // the copy's bytes on its page.
     static void NoteFaultingHostCopy(WriteWindow& window, VAddr addr) {
         uintptr_t begin = 0, end = 0;
-        if (fault_from_guest || !runtime_memory_host_copy_extent(&begin, &end) || addr < begin ||
+        if (fault_from_guest || !runtime_memory_host_copy_enabled() ||
+            !runtime_guest_copy_range(&begin, &end) || addr < begin ||
             addr >= end) {
             return;
         }
@@ -1916,8 +1918,8 @@ u64 PageManager::TakeWindowAmbiguousBytes() {
 
 bool PageManager::FaultInHostCopy(VAddr addr) {
     uintptr_t begin = 0, end = 0;
-    return !fault_from_guest && runtime_memory_host_copy_extent(&begin, &end) && addr >= begin &&
-           addr < end;
+    return !fault_from_guest && runtime_memory_host_copy_enabled() &&
+           runtime_guest_copy_range(&begin, &end) && addr >= begin && addr < end;
 }
 
 void PageManager::TakeHostCopyStats(u64* windows, u64* bytes) {

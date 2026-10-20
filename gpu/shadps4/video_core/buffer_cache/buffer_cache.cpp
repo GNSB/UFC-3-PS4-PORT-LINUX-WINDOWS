@@ -2874,9 +2874,11 @@ void BufferCache::Maintain() {
             }
             u64 copy_windows = 0, copy_bytes = 0;
             PageManager::TakeHostCopyStats(&copy_windows, &copy_bytes);
-            std::printf("Write windows: %.1f/s opened by libc copies, %.1f KiB/s of their bytes "
-                        "known (no readback)\n",
-                        copy_windows / 5.0, copy_bytes / 5.0 / 1024.0);
+            if (copy_windows || copy_bytes) {
+                std::printf("Write windows: %.1f/s opened by libc copies, %.1f KiB/s of their bytes "
+                            "known (no readback)\n",
+                            copy_windows / 5.0, copy_bytes / 5.0 / 1024.0);
+            }
             if (const u64 locks = discard_locks.exchange(0)) {
                 std::printf("Discard locks: %.1f/s, %.1f KB/s of dead GPU bytes dropped, %.1f pages/s "
                             "no longer GPU-modified\n",
