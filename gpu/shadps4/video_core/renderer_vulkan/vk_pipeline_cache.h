@@ -167,6 +167,13 @@ public:
         return profile;
     }
 
+    /// ufc3 (UFC-65): programs, graphics and compute pipelines, compiles pending (GPU thread).
+    std::array<size_t, 4> CountGrowth() {
+        std::shared_lock lk{programs_mutex};
+        return {program_cache.size(), graphics_pipelines.size(), compute_pipelines.size(),
+                pending_graphics.size()};
+    }
+
 private:
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);

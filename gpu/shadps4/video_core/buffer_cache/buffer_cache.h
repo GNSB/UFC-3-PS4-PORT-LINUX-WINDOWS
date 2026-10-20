@@ -206,6 +206,13 @@ public:
     /// bbport: the CPU wrote [addr, addr + size) where the GPU side asked to hear of it (no write
     /// tracking): counted per block like a write fault, for moving per-frame data in place.
     void NoteCpuWriteRange(VAddr addr, u64 size);
+    /// ufc3 (UFC-65): sizes of what the cache keeps, for the periodic growth line (GPU thread).
+    struct GrowthCounters {
+        u64 arenas = 0, resident_intervals = 0, in_place_intervals = 0, gpu_ranges = 0;
+        u64 gpu_written_intervals = 0, asset_intervals = 0, cpu_write_blocks = 0;
+        u64 gpu_write_ranges = 0, residency_chunks = 0;
+    };
+    GrowthCounters CountGrowth();
     /// Whether any part of the range is.
     [[nodiscard]] bool IsAnyInPlace(VAddr addr, u64 size) const {
         return GuestInPlace() && size != 0 &&

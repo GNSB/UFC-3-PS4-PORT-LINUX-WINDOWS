@@ -294,6 +294,20 @@ public:
     /// textures unused for seconds.
     static void NoteVramShort();
 
+    /// ufc3 (UFC-65): what the cache holds, for the periodic growth line (GPU thread).
+    struct GrowthCounters {
+        u64 images = 0, image_mib = 0;
+        u64 idle_images = 0;  ///< untouched for 60 s
+        u64 dirty_images = 0; ///< CPU-overwritten, not refreshed since (stale)
+        u64 gpu_images = 0;   ///< GPU-written (kept by the collector below memory pressure)
+        u64 tracked_images = 0;
+        u64 pages = 0, page_entries = 0, longest_page = 0; ///< 1 MiB lookup pages
+        u64 views = 0, samplers = 0;
+        u64 stale_freed = 0; ///< BB_GC_STALE_SECONDS evictions since the last call
+        u64 used_mib = 0, trigger_mib = 0;
+    };
+    GrowthCounters CountGrowth();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -425,6 +439,7 @@ private:
     /// bbport: gc_tick at each of the last 64 seconds (GarbageCollectImages).
     std::array<u64, 64> gc_tick_at_second{};
     u64 gc_second = 0;
+    u64 stale_scan_second = 0, stale_freed = 0; ///< ufc3 (UFC-65)
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;

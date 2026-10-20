@@ -64,6 +64,10 @@ public:
         return !copying && tracked.contains(image_uid);
     }
     void ResolveAll();
+    /// ufc3 (UFC-65): reduced-size proxies held (they are freed only by SetSize).
+    [[nodiscard]] size_t Count() const {
+        return entries.size();
+    }
     bool debug = false; ///< BB_SCENE_DEBUG frame: print resolves and fills
 private:
     struct Entry {
