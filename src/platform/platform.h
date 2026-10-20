@@ -143,6 +143,9 @@ int platform_fstat(int fd, PlatformStat *out);            /* 0 or -errno */
  * read-only (Windows gives it a listing-only descriptor, platform_fd_is_dir). Returns the
  * descriptor or -errno. */
 int platform_open(const char *path, int guest_flags, int mode);
+/* As platform_open, for save data: on Windows other handles on the file do not stop a rename
+ * from replacing it (FILE_SHARE_DELETE); elsewhere platform_open. */
+int platform_open_shared(const char *path, int guest_flags, int mode);
 int platform_close(int fd);
 ssize_t platform_read(int fd, void *buffer, size_t size);      /* -1 and errno as read() */
 ssize_t platform_write(int fd, const void *buffer, size_t size);
