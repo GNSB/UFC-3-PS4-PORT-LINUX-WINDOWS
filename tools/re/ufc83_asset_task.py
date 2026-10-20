@@ -52,6 +52,12 @@ def main():
     assert read(0xe3d1cc, 4) == bytes.fromhex('49894638')
     assert read(0xe42700, 10) == bytes.fromhex('0faee88b463883e00fc3')
     print('status = request[+0x38] & 15; publisher +0xe3d170/store +0xe3d1cc')
+    # EAThread records *ScePthread after create, then looks up *self in sleep.
+    assert read(0x46ee9, 14) == bytes.fromhex('488b4308488d7dc04c8b304c8933')
+    assert read(0x43e89, 8) == bytes.fromhex('e85265db01488b10')
+    assert read(0x470eb, 5) == bytes.fromhex('e810faffff')
+    print('EAThread identity: create +0x46ee9 -> *handle saved at +0x46ef4; '
+          'sleep +0x43e89 -> *self, lookup +0x297c350, fallback +0x297c338')
     if args.disassemble:
         text = next(s for s in segments if s[0] == 1 and s[1] & 1)
         with tempfile.NamedTemporaryFile() as f:
@@ -62,7 +68,9 @@ def main():
                            (0xe3d170, 0xe3d1de), (0xe40800, 0xe40891),
                            (0xe40944, 0xe40973), (0xe40a61, 0xe40aa0),
                            (0xe3c6f0, 0xe3c7c0), (0xe3f1e0, 0xe3f37f),
-                           (0x43d30, 0x43eea)]:
+                           (0x43d30, 0x43eea), (0x46e48, 0x46f16),
+                           (0x46b34, 0x46b6f), (0x470c0, 0x470f0),
+                           (0x471a0, 0x47230), (0x1dfa3e0, 0x1dfa3f0)]:
                 subprocess.run(['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64',
                                 '-Mintel', f'--adjust-vma={text[3]}',
                                 f'--start-address={lo}', f'--stop-address={hi}', f.name],

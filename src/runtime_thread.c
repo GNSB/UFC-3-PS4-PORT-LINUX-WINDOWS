@@ -55,8 +55,12 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
 }
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
-/* Build TCB/static TLS for the calling host thread and publish it as the guest TCB. */
-static void attach(GuestThread *t) {
+/* Build the TCB before publishing the ScePthread handle. EAThread reads the
+ * handle's first word immediately after create returns and saves it as the
+ * thread identity (+0x46ee9 in UFC 3 1.14). It must not change from NULL to a
+ * TCB later on the child: that makes its timer-queue lookup miss. */
+static void prepare_tcb(GuestThread *t) {
+    if (t->tcb) return;
     uint64_t offset=tls_offset();
     size_t total=offset+256;
     unsigned char *block=platform_aligned_alloc(64,(total+63)&~(size_t)63);
@@ -69,7 +73,11 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
-    platform_thread_publish_tcb(tcb);
+}
+/* Only the target host thread publishes GS/TEB and its runtime identity. */
+static void attach(GuestThread *t) {
+    prepare_tcb(t);
+    platform_thread_publish_tcb(t->tcb);
     current=t;
     runtime_fp_thread_setup(); /* BB_DETERMINISTIC_FP: Orbis' MXCSR and x87 control word */
 }
@@ -234,6 +242,7 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
      * stack probes): platform_thread_stack. */
     size_t stack_bytes=(size_t)stack+STACK_MARGIN;
     platform_thread_stack(&host,stack_bytes);
+    prepare_tcb(t);
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
     *out=t;

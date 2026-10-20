@@ -9,6 +9,7 @@ void runtime_restart(void) { abort(); }
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
@@ -115,6 +116,33 @@ static void equeue_timer_probe(void) {
 }
 typedef void *(ABI *TlsAddress)(const uint64_t *);
 typedef void *(ABI *ThreadSelf)(void);
+typedef int32_t (ABI *CreateGuestThread)(void **,void **,void *(ABI *)(void *),void *,const char *);
+typedef int32_t (ABI *JoinGuestThread)(void *,void **);
+typedef struct { _Atomic int release; uint64_t identity; void *handle; } ThreadIdentity;
+static ABI void *identity_worker(void *argument) {
+    ThreadIdentity *identity=argument;
+    void *self=GET(ThreadSelf,"aI+OeCz8xrQ#libkernel")();
+    while (!atomic_load_explicit(&identity->release,memory_order_acquire)) sched_yield();
+    assert(self==identity->handle && *(uint64_t *)self==identity->identity);
+    return argument;
+}
+static void published_thread_identity(void) {
+    uint64_t previous=0;
+    for (int i=0;i<8;++i) {
+        ThreadIdentity identity={0};
+        assert(GET(CreateGuestThread,"6UgtwV+0zb4#libkernel")(
+            &identity.handle,NULL,identity_worker,&identity,"identity-test")==0);
+        /* The child can still be starting. EAThread must already be able to
+         * save a nonzero identity that agrees with the child's later self. */
+        identity.identity=*(uint64_t *)identity.handle;
+        assert(identity.identity && identity.identity!=previous);
+        atomic_store_explicit(&identity.release,1,memory_order_release);
+        void *result=NULL;
+        assert(GET(JoinGuestThread,"onNY9Byn-W8#libkernel")(identity.handle,&result)==0);
+        assert(result==&identity && *(uint64_t *)identity.handle==identity.identity);
+        previous=identity.identity;
+    }
+}
 typedef int32_t (ABI *ThreadGetAttr)(void *,void **);
 typedef int32_t (ABI *ThreadAffinity)(void **,uint64_t *);
 static void *main_identity;
@@ -567,6 +595,7 @@ static void appearance_backpressure(void) {
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
+    if (argc>1 && !strcmp(argv[1],"--thread-identity-probe")) { published_thread_identity(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--equeue-timer-probe")) { equeue_timer_probe(); return 0; }
 #ifdef __linux__
     if (argc>1 && !strcmp(argv[1],"--sample-trace-smoke")) { sample_trace_smoke(); return 0; }
@@ -593,7 +622,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); host_copy_scope(); memory_primitives();
+    published_thread_identity(); libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); host_copy_scope(); memory_primitives();
     assert(host_copy_callbacks==((getenv("BB_HOST_COPY_EXTENTS") && getenv("BB_HOST_COPY_EXTENTS")[0]=='0') ? 0u : 4u));
     runtime_memory_set_host_copy_hook(NULL,NULL);
     rw_lifecycle(); rw_concurrency(); rw_timeouts(); ui_backpressure(); appearance_backpressure();
