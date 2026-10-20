@@ -17,6 +17,7 @@ from pathlib import Path
 import struct
 from prepare import parse_self, span, unpack
 from link_libc import encode_id
+from cpu_compat import atomic_output, patch_image, patch_libc
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
@@ -129,6 +130,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
     tls_module = 2
     for filename in module_names:
         m = module(game / 'sce_module' / filename)
+        if filename == 'libc.prx':
+            libc_changes = patch_libc(m)
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
         modsize = max(p['vaddr'] + p['memsz'] for p in loads)
         if base + modsize > 512 * 1024 * 1024:
@@ -219,7 +222,9 @@ def link(game, out, module_names=DEFAULT_MODULES):
                      or main_tls['vaddr'] + main_tls['filesz'] > size):
         raise ValueError('unsupported eboot TLS layout')
     procparam = next(p for p in main['ph'] if p['type'] == 0x61000001)
-    with (out / 'boot-linked.bin').open('wb') as f:
+    image, segments, cpu_compat = patch_image(image, segments, main, table, relocs)
+    cpu_compat['libc'] = libc_changes
+    with atomic_output(out / 'boot-linked.bin') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
         f.write(struct.pack('<4Q', *main_tls_values))
@@ -242,8 +247,11 @@ def link(game, out, module_names=DEFAULT_MODULES):
     report = dict(modules=[{k: (hex(v) if k in ('base', 'init', 'tls_address') else v) for k, v in t.items()} for t in table],
                   bindings=len(bindings), imports=len(names), fs_loads_patched=fs_patched,
                   main_tls=dict(zip(('vaddr', 'filesz', 'memsz', 'align'), main_tls_values)),
-                  unresolved_imports=unresolved)
-    (out / 'link.json').write_text(json.dumps(report, indent=2) + '\n')
+                  unresolved_imports=unresolved, cpu_compat=cpu_compat)
+    with atomic_output(out / 'link.json') as f:
+        f.write((json.dumps(report, indent=2) + '\n').encode('utf-8'))
+    if cpu_compat.get('enabled'):
+        print(f"CPU compatibility: translated {cpu_compat['patched_sites']} instruction sites for Ivy Bridge; trampolines={cpu_compat['trampoline_bytes']} bytes")
     summary = ', '.join(f"{t['file']}@{t['base']:#x}" for t in table)
     print(f'Linked modules: {summary}; {len(bindings)} native bindings, {len(unresolved)} imports left to the host runtime, '
           f'fs->gs patched={fs_patched}')
