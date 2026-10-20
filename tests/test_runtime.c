@@ -17,26 +17,51 @@ void runtime_restart(void) { abort(); }
 typedef int (ABI *Register)(GuestCallback);
 #ifdef __linux__
 /* Opt-in smoke for the signal sampler: no guest image or GPU execution. */
+static _Atomic int sample_workers_stop, sample_workers_ready;
+static void *sample_trace_worker(void *unused) {
+    (void)unused;
+    platform_thread_set_name("sample-worker-duplicate");
+    atomic_fetch_add(&sample_workers_ready,1);
+    while (!atomic_load(&sample_workers_stop)) usleep(1000);
+    return NULL;
+}
 static void sample_trace_smoke(void) {
     char path[]="/tmp/ufc83-sample-XXXXXX";
     int fd=mkstemp(path); assert(fd>=0); close(fd);
     platform_thread_set_name("sample-smoke");
-    assert(!setenv("BB_SAMPLE_THREAD","sample-smoke",1));
+    assert(!setenv("BB_SAMPLE_THREAD","sample-smoke,sample-worker-duplicate",1));
     assert(!setenv("BB_SAMPLE_LOG",path,1));
+    pthread_t workers[2];
+    for (int i=0;i<2;++i) assert(!pthread_create(&workers[i],NULL,sample_trace_worker,NULL));
+    while (atomic_load(&sample_workers_ready)!=2) usleep(1000);
     runtime_wait_report(1);
     errno=EDOM;
     uint64_t deadline=platform_monotonic_ns()+200000000;
     while (platform_monotonic_ns()<deadline) { /* signals interrupt a running thread */ }
     assert(errno==EDOM);
     FILE *f=fopen(path,"r"); assert(f);
-    char line[4096]; int anchor=0, sample=0;
+    char line[4096]; int anchor=0, sample=0, targets=0, worker_samples=0;
+    int worker_tids[2]={0};
     while (fgets(line,sizeof(line),f)) {
         anchor|=!strncmp(line,"anchor ",7);
+        if (!strncmp(line,"target ",7) && strstr(line,"name=sample-worker-d")) {
+            char *tid=strstr(line,"tid=");
+            if (targets<2 && tid) worker_tids[targets++]=atoi(tid+4);
+        }
+        if (!strncmp(line,"sample ",7)) {
+            char *tid=strstr(line,"tid=");
+            if (tid && atoi(tid+4)==worker_tids[0]) worker_samples|=1;
+            if (tid && atoi(tid+4)==worker_tids[1]) worker_samples|=2;
+        }
         sample|=!strncmp(line,"sample mono_ns=",15) && strstr(line," rbp-chain:") && strstr(line," stack-candidates:");
     }
-    fclose(f); unlink(path);
-    assert(anchor && sample);
-    puts("PASS: timestamped signal samples, host frame output, interrupted errno preserved");
+    fclose(f);
+    fprintf(stderr,"sampler smoke: anchor=%d sample=%d targets=%d worker_samples=%d log=%s\n",anchor,sample,targets,worker_samples,path);
+    atomic_store(&sample_workers_stop,1);
+    for (int i=0;i<2;++i) assert(!pthread_join(workers[i],NULL));
+    assert(anchor && sample && targets==2 && worker_tids[0]!=worker_tids[1] && worker_samples==3);
+    unlink(path);
+    puts("PASS: comma-separated sampler targets, duplicate/truncated names, per-tid host stacks, interrupted errno preserved");
 }
 #endif
 typedef int (ABI *RegisterCxa)(void (ABI *)(void *), void *, void *);
