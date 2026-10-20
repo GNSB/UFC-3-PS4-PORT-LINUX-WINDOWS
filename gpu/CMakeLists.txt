@@ -2,6 +2,9 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(bbgpu LANGUAGES C CXX)
+set(BB_BUILD_VERSION "unknown" CACHE STRING "Source revision embedded in release components")
+# Only the identity shim needs recompiling when the revision changes.
+set_property(SOURCE shim/bbgpu.cpp APPEND PROPERTY COMPILE_DEFINITIONS BB_BUILD_VERSION="${BB_BUILD_VERSION}")
 # Release archives: source paths in __FILE__ (log messages) relative to the repository, without
 # the build machine's home directory.
 get_filename_component(BB_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
@@ -231,7 +234,7 @@ if (WIN32)
         ${BB_SRC}/src/vulkan_smoke.c ${BB_SRC}/packaging/windows/sacredfire-game.rc)
     set_target_properties(sacredfire-game PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
     target_compile_options(sacredfire-game PRIVATE $<$<COMPILE_LANGUAGE:C>:${BB_C_WARNINGS}>)
-    target_compile_definitions(sacredfire-game PRIVATE ${BB_WIN_DEFS})
+    target_compile_definitions(sacredfire-game PRIVATE ${BB_WIN_DEFS} BB_BUILD_VERSION="${BB_BUILD_VERSION}")
     target_include_directories(sacredfire-game PRIVATE ${BB_SRC} ${BB_SRC}/src)
     target_link_libraries(sacredfire-game PRIVATE bbgpu atrac9 Zydis::Zydis onecore bcrypt ws2_32 winmm -pthread)
     # The PS4 range (64 GiB - 1 TiB) must stay free of host allocations: no high-entropy ASLR
@@ -250,7 +253,7 @@ if (WIN32)
     set_target_properties(sacredfire PROPERTIES C_STANDARD 11 OUTPUT_NAME SacredFire)
     target_compile_options(sacredfire PRIVATE ${BB_C_WARNINGS} -municode) # wWinMain: UTF-16 arguments
     target_link_options(sacredfire PRIVATE -municode -mwindows)
-    target_compile_definitions(sacredfire PRIVATE ${BB_WIN_DEFS})
+    target_compile_definitions(sacredfire PRIVATE ${BB_WIN_DEFS} BB_BUILD_VERSION="${BB_BUILD_VERSION}")
     target_link_libraries(sacredfire PRIVATE comctl32 shlwapi ole32 shell32 uuid user32 gdi32)
     # Windows versions of the runtime tests and the ABI/TLS/memory probes (tests/windows): built
     # with `ninja windows-tests`, run on real Windows (Wine as a diagnostic).

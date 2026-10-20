@@ -2,6 +2,7 @@
  * the runtime files did inline before the Windows port (docs/sacredfire/13-windows-port.md). */
 #define _GNU_SOURCE
 #include "platform.h"
+#include "../build_version.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -224,8 +225,8 @@ static void fault(int sig, siginfo_t *info, void *context) {
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
     char line[512], where[256];
     if (rip - (uintptr_t)guest_image < guest_image_size)
-        snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n", sig, (unsigned long)(rip - (uintptr_t)guest_image), info->si_addr);
-    else { platform_describe_address(rip, where, sizeof(where)); snprintf(line, sizeof(line), "Host fault (signal %d) in %s, address %p\n", sig, where, info->si_addr); }
+        snprintf(line, sizeof(line), "Guest fault (game " BB_BUILD_VERSION ", signal %d) at guest offset 0x%lx, address %p\n", sig, (unsigned long)(rip - (uintptr_t)guest_image), info->si_addr);
+    else { platform_describe_address(rip, where, sizeof(where)); snprintf(line, sizeof(line), "Host fault (game " BB_BUILD_VERSION ", signal %d) in %s, address %p\n", sig, where, info->si_addr); }
     write_all(line);
     {
         const greg_t *g = uc->uc_mcontext.gregs;

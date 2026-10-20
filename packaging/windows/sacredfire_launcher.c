@@ -33,6 +33,7 @@
 #endif
 /* Winsock and IP Helper are loaded at run time (net_load): the launcher links neither. */
 #include <winsock2.h>
+#include "../../src/build_version.h"
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
@@ -190,6 +191,13 @@ static void read_version(char *version, size_t n) {
     FILE *f = _wfopen(path, L"rb");
     if (f) { if (fgets(version, (int)n, f)) trim(version); fclose(f); }
 }
+static void read_game_version(char *version, size_t n) {
+    snprintf(version, n, "unknown");
+    FILE *f = _wfopen(game_exe, L"rb");
+    if (!f) return;
+    bb_read_game_version(f, version, n);
+    fclose(f);
+}
 static void settings_path(wchar_t *out_path) { join(out_path, PATHW, data, L"sacredfire.ini"); }
 static void settings_load(void) {
     wchar_t path[PATHW]; settings_path(path);
@@ -322,6 +330,13 @@ static void fail(const wchar_t *message) {
 }
 
 /* ---- running programs ---- */
+static void log_versions(const char *file_version) {
+    char game_version[256]; read_game_version(game_version, sizeof(game_version));
+    logf("Version: launcher %s, VERSION file %s, game %s (Windows)\n",
+         BB_BUILD_VERSION, file_version, game_version);
+    if (!bb_versions_match(BB_BUILD_VERSION, file_version) || !bb_versions_match(BB_BUILD_VERSION, game_version))
+        logf("%s\n", BB_VERSION_WARNING);
+}
 static HANDLE game_process; /* the running game (Stop) */
 static volatile LONG stop_requested;
 static int server_failed(void);
@@ -774,6 +789,9 @@ static void gamepads_refresh(void) {
 
 /* ---- the run: what run.sh does, then the game. Returns the game's exit code. ---- */
 static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
+    char version[256]; read_version(version, sizeof(version));
+    logf("SacredFire %s (Windows)\n", version);
+    log_versions(version);
     wchar_t out[PATHW], user_dir[PATHW], config[PATHW];
     join(out, PATHW, data, L"out"); ensure_directory(out);
     join(user_dir, PATHW, data, L"user"); ensure_directory(user_dir);
@@ -999,8 +1017,6 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     append_argument(line, 32768, L"--timeout"); append_argument(line, 32768, env_or(L"BB_TIMEOUT", L"0"));
     append_argument(line, 32768, L"--tls-loads"); append_argument(line, 32768, tls_loads);
     for (int i = 0; i < extra_count; ++i) append_argument(line, 32768, extra[i]);
-    char version[64]; read_version(version, sizeof(version));
-    logf("SacredFire %s (Windows)\n", version);
 #ifdef UFC3_WRITE_WINDOWS_TEST
     logw(L"UFC-48 write windows test: BB_WRITE_STEP=1 BB_WRITE_WINDOW=1 BB_WRITE_WINDOW_DIAG=1 BB_WRITE_WINDOW_DIAG_MAX=1000 (UFC3-WRITE-WINDOWS-TEST.exe).\n");
 #endif
@@ -1341,7 +1357,7 @@ static void paint_window(HDC dc, RECT client) {
     RECT t = {text_x, sx(26), client.right - sx(16), sx(66)};
     SelectObject(dc, font_title); SetTextColor(dc, C_GOLD);
     DrawTextW(dc, L"EA SPORTS UFC 3 \x2014 native PC port", -1, &t, DT_SINGLELINE | DT_LEFT | DT_BOTTOM | DT_NOPREFIX | DT_END_ELLIPSIS);
-    char version[64]; read_version(version, sizeof(version));
+    char version[256]; read_version(version, sizeof(version));
     wchar_t line[160]; _snwprintf(line, 160, L"PS4 CUSA06534 \x00B7 SacredFire %hs \x00B7 your own game dump required", version); line[159] = 0;
     t.top = sx(70); t.bottom = sx(90);
     SelectObject(dc, ui_font); SetTextColor(dc, C_TEXT_DIM);
@@ -2117,8 +2133,9 @@ static int gui(HINSTANCE instance, const wchar_t *const *extra, int extra_count)
     set_checked(ID_STATS, settings.frame_stats); set_checked(ID_VALIDATION, settings.validation); set_checked(ID_TRACE, settings.menu_trace);
     gamepads_refresh(); fill_gamepads(); fill_host_addresses();
     set_running(0);
-    char version[64]; read_version(version, sizeof(version));
+    char version[256]; read_version(version, sizeof(version));
     logf("SacredFire %s (Windows). Data: ", version); logw(L"%ls\n", data);
+    log_versions(version);
 #ifdef UFC3_DIAGNOSTIC_PACKAGE
     logw(L"Windows diagnostic test: the data stays beside the exe in diagnostic-data; write windows and their audit are on for every run.\n");
 #endif

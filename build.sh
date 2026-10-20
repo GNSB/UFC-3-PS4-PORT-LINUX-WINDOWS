@@ -2,6 +2,9 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
+# One identity for VERSION and all compiled components; patched submodules do not mark it dirty.
+version=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
+if ! git diff --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null; then version="$version-dirty"; fi
 # Keep Windows runtime builds under ufc3-build's machine-wide build lock too.
 if [[ ${1:-} == --windows-runtime ]]; then
     exec bash scripts/build-windows.sh --runtime
@@ -57,7 +60,7 @@ if ! fsr_patches_apply --check 2>/dev/null; then
     git -C gpu/third_party/fsr-vulkan checkout -- .
 fi
 fsr_patches_apply
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
+cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_BUILD_VERSION="$version" -DBB_PGO="$pgo" \
     -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
@@ -76,19 +79,25 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" "-DBB_BUILD_VERSION=\"$version\"" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/sacredfire
 echo "Built $PWD/out/sacredfire"
-# out/VERSION: the source revision this build came from (the nearest v* tag, else the commit;
-# "-dirty" when tracked files differ from it). run.sh prints it, the launcher shows it and the
-# package carries it, so a published binary can be matched to its source. The FSR-Vulkan patch
-# build.sh applies inside its submodule does not count as a change.
-version=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
-git update-index -q --refresh 2>/dev/null || true
-if ! git diff-index --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null; then version="$version-dirty"; fi
 printf '%s\n' "$version" > out/VERSION
 echo "Version: $version (out/VERSION)"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
+# Fast identity checks; --version returns before reserving memory or initializing the GPU.
+if [[ ${1:-} == --test || ${1:-} == --version-test ]]; then
+    "$CC" -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/test_build_version.c -o out/build-version-test
+    out/build-version-test
+    [[ $(out/sacredfire --version) == "$version" ]] || { echo 'Embedded game version differs from VERSION' >&2; exit 1; }
+    python3 - "$version" <<'PYTEST'
+import pathlib, sys
+identity = b"BB_GAME_BUILD_VERSION=" + sys.argv[1].encode() + b"\0"
+assert identity in pathlib.Path("out/sacredfire").read_bytes(), "Missing game identity marker"
+assert sys.argv[1].encode() + b"\0" in pathlib.Path("out/gpu/libbbgpu.so").read_bytes(), "Missing GPU version"
+print("Embedded game and GPU versions: OK")
+PYTEST
+fi
 if [[ ${1:-} == --test ]]; then
     ninja -C out/gpu write-window-merge-test
     out/gpu/write-window-merge-test

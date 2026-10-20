@@ -10,7 +10,14 @@
 #include <inttypes.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "build_version.h"
+/* Referenced by --version so LTO retains this searchable, NUL-terminated identity. */
+static const char game_build_identity[] __attribute__((used)) = BB_GAME_VERSION_MARKER BB_BUILD_VERSION;
 #include "gpu/bbgpu.h"
+#ifndef _WIN32
+/* Releases before the detector lack this export; still report a mixed installation. */
+extern const char *bbgpu_version(void) __attribute__((weak));
+#endif
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
@@ -165,6 +172,7 @@ static void ui_snapshot_report(void *context) {
     fprintf(stderr, "  UFC-57: %" PRIu64 " nodes, %" PRIu64 " without a copy\n", nodes, empty);
 }
 static void fault_extra(void *context) {
+    fprintf(stderr, "  Version: game %s\n", BB_BUILD_VERSION);
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
     ui_snapshot_report(context);
 }
@@ -248,6 +256,10 @@ void runtime_restart(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--version")) {
+        puts(game_build_identity + sizeof(BB_GAME_VERSION_MARKER) - 1);
+        return 0;
+    }
 #ifdef __linux__
     /* ufc3: BB_ALLOW_PTRACE=1 lets a debugger attach later (Yama ptrace_scope 1 allows only
      * descendants otherwise): stacks of a hang that does not happen under gdb. */
@@ -260,6 +272,18 @@ int main(int argc, char **argv) {
     platform_process_init();
     runtime_memory_reserve();
     runtime_thread_host_init();
+#ifdef _WIN32
+    const char *platform = "Windows";
+#else
+    const char *platform = "Linux";
+#endif
+#ifdef _WIN32
+    const char *gpu_version = bbgpu_version();
+#else
+    const char *gpu_version = bbgpu_version ? bbgpu_version() : "unknown";
+#endif
+    bb_print_versions(stdout, BB_BUILD_VERSION, gpu_version, platform);
+    fflush(stdout);
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     check_cpu();
     int cpu_only = 0, strict_imports = 0, list_imports = 0;
