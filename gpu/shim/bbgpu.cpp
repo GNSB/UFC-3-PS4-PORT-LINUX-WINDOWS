@@ -294,6 +294,13 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         std::fflush(stdout);
         std::fprintf(stderr, "Window closed (window close or quit request): exiting with code 0\n");
         std::fflush(stderr);
+#ifdef _WIN32
+        // ufc3: ExitProcess (what _Exit ends in on Windows) first runs every DLL's detach
+        // routine and can hang there after a match (a driver waiting on a thread that never
+        // finishes), leaving the closed window white and not responding. End the process at once.
+        void BbTerminateSelf();
+        BbTerminateSelf();
+#endif
         std::_Exit(0);
     });
     g_window_thread.detach();
@@ -437,3 +444,12 @@ extern "C" int bbgpu_text_input_poll(char* out, uint64_t size) {
     }
     return state;
 }
+
+#ifdef _WIN32
+// ufc3: ends the process at once (see the window thread above).
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess(void);
+extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* process, unsigned int exit_code);
+void BbTerminateSelf() {
+    TerminateProcess(GetCurrentProcess(), 0);
+}
+#endif
