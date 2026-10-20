@@ -1343,6 +1343,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     WatchImage(image, "depth target");
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = scheduler.CurrentTick();
+    ++image.write_count; // UFC-60: also with scene proxies, where the Transit is skipped
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
