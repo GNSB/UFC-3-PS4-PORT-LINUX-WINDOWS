@@ -328,6 +328,77 @@ bool WriteImageReadback(VAddr address, const u8* data, u64 size,
 }
 } // namespace
 
+// bbport (UFC-READBACK): linear images (not tiled, or at most 8 pixels wide) that the GPU writes
+// are read back to guest memory at the next fence (BB_READBACK_LINEAR=1), and each readback waits
+// for the GPU. Matches need some of them (without them the 3D scene stays black); the career hub
+// pays about 2 ms per readback. These switches choose which images are read back:
+//   BB_READBACK_LINEAR_MAX_KB=n  images larger than n KiB are skipped (width <= 8 always read back)
+//   BB_READBACK_LINEAR_ONLY=s|r  only storage images (s) or only render targets (r)
+//   BB_READBACK_LINEAR_LOG=1     log each distinct kind of image queued (and every 1024th time)
+static bool ShouldReadBackLinear(const ImageInfo& info, bool target) {
+    static const unsigned long long max_bytes = [] {
+        const char* env = std::getenv("BB_READBACK_LINEAR_MAX_KB");
+        return env && env[0] ? std::strtoull(env, nullptr, 10) * 1024ull : 0ull;
+    }();
+    static const int only = [] {
+        // ufc3 default: only storage images (and tiny ones) are read back; render targets are not
+        // (the career hub's full-screen render targets cost about 2 ms per fence, each waiting for
+        // the GPU). BB_READBACK_LINEAR_ONLY=a reads back every linear image again, as before.
+        const char* env = std::getenv("BB_READBACK_LINEAR_ONLY");
+        if (!env || !env[0]) {
+            return 1;
+        }
+        return env[0] == 's' ? 1 : (env[0] == 'r' ? 2 : 0);
+    }();
+    if (info.size.width <= 8) {
+        return true;
+    }
+    if ((only == 1 && target) || (only == 2 && !target)) {
+        return false;
+    }
+    return max_bytes == 0 || info.guest_size <= max_bytes;
+}
+
+// Called with download_images_mutex held.
+static void NoteLinearReadback(const ImageInfo& info, bool target) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_READBACK_LINEAR_LOG");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct Entry {
+        u32 width, height, guest_kb;
+        int format;
+        bool target;
+        unsigned long long count;
+    };
+    static Entry entries[64];
+    static u32 used = 0;
+    const u32 width = static_cast<u32>(info.size.width);
+    const u32 height = static_cast<u32>(info.size.height);
+    const int format = static_cast<int>(info.pixel_format);
+    for (u32 i = 0; i < used; ++i) {
+        Entry& e = entries[i];
+        if (e.width == width && e.height == height && e.format == format && e.target == target) {
+            if ((++e.count & 1023ull) == 0) {
+                std::printf("[RB] %s %ux%u %s %u KiB: queued %llu times\n",
+                            target ? "render target" : "storage", width, height,
+                            vk::to_string(info.pixel_format).c_str(), e.guest_kb, e.count);
+            }
+            return;
+        }
+    }
+    if (used < 64) {
+        const u32 kb = static_cast<u32>(info.guest_size / 1024);
+        entries[used++] = Entry{width, height, kb, format, target, 1ull};
+        std::printf("[RB] new linear readback: %s %ux%u %s %u KiB tiled=%d\n",
+                    target ? "render target" : "storage", width, height,
+                    vk::to_string(info.pixel_format).c_str(), kb, info.props.is_tiled ? 1 : 0);
+    }
+}
+
 void TextureCache::ProcessDownloadImages() {
     // bbport: called for every fence (~450 a frame): the lock only when something is queued.
     if (!downloads_queued.load(std::memory_order_acquire)) {
@@ -1259,8 +1330,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
         image.flags &= ~ImageFlagBits::WrittenBack;
         image.gpu_write_tick = scheduler.CurrentTick();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
+            ShouldReadBackLinear(image.info, false) && image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
+            NoteLinearReadback(image.info, false);
             download_images.emplace(image_id);
             downloads_queued.store(true, std::memory_order_release);
         }
@@ -1313,8 +1385,10 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     image.flags |= ImageFlagBits::GpuModified;
     image.flags &= ~ImageFlagBits::WrittenBack;
     image.gpu_write_tick = scheduler.CurrentTick();
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        ShouldReadBackLinear(image.info, true)) {
         std::unique_lock lk{download_images_mutex};
+        NoteLinearReadback(image.info, true);
         download_images.emplace(image_id);
         downloads_queued.store(true, std::memory_order_release);
     }
