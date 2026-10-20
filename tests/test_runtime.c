@@ -51,6 +51,43 @@ typedef int32_t (ABI *Map)(void **, uint64_t, int, int, int64_t, uint64_t);
 typedef int32_t (ABI *Unmap)(void *, uint64_t);
 typedef int32_t (ABI *Release)(uint64_t, uint64_t);
 #define GET(type, name) ((type)runtime_resolve(name, 0))
+/* UFC-83: exercise the actual equeue service without loading guest code or a GPU. */
+static void equeue_timer_probe(void) {
+    extern void bbgpu_register_kernel(void);
+    typedef struct {
+        uint64_t ident;
+        int16_t filter;
+        uint16_t flags;
+        uint32_t fflags;
+        uint64_t data;
+        void *udata;
+    } Event;
+    typedef struct { int64_t sec, nsec; } TimerTime;
+    typedef int (ABI *Create)(int64_t *, const char *);
+    typedef int (ABI *Delete)(int64_t);
+    typedef int (ABI *AddTimer)(int64_t, int, TimerTime *, void *);
+    typedef int (ABI *Wait)(int64_t, Event *, int, int *, uint32_t *);
+    bbgpu_register_kernel();
+    Create create=GET(Create,"D0OdFMjp46I");
+    Delete destroy=GET(Delete,"jpFjmgAC5AE");
+    AddTimer add=GET(AddTimer,"R74tt43xP6k");
+    Wait wait=GET(Wait,"fzyMKs9kim0");
+    assert(create && destroy && add && wait);
+    int64_t queue;
+    assert(create(&queue,"UFC-83 timer probe")==0);
+    for (int i=0;i<20;++i) {
+        TimerTime ts={0,3000000};
+        uint32_t timeout=1000000;
+        uint64_t start=platform_monotonic_ns();
+        assert(add(queue,i,&ts,NULL)==0);
+        Event event={0}; int count=0;
+        assert(wait(queue,&event,1,&count,&timeout)==0);
+        double elapsed=(platform_monotonic_ns()-start)/1e6;
+        assert(count==1 && event.ident==(uint64_t)i && event.filter==-15);
+        printf("HR timer probe: requested=3 ms delivered=%.3f ms\n",elapsed);
+    }
+    assert(destroy(queue)==0);
+}
 typedef void *(ABI *TlsAddress)(const uint64_t *);
 typedef void *(ABI *ThreadSelf)(void);
 typedef int32_t (ABI *ThreadGetAttr)(void *,void **);
@@ -505,6 +542,7 @@ static void appearance_backpressure(void) {
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
+    if (argc>1 && !strcmp(argv[1],"--equeue-timer-probe")) { equeue_timer_probe(); return 0; }
 #ifdef __linux__
     if (argc>1 && !strcmp(argv[1],"--sample-trace-smoke")) { sample_trace_smoke(); return 0; }
 #endif

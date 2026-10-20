@@ -1,197 +1,160 @@
-# UFC-83 / issue #44: corrida de las 14:05 y revisión de fix_case
+# UFC-83 / issue #44: espera del cargador, corrida 14:19
 
-**Estado: causa final pendiente; no hay arreglo acreditado de la latencia.** La nueva
-corrida demuestra que seguir únicamente al despachador no explica los huecos: hay
-ráfagas de trabajo enviadas por UI Update, seguidas de procesamiento lento en posix.
-No se ejecutó el juego ni se cambiaron timers, señales, readbacks, persistencia o las
-protecciones de Career/post-pelea. Esta entrega agrega diagnóstico, no una mejora de
-velocidad que deba darse por validada.
+**Estado: identificada la espera como polling con HR timers; causa de su duración
+pendiente. No hay un arreglo de latencia acreditado.** La pila observada no espera
+un EOP ni un flip. Cambiar el flush a partir de esta pila no está justificado.
+No se ejecutó el juego, ni se tocaron labels, write windows, readback, persistencia
+o las protecciones de Career/post-pelea (UFC-27/UFC-47).
 
-## Cadena observada, con tiempos y sitios
+## Evidencia y cadena causal identificada
 
-Fuente: `logs/20261020_140521.log`, `logs/ufc83-next.waits`,
-`logs/20261020_140521.frames.csv`. Tiempos del File/Cond/Wait trace, en segundos
-respecto de configure del filesystem; no son tiempos del video anterior.
+Fuentes: `logs/20261020_141917.log`, `logs/ufc83-host.samples`,
+`logs/ufc83-host.waits`, ELF 1.14 `out/eboot.elf` y tabla de imports
+`out/boot.bin`. Los offsets guest son relativos a 0x800000000.
 
-- Productor: **UI Update, tid 129581**. Broadcast sobre `cond=0x3a583ab0`, sitios
-  `+0x1a3933a < +0x1daa137 < +0x1daa35f`.
-- Consumidor: **posix, tid 129584**. Espera indefinida, `deadline_rt_ns=0`, sitios
-  `+0x1a391ff < +0x1da9eab < +0x1da9df1`; resultado host 0 al despertar.
-- Lector del BIG: **/app0, tid 129484**. Por ejemplo, tras pedir `tile_Ad_generic`
-  a 46.517276, lee 147429 bytes de `inxp_ui_40.big` a 46.517415, en 0.03 ms.
+1. **UI Update (tid 138339)** encola trabajo y hace broadcast de
+   `cond=0x2fbe6d30`, sitios `+0x1a3933a,+0x1daa137,+0x1daa35f`.
+   A 62.306964 despierta a **posix (tid 138354)**, que sale de la condición
+   a 62.306984 y consulta la primera GNF a 62.307035. La ráfaga de envíos
+   continúa mientras posix trabaja. El despachador no está esperando 70 ms
+   entre cada envío; esta señal tarda unos 20 microsegundos en despertar.
+2. Posix consume la cola en `+0x1da9dc0`; al pasar a la siguiente tarea
+   llama a una operación virtual de la tarea anterior en `+0x1da9cdf`,
+   retorno **+0x1da9ce2**. Esa operación entra por `+0x19fbc74 ->
+   +0x19d95a0`, retorno **+0x19fbc79**; continúa por `+0x19dcaf0`
+   hacia **+0x1bab670**. Esta última crea/encola una operación en
+   `+0xe3c600 -> +0xe3a870` y espera su estado mediante `+0xe3e040`.
+   Los nombres/tipo exacto de esa operación no están en los logs.
+3. **+0xe3e050** consulta el estado por la función virtual `vtable+0x30`.
+   Si aún no llegó a 3, ejecuta el bucle `+0xe3e0d0..+0xe3e0eb`:
+   almacena el double **3.0** (`0x4008000000000000`), llama a
+   **+0x43d30**, retorna en **+0xe3e0dc**, reconsulta y repite.
+4. **+0x43d30 es un sleep en milisegundos**, no una espera de gráficos:
+   multiplica por **1000000.0** (constante en +0x1e05028), convierte a
+   nanosegundos, divide por 1000000000 y arma un timespec. Con 3.0 pide
+   `sec=0, nsec=3000000`. Usa la cola del thread (TLS), incrementa el ident,
+   llama a **sceKernelAddHRTimerEvent** en +0x43e47 y a
+   **sceKernelWaitEqueue** con timeout NULL en +0x43e5f, retorno
+   **+0x43e64**. Se verificaron los PLT/GOT: +0x1dfa0c0/GOT+0x25c5ec0
+   resuelve R74tt43xP6k (AddHRTimer); +0x1dfa160/GOT+0x25c5f10 resuelve
+   fzyMKs9kim0 (WaitEqueue).
+5. En el host esa petición registra **filter=-15 (HrTimer), OneShot**.
+   Como 3 ms supera el umbral de 1.2 ms de `equeue.cpp`, se programa en
+   `boost::asio::steady_timer`; `bb:kernel_service` ejecuta el callback
+   `HrTimerCallback -> TriggerEvent -> notify_one`. No depende de un submit
+   Vulkan ni de ProcessDownloadImages. La implementación usa un io_context
+   con work guard y run() continuo, no un poll por frame.
 
-El texto ejecutable del ELF 1.14 (`out/eboot.elf`, PT_LOAD ejecutable, offset 0x4000,
-VA 0, longitud 37652556) confirma el significado de los sitios:
-`+0x1daa050` añade trabajo a la cola; almacena el puntero en `+0x1daa116`, llama
-al wrapper del broadcast en `+0x1daa132` y retorna en `+0x1daa137`.
-`+0x1daa35a` llama a esa función y retorna en `+0x1daa35f`.
-El consumidor prueba extraer trabajo en `+0x1da9e86 -> +0x1daa150`; sólo si recibe
-NULL llama al wait en `+0x1da9ea6` (EDX=-1); retorna en `+0x1da9eab` y reconsulta.
-Los sitios son de una cola genérica: el trace no incluye la identidad de cada tarea;
-no permite asignar cada broadcast a una GNF concreta.
+La cola se llama **EAThread Timer Queue**: su constructor +0x46a12 carga ese
+string (+0x1e05246), +0x46a31 llama a sceKernelCreateEqueue y escribe el handle
+en thread+0x90, el mismo campo usado por +0x43dfe/+0x43e3f. El fallback global
+se crea con igual nombre en +0x47782/+0x477a5. El **handle numérico y el ident
+concreto** no quedaron registrados en las muestras ni en `.waits`: no se pueden
+recuperar desde una dirección de futex. El trace nuevo distingue las instancias
+y registra cada ident directamente.
 
-| Evento | Primer ingreso | Regreso posterior |
-| --- | ---: | ---: |
-| Ad / pages_fill / ras_rl | 46.517276 / 46.613551 / 46.704512 | 69.084719 / 69.147014 / 69.242593 |
-| posix vuelve a esperar cola | 47.121333 | 69.653987 |
-| UI Update siguiente ráfaga | 33 broadcasts, 47.668746–47.679168 | 33 broadcasts, 70.199141–70.208540 |
-| posix termina ese wait | 47.668770 | 70.199162 |
-| tile_fight_modes | 47.668798 | 70.199233 |
+### Correlación temporal, no sólo totales de sesión
 
-Al primer ingreso, UI Update emite 27 broadcasts entre 46.216204 y 46.234923;
-la primera condición termina a 46.216233 y la primera GNF llega a 46.216268.
-Al regreso también envía una ráfaga (17 broadcasts entre 68.872241 y 68.894754,
-además de los envíos inmediatamente anteriores a 68.869).
+La primera línea de samples da el ancla: tiempo 21.524725 corresponde a
+`mono_ns=9960169548506`. Se convierte cada muestra usando esa diferencia.
 
-**Dos intervalos distintos:**
+| Ventana de posix | Resolución de ruta | Lectura BIG | Muestras entre pedidos |
+| --- | ---: | ---: | --- |
+| Ad 62.560222 → pages_fill 62.640993 (80.771 ms) | Ad 0.045 ms, fix_case 0.031 ms | 62.560362, 0.03 ms | 8/8 en +0x43e64 / +0xe3e0dc (62.568172–62.633096) |
+| pages_fill 62.640993 → ras_rl 62.711394 (70.401 ms) | pages_fill 0.043 ms | 62.641124, 0.01 ms | 8/8 en la misma pila (62.643428–62.708919) |
+| Ad al volver, 70.587996 → 70.690500 | 0.058 ms | lectura inmediata | 11/11 en la misma pila (70.596699–70.690315) |
 
-1. De 46.216233 a 47.121333 (905 ms), posix no vuelve a esperar la condición,
-   ni registra otro wait instrumentado. UI Update ya envió 27 broadcasts en
-   18.719 ms. Lo mismo sucede entre 68.895 y 69.654, y durante el lote de Fight
-   Modes enviado a 47.669–47.679: las GNF siguen llegando espaciadas cuando ya no
-   hay nuevos broadcasts del productor. Además, posix hace sus propios broadcasts
-   justo antes de abrir GNF (p.ej. 46.517241), compatibles con tareas que encolan
-   más trabajo. No corresponde afirmar «UI Update manda una textura cada 70 ms».
-2. De 47.121333 a 47.668770 sí espera una cola sin trabajo elegible, unos 547 ms;
-   de 69.653987 a 70.199162 sucede lo mismo, unos 545 ms. Tras el broadcast,
-   retorna en **24 y 21 microsegundos**, respectivamente. La primera apertura está
-   a 52 y 92 microsegundos del broadcast. No son señales perdidas ni un timeout
-   de 70 ms redondeado. La espera indefinida no tiene deadline que redondear.
+En toda la sesión: **8206 muestras**, 6071 en la condición de cola vacía,
+2090 con los retornos +0x43e64/+0xe3e0dc y 45 restantes. El número de muestras
+no es el número de waits: un sampler a ~9 ms puede observar varios sleeps de
+3 ms distintos con idéntica pila. Por tanto, **no demuestra que cada timer
+esté tardando 70–100 ms** ni que una sola espera dure los ~18 s acumulados.
+Tampoco demuestra que el estado pendiente sea GPU; la condición del bucle es
+una consulta virtual a una operación del guest, no un label/fence en esta pila.
 
-## Qué queda sin identificar
+UI Update espera además en otra condición (`0x2f3797b0`), señalada por SimThread
+cada ~33.33 ms; por ejemplo 62.547993 → retorno 62.548011. Esto es distinto de
+la condición del cargador. Los EOP agregados siguen sin pendientes (p.ej.
+77809 decodificados/escritos, línea 16043). No es una medición de latencia de EOP,
+pero tampoco apoya tocar las protecciones por labels tardíos.
 
-La ventana de muestras que termina después del lote inicial (línea 9701) atribuye
-57.6% de posix a `libc.so.6+0xa0950 (from +0)`, 34.1% al mismo RIP con candidato
-`+0x1a391ff` y 7.9% con candidato `+0x2a9e558`. La última ventana (línea 10370)
-da 53.6%, 43.4% y 2.8%. Son agregados de ventana, no muestras con timestamp que
-puedan asignarse a cada hueco. El sampler anterior sólo conserva RIP y el primer
-valor dentro del rango de imagen encontrado en 2048 bytes de stack.
+## Qué falta y por qué no se cambia la semántica todavía
 
-En la libc de esta máquina, `objdump -d --start-address=0xa0920
---stop-address=0xa0980 /usr/lib/libc.so.6` muestra **una instrucción syscall en
-+0xa0950, ret en +0xa0952**, dentro del wrapper interno de syscall cancelable.
-Eso no identifica la syscall: hacen falta registros y pila host. **No permite
-llamarla futex, sleep, espera de GPU o lectura lenta.** Tampoco debe interpretarse
-`from +0` como código guest +0. `+0x2a9e558` ni siquiera pertenece al PT_LOAD
-ejecutable del eboot: en boot.bin contiene datos. Es un candidato encontrado por
-barrido de stack, no evidencia de un llamador. Esta limitación también afecta a
-sitios como `+0x297de30` en el agregado de UI Update.
+Hay dos explicaciones aún compatibles: timers entregados tarde, o sleeps de 3 ms
+normales repetidos mientras la operación consultada permanece pendiente. Los
+logs existentes no registran cada alta/disparo/retorno de timer. No permiten
+comparar sus 3 ms pedidos con la duración real, ni identificar quién publica el
+estado final de esa operación. No corresponde afirmar que sea el ritmo normal
+de PS4 o que haya una textura por tick de UI.
 
-El `.waits` sigue saturado (512 claves; el log ya avisa omisiones). El trace detallado
-sí evita esa tabla para posix, pero sólo cubre las primitivas instrumentadas; no cubre
-cada bloqueo interno host ni rwlocks. UI Update registra principalmente condición
-(aprox. 0.25 llamadas/frame, 8 ms acumulados/frame), sin cronología ni objeto en
-esta corrida. No se puede atribuir su pausa de 545 ms a timer, flip o GPU con eso.
-AssetStream::Lo/Tr/Un tiene esperas de semáforo agregadas, sin asociación de tarea o
-GNF; no identifica al emisor de esta cola. El emisor lo acredita Cond trace.
-
-En el lote inicial los diez reads del BIG cuestan como máximo 0.03 ms, y en el
-lote siguiente 0.04 ms. Los CSV de readbacks están vacíos; los contadores registran
-cero read faults y los EOP no quedan pendientes. Los frames siguen a ~8.33 ms.
-Eso debilita las hipótesis de disco/readback/flip, pero no identifica qué bloqueo
-host ocupa a posix. No hay base para afirmar que una PS4 tarda lo mismo o que el
-juego despacha una textura por tick, ni para tocar sus deadlines o prioridades.
-
-## Revisión de la hipótesis `fix_case`
-
-En los archivos disponibles no hay `ufc83-host.samples`: ni en `logs/` ni en
-`~/ufcCOntext/ufc44-runs/`. La corrida 14:05 precede al sampler host detallado.
-Por eso no se puede atribuir `libc+0xa0950` a `access`, `stat`, `getdents` o futex.
-Las muestras agregadas incluyen `getdents64`, pero sin cronología y con proporción
-redondeada a 0.0%; no prueban que ocupe los huecos.
-
-Hay evidencia adicional contra que la resolución de cada GNF explique su pausa:
-
-| Consulta de ruta (posix) | Read del BIG (/app0) | Intervalo total | Read |
-| --- | --- | ---: | ---: |
-| `tile_Ad_generic`, 46.517276 | 46.517415 | 0.139 ms | 0.03 ms |
-| `pages_fill`, 46.613551 | 46.613671 | 0.120 ms | 0.01 ms |
-| `ras_rl`, 46.704512 | 46.704724 | 0.212 ms | 0.01 ms |
-| `tile_Ad_generic`, 69.084719 | 69.084847 | 0.128 ms | 0.02 ms |
-
-Para los 17 pares GNF → siguiente read del BIG de las ventanas 46.21–47.13 y
-68.86–69.66, sin otra consulta GNF interpuesta, mediana **0.127 ms**, máximo
-**0.616 ms**. Estos intervalos son cotas de la ruta de fallback observada, no
-mediciones directas de `fix_case`, ni asociaciones de tarea acreditadas. Entre
-46.517415 y la siguiente consulta a 46.613551 quedan **96.136 ms** fuera de ese
-intervalo. Las consultas de `disabled_texture_pattern` también se repiten a
-46.342521 / 46.342615 / 46.342684: separaciones de 94 y 69 microsegundos.
-
-Corrección de interpretación: las líneas anteriores de File trace se imprimen en
-`translate`, común a **open/stat/access**. No dicen que el juego haya hecho un
-`open`. Para esas GNF no aparece `Runtime: open(...) -> not found`, a diferencia
-de las LREQ. El log no acredita «un open fallido por GNF». El nuevo trace distingue
-la operación y su resultado. `BB_MODS_DIR` no es un resolver invocado en cada
-consulta: `scripts/mods.py` prepara una vista con enlaces antes de arrancar;
-`do_open` sólo hace `realpath` adicional con `BB_MOD_TRACE=1`. En esta corrida las
-rutas apuntan al `orig` original.
-
-No se implementó un caché negativo sin confirmar su necesidad: podría enmascarar
-el problema y cambiar el comportamiento ante modificaciones del overlay. El runtime
-no vacía temp0; tampoco hay evidencia nueva de que la PS4 tenga este ritmo. No se
-cambiaron timers, señales, prioridades, GPU ni readbacks.
+Si los timers son puntuales, el próximo eslabón es la operación creada por
++0x1bab670/+0xe3a870 y su productor de estado. Eso requiere seguir esa operación,
+no adelantar eventos GPU. No se implementó un caché negativo: las mediciones
+directas vuelven a descartar `fix_case` como explicación de estas pausas.
 
 ## Cambios de esta entrega
 
-- `src/runtime_file.c`: con **BB_FILE_TRACE=2**, líneas de finalización `open`,
-  `stat` y `access`, con ruta guest, resultado (descriptor guest o errno host
-  negativo), timestamp final, `begin` y `resolved in X ms`. Cubren la operación
-  completa, incluidos los retornos fallidos y bookkeeping del host. Una línea
-  `fix_case` separada mide el recorrido de componentes y listados; resultado 1
-  significa corrección, 0 significa sin corrección. Preservan errno al imprimir.
-  Son optativas: total de open/stat/access incluye el trazado anidado, de modo
-  que para medir el resolver se usa la línea `fix_case` (que mide antes de imprimir).
-- Este informe actualiza evidencia y la única prueba pendiente.
-
-El sampler host y el trace de consumidor/productor ya estaban en HEAD al empezar
-esta entrega (`4579d6a`); no son cambios nuevos. `gpu/third_party/fsr-vulkan`
-también ya estaba modificado; no forma parte de esta entrega.
-
-## Única corrida manual solicitada
-
-Mantener ajustes gráficos y temp0; ejecutar desde este worktree:
-
-```bash
-BB_SAVE_LOG=1 BB_FILE_TRACE=2 BB_WAIT_THREAD_TRACE='posix,UI Update' \
-BB_SAMPLE_THREAD=posix BB_SAMPLE_LOG="$PWD/logs/ufc83-host.samples" \
-BB_WAIT_LOG="$PWD/logs/ufc83-host.waits" bash ./run.sh
-```
-
-Menú hasta ver imágenes → Fight Modes → volver y esperar → Fight Now hasta
-retratos → volver → salir normalmente. Enviar el log automático, frames.csv,
-readbacks.csv y los dos archivos `ufc83-host.*`. No hay otra combinación A/B.
-
-Usar `begin`/timestamp para ubicar cada hueco. Si `fix_case` dura decenas de ms y
-las muestras caen en sus llamadas de filesystem, se justifica un índice o caché
-para los mounts de juego de sólo lectura, excluyendo temp0/download0/data/savedata.
-Si las resoluciones terminan en microsegundos, seguir la pila host y registros de
-las muestras dentro del hueco. Una cadena RBP incompleta conserva candidatos,
-que deben verificarse antes de llamarlos sitios de retorno. El trace de UI Update
-mostrará objeto y emisor durante el tramo adicional de ~545 ms.
-
-**Pendiente:** identificar la syscall/dependencia host que ocupa posix durante
-los huecos. No hay arreglo de latencia acreditado ni prueba de ritmo normal del
-juego. No se ejecutó el juego. Esta entrega es diagnóstico acotado para resolver
-la hipótesis solicitada con una sola corrida.
+- `gpu/shadps4/core/libraries/kernel/equeue.{cpp,h}`: **BB_EQUEUE_TRACE=1**, junto
+  con BB_WAIT_THREAD_TRACE, activa cronología sólo para las colas usadas por los
+  hilos seleccionados. Registra `hrtimer-add`, `wait-begin`, `trigger`,
+  `delivered`/`timeout`, con timestamp común a File/Cond trace, thread/tid,
+  handle, nombre, ident, filter y caller inmediato. El callback se registra
+  también aunque lo ejecute otro hilo. No fuerza flush ni cambia deadlines.
+- `duration_us` significa: intervalo pedido en `hrtimer-add`; timeout pedido
+  en `wait-begin` (-1: infinito); edad desde AddEvent en `trigger`; tiempo de
+  espera en `delivered`/`timeout`. La edad de un timer periódico es desde su
+  registro, no desde su último tick; para este HR OneShot es la latencia buscada.
+  Trigger se imprime bajo el mutex del evento, antes de notify_one; el trazado
+  optativo puede añadir su costo de impresión al tiempo de entrega. Los timers
+  pequeños se entregan desde el waiter y no pasan por TriggerEvent.
+- `tests/test_runtime.c`: modo `--equeue-timer-probe`, 20 timers de 3 ms a través
+  del servicio real, sin cargar guest ni inicializar GPU. Verifica ident/filter
+  y entrega; imprime tiempos, sin imponer un límite de scheduler artificial.
+- `tests/test_gpu_runtime_stubs.cpp`: stubs de las dos funciones de diagnóstico
+  del runtime para los targets de renderer sin guest.
+- Este informe reemplaza la conclusión pendiente de la corrida anterior.
 
 ## Verificación
 
-`ufc3-build --test`: **exit 0**, binario generado y checks de runtime,
-filesystem/mods, audio, semáforos, FP, AppContent y red; **42 tests Python OK**.
-Log: `/tmp/ufc83-resolver-build.log`.
-`BB_FILE_TRACE=2 out/file-mods-test`: **exit 0**; confirma las líneas de duración
-para open/stat, con operaciones exitosas y denegadas, sin ejecutar guest/GPU.
-Log: `/tmp/ufc83-resolver-trace.log`. `git diff --check`: OK.
-Estos checks validan la instrumentación y no una reducción de la latencia.
+`ufc3-build --test`: **exit 0** con la revisión final; checks de runtime,
+filesystem/mods, audio, semáforos, FP, AppContent, red y **42 tests Python OK**.
+Log: `/tmp/ufc83-equeue-final-build.log`.
 
-## temp0 y UFC-81
+Con el binario final, `BB_EQUEUE_TRACE=1 BB_WAIT_THREAD_TRACE=runtime-test
+out/runtime-test --equeue-timer-probe`: **exit 0**, 20/20 timers entregados;
+mediana **3.040 ms**, máximo **3.076 ms**. Registra 20 altas, 20 comienzos,
+20 disparos y 20 entregas, con filter=-15 y los ident esperados.
+Log: `/tmp/ufc83-equeue-final-probe.log`. Esto descarta un redondeo fijo a 70 ms
+en este probe sin carga; **no mide el servicio bajo la carga de la sesión guest**.
+`git diff --check`: OK. No se ejecutó el juego.
 
-`runtime_file_configure` sólo crea/monta directorios, sin vaciarlos. El borrado
-relevante de run.sh es el cache CUSA06534, no temp0; no se encontró una limpieza
-createplayer/images en el launcher. La ausencia de cap_* en B no prueba quién
-los quitó ni que el juego los regenere obligatoriamente en todas las sesiones.
-Estas GNF del menú no son SPG capturados; la demora también ocurre al regresar
-sin reiniciar. No se tocaron las protecciones de Career/post-pelea ni el cambio
-`25ff544` de readback lineal: esta evidencia no los implica.
-**UFC-81 sigue valiendo como optimización de picos de upload/protección en Deck;
-el A/B en PC no mejoró la latencia y no resuelve issue #44.**
+## Una sola prueba manual pendiente
+
+Mismos ajustes, sin borrar temp0. Desde este worktree:
+
+```bash
+BB_SAVE_LOG=1 BB_FILE_TRACE=2 BB_EQUEUE_TRACE=1 \
+BB_WAIT_THREAD_TRACE='posix,UI Update' \
+BB_WAIT_LOG="$PWD/logs/ufc83-equeue.waits" bash ./run.sh
+```
+
+Menú hasta ver imágenes → Fight Modes → volver y esperar → Fight Now hasta ver
+retratos → volver → salir. Enviar el log automático, frames.csv y
+`ufc83-equeue.waits`. No se pide A/B ni otro sampler. Correlacionar cada
+`hrtimer-add` de posix con `trigger` y `delivered` de igual cola/ident:
+Un trigger a ~70 ms para un pedido de 3 ms aislaría retraso del servicio;
+trigger a ~3 ms y entrega tardía apuntaría al despertar/scheduler. Múltiples
+pares de ~3 ms antes de la siguiente GNF demostrarían polling repetido y
+dejarían pendiente al productor del estado. Esta prueba **diagnostica**; no se promete reducción de los 3 s.
+
+## temp0, retratos y UFC-81
+
+La revisión previa de runtime_file_configure/run.sh/launcher no encontró limpieza
+de temp0; la ausencia de cap_* en B no identifica quién los quitó. Las GNF del
+menú son independientes de la captura SPG; la demora se reproduce al volver al
+menú sin reiniciar. No se modificó `25ff544`, BB_READBACK_LINEAR_ONLY ni la captura
+de Career/post-pelea. Fight Now aún requiere correlacionar su propia espera;
+no se extrapola esta pila del menú a todos sus retratos.
+
+**UFC-81 sigue siendo útil como optimización de picos de upload/protección en
+Deck; el A/B en PC no mejoró la latencia y no resuelve issue #44.**

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,6 +22,9 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+
+extern "C" int runtime_wait_trace_selected();
+extern "C" void runtime_trace_stamp(char*, size_t);
 
 namespace Libraries::Kernel {
 
@@ -53,6 +57,27 @@ static EqueueInternal* QueueTake(s32 eq) {
     return q;
 }
 static constexpr auto HrTimerSpinlockThresholdNs = 1200000u;
+
+bool EqueueInternal::TraceSelected() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_EQUEUE_TRACE");
+        return value && value[0] == '1';
+    }();
+    const bool selected = enabled && runtime_wait_trace_selected();
+    if (selected) m_trace.store(true, std::memory_order_relaxed);
+    return selected;
+}
+
+void EqueueInternal::TraceEvent(const char* action, const OrbisKernelEvent* event,
+                              double duration_us, const void* caller) const {
+    if (!m_trace.load(std::memory_order_relaxed)) return;
+    char stamp[96];
+    runtime_trace_stamp(stamp, sizeof(stamp));
+    std::printf("Equeue trace: %s%s eq=%lld name=\"%s\" ident=%llu filter=%d "
+                "duration_us=%.3f caller=%p\n", stamp, action, (long long)m_handle,
+                m_name.c_str(), event ? (unsigned long long)event->ident : 0ull,
+                event ? int(event->filter) : 0, duration_us, caller);
+}
 
 EqueueInternal* GetEqueue(OrbisKernelEqueue eq) {
     if (!QueueContains(eq)) {
@@ -275,6 +300,13 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
                     event.Trigger(trigger_data);
                 }
                 has_found = true;
+                if (m_trace.load(std::memory_order_relaxed)) {
+                    const double age_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - event.time_added).count();
+                    // Print while the waiter cannot consume/delete the queue; do not
+                    // access it after notify_one just to print a diagnostic.
+                    TraceEvent("trigger", &event.event, age_us);
+                }
             }
         }
     }
@@ -587,7 +619,16 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
     }
 
     const auto wait_start = std::chrono::steady_clock::now();
+    const bool trace = equeue->TraceSelected();
+    const void* caller = trace ? __builtin_return_address(0) : nullptr;
+    if (trace) equeue->TraceEvent("wait-begin", nullptr, timo ? double(*timo) : -1., caller);
     *out = equeue->WaitForEvents(ev, num, timo);
+    if (trace) {
+        const double elapsed = std::chrono::duration<double, std::micro>(
+                                   std::chrono::steady_clock::now() - wait_start).count();
+        if (*out == 0) equeue->TraceEvent("timeout", nullptr, elapsed, caller);
+        for (int i = 0; i < *out; ++i) equeue->TraceEvent("delivered", &ev[i], elapsed, caller);
+    }
     {
         const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)
@@ -654,6 +695,10 @@ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKer
     // large. Even for large delays, we truncate a small portion to complete the wait
     // using the spinlock, prioritizing precision.
     auto* equeue = QueueGet(eq);
+    if (equeue->TraceSelected()) {
+        equeue->TraceEvent("hrtimer-add", &event.event, double(total_ns) / 1000.,
+                           __builtin_return_address(0));
+    }
     if (total_ns < HrTimerSpinlockThresholdNs) {
         return equeue->AddSmallTimer(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
     }
