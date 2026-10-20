@@ -6,6 +6,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -42,5 +43,9 @@ bool MenuOpen();
 
 /// Window thread: the game's text dialog (ImeDialog) state, drawn as a box over the frame.
 void SetTextPrompt(bool active, const std::string& prompt, const std::string& text);
+
+/// UFC-82: queues a trophy toast (any thread; bbgpu_trophy_toast). name may be empty; rgba is the
+/// icon (w x h), empty when there is none. Off with bbport.ini trophy_notifications=0.
+void ShowTrophy(int id, std::string name, std::vector<u8> rgba, int w, int h);
 
 } // namespace BbOverlay

@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/bbgpu.h"
+#include "runtime_trophy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -315,28 +316,45 @@ static ABI int32_t ime_result(uint32_t *result) {
 }
 static ABI int32_t ime_term(void) { memset(&ime,0,sizeof(ime)); return 0; }
 
-/* ---- Trophies: accepted locally, recorded in the log ---- */
+/* ---- Trophies: kept locally (runtime_trophy.c: trophies.json in the user folder, a toast) ---- */
+#define TROPHY_INVALID_ID ((int32_t)0x8055160A)
+static int trophies_configured;
 static ABI int32_t trophy_context(int32_t *ctx,int32_t user,uint32_t label,uint64_t options) {
-    (void)user; (void)label; (void)options;
+    (void)user; (void)options;
     if (!ctx) return TROPHY_INVALID;
+    static pthread_mutex_t configure_lock=PTHREAD_MUTEX_INITIALIZER; /* a second context waits for the first */
+    pthread_mutex_lock(&configure_lock);
+    if (!trophies_configured) {
+        trophies_configured=1;
+        char guest[64], trp[1024]="", npbind[1024]="", json[1024], keys[1024];
+        snprintf(guest,sizeof guest,"/app0/sce_sys/trophy/trophy%02u.trp",label<100 ? label : 0);
+        int have_trp=!runtime_file_translate(guest,trp,sizeof trp);
+        int have_npbind=!runtime_file_translate("/app0/sce_sys/npbind.dat",npbind,sizeof npbind);
+        snprintf(json,sizeof json,"%s/trophies.json",runtime_file_user_dir());
+        snprintf(keys,sizeof keys,"%s/keys.json",runtime_file_user_dir());
+        runtime_trophy_configure(have_trp ? trp : NULL,have_npbind ? npbind : NULL,json,getenv("BB_CONFIG"),keys);
+    }
+    pthread_mutex_unlock(&configure_lock);
     *ctx=new_id(); return 0;
 }
 static ABI int32_t trophy_handle(int32_t *handle) { if (!handle) return TROPHY_INVALID; *handle=new_id(); return 0; }
 static ABI int32_t trophy_register(int32_t ctx,int32_t handle,uint64_t options) { (void)ctx; (void)handle; (void)options; return 0; }
 static ABI int32_t trophy_unlock(int32_t ctx,int32_t handle,int32_t id,int32_t *platinum) {
     (void)ctx; (void)handle;
-    printf("Runtime: trophy %d unlocked\n",id);
-    if (platinum) *platinum=-1;
+    int plat=-1;
+    if (runtime_trophy_unlock(id,&plat)<0) return TROPHY_INVALID_ID;
+    /* An unlocked trophy again answers OK, as before UFC-82 (the PS4 says ALREADY_UNLOCKED). */
+    if (platinum) *platinum=plat;
     return 0;
 }
 static ABI int32_t trophy_game_info(int32_t ctx,int32_t handle,void *details,void *data) {
     (void)ctx; (void)handle;
-    if (details) { uint64_t size; memcpy(&size,details,8); memset((char *)details+8,0,size>8 && size<4096 ? size-8 : 0); }
-    if (data) { uint64_t size; memcpy(&size,data,8); memset((char *)data+8,0,size>8 && size<4096 ? size-8 : 0); }
+    runtime_trophy_game_info(details,data);
     return 0;
 }
 static ABI int32_t trophy_info(int32_t ctx,int32_t handle,int32_t id,void *details,void *data) {
-    (void)id; return trophy_game_info(ctx,handle,details,data);
+    (void)ctx; (void)handle;
+    return runtime_trophy_info(id,details,data) ? TROPHY_INVALID_ID : 0;
 }
 
 /* ---- PlayGo: fully installed package ---- */

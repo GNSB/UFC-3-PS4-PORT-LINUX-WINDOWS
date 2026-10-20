@@ -4,6 +4,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 #include "common/types.h"
 
 struct SDL_Window;
@@ -18,6 +19,9 @@ struct WindowSystemInfo {
     float render_surface_scale = 1.0f;
     WindowSystemType type = WindowSystemType::Headless;
 };
+
+/// 8-bit RGB/RGBA PNG (no interlace) to RGBA; false for anything else.
+bool DecodePngRgba(const std::vector<u8>& data, std::vector<u8>& rgba, int& width, int& height);
 
 class WindowSDL {
 public:

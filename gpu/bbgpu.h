@@ -37,6 +37,14 @@ int bbgpu_overlay_captures_input(void);
 /* SacredFire: 1 once after the in-game menu's "Rescan controllers" button (runtime_pad.c restarts
  * SDL's gamepad subsystem and enumerates devices afresh); cleared by the call. */
 int bbgpu_pad_rescan_take(void);
+/* UFC-82: a trophy was unlocked: a toast of about 4 s over the frame (bbport.ini
+ * trophy_notifications=0 turns it off). name: the trophy's name, or NULL ("Trophy unlocked: #N");
+ * png: its icon from the .trp (copied; may be NULL). */
+void bbgpu_trophy_toast(int32_t id, const char *name_utf8, const void *png, uint64_t png_size);
+/* UFC-82: decrypts a .trp's ESFM: AES-128-CBC with the key the trophy key makes of the NP
+ * communication id (shadPS4 trp.cpp). size: a multiple of 16. 1 on success. */
+int bbgpu_trophy_decrypt(const uint8_t key[16], const char np_comm_id[16], const uint8_t iv[16],
+                         const uint8_t *in, uint64_t size, uint8_t *out);
 /* Patches the loaded image before the game runs (image still writable): libGnm entry hooks. */
 void bbgpu_patch_image(unsigned char *image, uint64_t size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
