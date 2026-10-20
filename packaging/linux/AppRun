@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here=$(cd -- "$(dirname -- "$0")" && pwd)
+# Suppress bytecode writes into the read-only mounted payload. All other writable
+# paths and argument handling come from the unchanged Linux release launcher.
+export PYTHONDONTWRITEBYTECODE=1
+exec "$here/usr/lib/UFC3Native/ufc3.sh" "$@"

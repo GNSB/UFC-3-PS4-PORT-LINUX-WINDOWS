@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=UFC 3 Native
+Comment=Launch UFC 3 with your own game dump
+Exec=AppRun
+Icon=UFC3Native
+Terminal=false
+Categories=Game;SportsGame;
