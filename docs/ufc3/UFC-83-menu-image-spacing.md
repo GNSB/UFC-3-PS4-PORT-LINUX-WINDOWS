@@ -1,4 +1,4 @@
-# UFC-83 / issue #44: corrida de las 14:05 (tercera revisión)
+# UFC-83 / issue #44: corrida de las 14:05 y revisión de fix_case
 
 **Estado: causa final pendiente; no hay arreglo acreditado de la latencia.** La nueva
 corrida demuestra que seguir únicamente al despachador no explica los huecos: hay
@@ -92,25 +92,60 @@ Eso debilita las hipótesis de disco/readback/flip, pero no identifica qué bloq
 host ocupa a posix. No hay base para afirmar que una PS4 tarda lo mismo o que el
 juego despacha una textura por tick, ni para tocar sus deadlines o prioridades.
 
-## Cambios de esta revisión
+## Revisión de la hipótesis `fix_case`
 
-- `src/runtime_kernel.c`: `BB_SAMPLE_LOG` con `BB_SAMPLE_THREAD` guarda muestras
-  temporales cada 16 señales (~9 ms). Conserva RIP, RAX/RDI/RSI/RDX/R10, cadena
-  RBP (hasta 16 frames) y 16 palabras de stack etiquetadas como **candidatos**.
-  Simboliza host con módulo/offset fuera del handler. Un ancla relaciona el reloj
-  monotónico con File/Cond trace. El buffer SPSC es acotado y cuenta pérdidas;
-  no escribe ni toma locks de stdio desde SIGPROF. Preserva errno al interrumpir.
-  Una biblioteca sin frame pointers puede omitir frames: la cadena no es completa.
-- `src/runtime_kernel.c`, `src/runtime_mutex.c`, `src/runtime.h`:
-  `BB_WAIT_THREAD_TRACE` acepta nombres exactos separados por coma. Así se pueden
-  registrar tanto consumidor como productor en una sola corrida, con objetos,
-  deadlines y emisores de las condiciones donde espera UI Update.
-- `tests/test_runtime.c`: smoke optativo `--sample-trace-smoke`, sin guest/GPU;
-  comprueba salida temporal y conservación de errno bajo señales.
+En los archivos disponibles no hay `ufc83-host.samples`: ni en `logs/` ni en
+`~/ufcCOntext/ufc44-runs/`. La corrida 14:05 precede al sampler host detallado.
+Por eso no se puede atribuir `libc+0xa0950` a `access`, `stat`, `getdents` o futex.
+Las muestras agregadas incluyen `getdents64`, pero sin cronología y con proporción
+redondeada a 0.0%; no prueban que ocupe los huecos.
 
-No se cambiaron semánticas de carga. Los diagnósticos nuevos son optativos y
-pueden perturbar el timing. `gpu/third_party/fsr-vulkan` ya estaba modificado al
-empezar; no forma parte de esta entrega.
+Hay evidencia adicional contra que la resolución de cada GNF explique su pausa:
+
+| Consulta de ruta (posix) | Read del BIG (/app0) | Intervalo total | Read |
+| --- | --- | ---: | ---: |
+| `tile_Ad_generic`, 46.517276 | 46.517415 | 0.139 ms | 0.03 ms |
+| `pages_fill`, 46.613551 | 46.613671 | 0.120 ms | 0.01 ms |
+| `ras_rl`, 46.704512 | 46.704724 | 0.212 ms | 0.01 ms |
+| `tile_Ad_generic`, 69.084719 | 69.084847 | 0.128 ms | 0.02 ms |
+
+Para los 17 pares GNF → siguiente read del BIG de las ventanas 46.21–47.13 y
+68.86–69.66, sin otra consulta GNF interpuesta, mediana **0.127 ms**, máximo
+**0.616 ms**. Estos intervalos son cotas de la ruta de fallback observada, no
+mediciones directas de `fix_case`, ni asociaciones de tarea acreditadas. Entre
+46.517415 y la siguiente consulta a 46.613551 quedan **96.136 ms** fuera de ese
+intervalo. Las consultas de `disabled_texture_pattern` también se repiten a
+46.342521 / 46.342615 / 46.342684: separaciones de 94 y 69 microsegundos.
+
+Corrección de interpretación: las líneas anteriores de File trace se imprimen en
+`translate`, común a **open/stat/access**. No dicen que el juego haya hecho un
+`open`. Para esas GNF no aparece `Runtime: open(...) -> not found`, a diferencia
+de las LREQ. El log no acredita «un open fallido por GNF». El nuevo trace distingue
+la operación y su resultado. `BB_MODS_DIR` no es un resolver invocado en cada
+consulta: `scripts/mods.py` prepara una vista con enlaces antes de arrancar;
+`do_open` sólo hace `realpath` adicional con `BB_MOD_TRACE=1`. En esta corrida las
+rutas apuntan al `orig` original.
+
+No se implementó un caché negativo sin confirmar su necesidad: podría enmascarar
+el problema y cambiar el comportamiento ante modificaciones del overlay. El runtime
+no vacía temp0; tampoco hay evidencia nueva de que la PS4 tenga este ritmo. No se
+cambiaron timers, señales, prioridades, GPU ni readbacks.
+
+## Cambios de esta entrega
+
+- `src/runtime_file.c`: con **BB_FILE_TRACE=2**, líneas de finalización `open`,
+  `stat` y `access`, con ruta guest, resultado (descriptor guest o errno host
+  negativo), timestamp final, `begin` y `resolved in X ms`. Cubren la operación
+  completa, incluidos los retornos fallidos y bookkeeping del host. Una línea
+  `fix_case` separada mide el recorrido de componentes y listados; resultado 1
+  significa corrección, 0 significa sin corrección. Preservan errno al imprimir.
+  Son optativas: total de open/stat/access incluye el trazado anidado, de modo
+  que para medir el resolver se usa la línea `fix_case` (que mide antes de imprimir).
+- Este informe actualiza evidencia y la única prueba pendiente.
+
+El sampler host y el trace de consumidor/productor ya estaban en HEAD al empezar
+esta entrega (`4579d6a`); no son cambios nuevos. `gpu/third_party/fsr-vulkan`
+también ya estaba modificado; no forma parte de esta entrega.
 
 ## Única corrida manual solicitada
 
@@ -126,21 +161,28 @@ Menú hasta ver imágenes → Fight Modes → volver y esperar → Fight Now has
 retratos → volver → salir normalmente. Enviar el log automático, frames.csv,
 readbacks.csv y los dos archivos `ufc83-host.*`. No hay otra combinación A/B.
 
-La prueba debe revelar la pila host dentro de los huecos (y registros si sigue en
-syscall) y el wait con objeto/emisor de UI Update durante la pausa de ~545 ms.
-Si falta algún frame host, quedan módulo/offset y candidatos para resolverlo;
-no es garantía de que todos los llamadores puedan reconstruirse. Hasta conocer
-esa dependencia, la causa final y un arreglo de la latencia siguen pendientes.
+Usar `begin`/timestamp para ubicar cada hueco. Si `fix_case` dura decenas de ms y
+las muestras caen en sus llamadas de filesystem, se justifica un índice o caché
+para los mounts de juego de sólo lectura, excluyendo temp0/download0/data/savedata.
+Si las resoluciones terminan en microsegundos, seguir la pila host y registros de
+las muestras dentro del hueco. Una cadena RBP incompleta conserva candidatos,
+que deben verificarse antes de llamarlos sitios de retorno. El trace de UI Update
+mostrará objeto y emisor durante el tramo adicional de ~545 ms.
+
+**Pendiente:** identificar la syscall/dependencia host que ocupa posix durante
+los huecos. No hay arreglo de latencia acreditado ni prueba de ritmo normal del
+juego. No se ejecutó el juego. Esta entrega es diagnóstico acotado para resolver
+la hipótesis solicitada con una sola corrida.
 
 ## Verificación
 
-`ufc3-build --test`: **exit 0**, binario generado, checks de runtime, filesystem,
-audio, semáforos, event flags, FP, AppContent y red; **42 tests Python OK**.
-Log local: `/tmp/ufc83-build-final-review.log`.
-`out/runtime-test --sample-trace-smoke`: **exit 0**, salida temporal y errno PASS;
-log `/tmp/ufc83-sample-smoke-final.log`. `git diff --check`: OK.
-No se ejecutó el juego. Estas comprobaciones validan el diagnóstico añadido, no una
-mejora visual ni la causa final.
+`ufc3-build --test`: **exit 0**, binario generado y checks de runtime,
+filesystem/mods, audio, semáforos, FP, AppContent y red; **42 tests Python OK**.
+Log: `/tmp/ufc83-resolver-build.log`.
+`BB_FILE_TRACE=2 out/file-mods-test`: **exit 0**; confirma las líneas de duración
+para open/stat, con operaciones exitosas y denegadas, sin ejecutar guest/GPU.
+Log: `/tmp/ufc83-resolver-trace.log`. `git diff --check`: OK.
+Estos checks validan la instrumentación y no una reducción de la latencia.
 
 ## temp0 y UFC-81
 
@@ -148,8 +190,8 @@ mejora visual ni la causa final.
 relevante de run.sh es el cache CUSA06534, no temp0; no se encontró una limpieza
 createplayer/images en el launcher. La ausencia de cap_* en B no prueba quién
 los quitó ni que el juego los regenere obligatoriamente en todas las sesiones.
-Estas GNF del menú no son
-SPG capturados; la demora también ocurre al regresar sin reiniciar. No corresponde
-cambiar temp0 o readback para solucionar esta cadena aún no resuelta.
+Estas GNF del menú no son SPG capturados; la demora también ocurre al regresar
+sin reiniciar. No se tocaron las protecciones de Career/post-pelea ni el cambio
+`25ff544` de readback lineal: esta evidencia no los implica.
 **UFC-81 sigue valiendo como optimización de picos de upload/protección en Deck;
 el A/B en PC no mejoró la latencia y no resuelve issue #44.**

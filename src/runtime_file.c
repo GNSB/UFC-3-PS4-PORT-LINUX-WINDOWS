@@ -67,6 +67,19 @@ static void trace_read(int fd,const char *op,uint64_t size,int64_t offset,ssize_
     printf("File trace: %s%s %s %llu @%lld -> %lld in %.2f ms\n",stamp,op,f ? f->path : "?",(unsigned long long)size,
            (long long)offset,(long long)n,(platform_monotonic_ns()-start)/1e6);
 }
+/* Completion records distinguish a failed loose-file probe from an open/read of a BIG.
+ * Measure the whole operation, including case recovery and host bookkeeping. Logging is
+ * outside the measured interval; preserve errno for callers of the case resolver. */
+static void trace_resolved(const char *op,const char *path,int64_t result,uint64_t start) {
+    if (!start) return;
+    uint64_t end=platform_monotonic_ns();
+    int saved_errno=errno;
+    char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
+    printf("File trace: %s%s %s -> %lld resolved in %.3f ms (begin=%.6f)\n",
+           stamp,op,path ? path : "(null)",(long long)result,(end-start)/1e6,
+           (start-trace_base)/1e9);
+    errno=saved_errno;
+}
 
 static int save_path(const char *p) { return p && !strncmp(p,"/savedata",9); }
 static int temp_name(const char *name) {
@@ -200,7 +213,7 @@ static int equal_ignoring_case(const char *a,const char *b) {
     }
 }
 /* A root ("/" or "C:/") stays as it is; the components after it are matched one by one. */
-static int fix_case(char *path) {
+static int fix_case_impl(char *path) {
     const char *p=path;
     char out[1024]="", trial[1024], part[256];
     if (path[0]=='/') ++p;
@@ -230,6 +243,12 @@ static int fix_case(char *path) {
     if (!strcmp(out,path) || strlen(out)!=strlen(path)) return 0;
     memcpy(path,out,strlen(out)+1);
     return 1;
+}
+static int fix_case(char *path) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int r=fix_case_impl(path);
+    trace_resolved("fix_case",path,r,start);
+    return r;
 }
 static void free_listing(Listing *l) { platform_free_listing(l); }
 /* The directory's entries without the save copies in progress (name.N.bbtmp). */
@@ -346,7 +365,7 @@ static int commit_file(const File *f) {
     return 0;
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
-static int64_t do_open(const char *guest,int flags,int mode) {
+static int64_t do_open_impl(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
@@ -405,6 +424,12 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     }
     if (save_trace() && save_path(guest)) printf("Save trace: open(%s) -> fd %d\n",guest,fd);
     return fd;
+}
+static int64_t do_open(const char *guest,int flags,int mode) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int64_t r=do_open_impl(guest,flags,mode);
+    trace_resolved("open",guest,r,start);
+    return r;
 }
 static int64_t do_close(int fd) {
     if (fd>=0 && fd<3) return 0;
@@ -552,7 +577,7 @@ static int64_t do_fstat(int fd,GuestStat *out) {
     if (r) return r;
     convert_stat(&s,out); return 0;
 }
-static int64_t do_stat(const char *guest,GuestStat *out) {
+static int64_t do_stat_impl(const char *guest,GuestStat *out) {
     char path[1024]; PlatformStat s;
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
@@ -563,6 +588,12 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes\n",guest,r,r ? -1LL : (long long)s.size);
     if (r) return r;
     convert_stat(&s,out); return 0;
+}
+static int64_t do_stat(const char *guest,GuestStat *out) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int64_t r=do_stat_impl(guest,out);
+    trace_resolved("stat",guest,r,start);
+    return r;
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
     pthread_mutex_lock(&lock);
@@ -629,13 +660,19 @@ static int64_t do_truncate(const char *guest,int64_t length) {
     return platform_truncate(path,length);
 }
 static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return platform_fsync(h); }
-static int64_t do_access(const char *guest,int mode) {
+static int64_t do_access_impl(const char *guest,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),0);
     int r=platform_access(path,mode&7);
     if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=platform_access(path,mode&7);
+    return r;
+}
+static int64_t do_access(const char *guest,int mode) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int64_t r=do_access_impl(guest,mode);
+    trace_resolved("access",guest,r,start);
     return r;
 }
 
