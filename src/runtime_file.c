@@ -46,6 +46,41 @@ static int t4_path(const char *p) {
         (!strncmp(p,"/temp0/createplayer",19) || !strncmp(p,"/temp0/images",13));
 }
 
+/* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files), with
+ * the seconds since the file system was configured and the thread; =2 also every read and pread
+ * (UFC-83: when a menu image is asked for, read and how long the read took). */
+static uint64_t trace_base;
+static int file_trace(void) {
+    static int trace=-1;
+    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && (t[0]=='1' || t[0]=='2') ? t[0]-'0' : 0; }
+    return trace;
+}
+void runtime_trace_stamp(char *out,size_t size) {
+    char name[32]; platform_thread_get_name(name,sizeof(name));
+    snprintf(out,size,"[%.6f %s tid=%llu] ",(platform_monotonic_ns()-trace_base)/1e9,name,
+             (unsigned long long)platform_thread_id());
+}
+static void trace_read(int fd,const char *op,uint64_t size,int64_t offset,ssize_t n,uint64_t start) {
+    if (file_trace()<2) return;
+    char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
+    File *f= fd>=3 && fd<MAX_FILES && files[fd].used ? &files[fd] : NULL;
+    printf("File trace: %s%s %s %llu @%lld -> %lld in %.2f ms\n",stamp,op,f ? f->path : "?",(unsigned long long)size,
+           (long long)offset,(long long)n,(platform_monotonic_ns()-start)/1e6);
+}
+/* Completion records distinguish a failed loose-file probe from an open/read of a BIG.
+ * Measure the whole operation, including case recovery and host bookkeeping. Logging is
+ * outside the measured interval; preserve errno for callers of the case resolver. */
+static void trace_resolved(const char *op,const char *path,int64_t result,uint64_t start) {
+    if (!start) return;
+    uint64_t end=platform_monotonic_ns();
+    int saved_errno=errno;
+    char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
+    printf("File trace: %s%s %s -> %lld resolved in %.3f ms (begin=%.6f)\n",
+           stamp,op,path ? path : "(null)",(long long)result,(end-start)/1e6,
+           (start-trace_base)/1e9);
+    errno=saved_errno;
+}
+
 static int save_path(const char *p) { return p && !strncmp(p,"/savedata",9); }
 static int temp_name(const char *name) {
     size_t n=strlen(name);
@@ -95,6 +130,7 @@ const char *runtime_file_user_dir(void) { return user_root; }
 void runtime_file_configure(const char *app0,const char *user) {
     char path[600];
     snprintf(user_root,sizeof(user_root),"%s",user);
+    trace_base=platform_monotonic_ns();
     runtime_file_mount("/app0",app0);
     runtime_file_mount("/hostapp",app0);
     const char *writable[]={"temp0","download0","data"};
@@ -162,10 +198,7 @@ static int translate(const char *guest,char *out,size_t size) {
             }
         }
     }
-    /* BB_FILE_TRACE=1: every guest path the game opens, stats or checks (mods, missing files). */
-    static int trace=-1;
-    if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && t[0]=='1'; }
-    if (trace) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
+    if (file_trace()) { char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp)); printf("File trace: %s%s -> %s\n",stamp,guest,result ? "(no mount)" : out); }
     return result;
 }
 /* The PS4's file system ignores case, and the game asks for lower-case names
@@ -180,7 +213,7 @@ static int equal_ignoring_case(const char *a,const char *b) {
     }
 }
 /* A root ("/" or "C:/") stays as it is; the components after it are matched one by one. */
-static int fix_case(char *path) {
+static int fix_case_impl(char *path) {
     const char *p=path;
     char out[1024]="", trial[1024], part[256];
     if (path[0]=='/') ++p;
@@ -210,6 +243,12 @@ static int fix_case(char *path) {
     if (!strcmp(out,path) || strlen(out)!=strlen(path)) return 0;
     memcpy(path,out,strlen(out)+1);
     return 1;
+}
+static int fix_case(char *path) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int r=fix_case_impl(path);
+    trace_resolved("fix_case",path,r,start);
+    return r;
 }
 static void free_listing(Listing *l) { platform_free_listing(l); }
 /* The directory's entries without the save copies in progress (name.N.bbtmp). */
@@ -326,7 +365,7 @@ static int commit_file(const File *f) {
     return 0;
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
-static int64_t do_open(const char *guest,int flags,int mode) {
+static int64_t do_open_impl(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
@@ -385,6 +424,12 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     }
     if (save_trace() && save_path(guest)) printf("Save trace: open(%s) -> fd %d\n",guest,fd);
     return fd;
+}
+static int64_t do_open(const char *guest,int flags,int mode) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int64_t r=do_open_impl(guest,flags,mode);
+    trace_resolved("open",guest,r,start);
+    return r;
 }
 static int64_t do_close(int fd) {
     if (fd>=0 && fd<3) return 0;
@@ -457,7 +502,9 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
+    uint64_t start=file_trace()>1 ? platform_monotonic_ns() : 0;
     ssize_t n=read_retrying(h,buffer,size,0,0);
+    trace_read(fd,"read",size,-1,n,start);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     t4_io(fd,"read",buffer,n,1);
@@ -469,7 +516,9 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
+    uint64_t start=file_trace()>1 ? platform_monotonic_ns() : 0;
     ssize_t n=read_retrying(h,buffer,size,offset,1);
+    trace_read(fd,"pread",size,offset,n,start);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     t4_io(fd,"pread",buffer,n,1);
@@ -528,7 +577,7 @@ static int64_t do_fstat(int fd,GuestStat *out) {
     if (r) return r;
     convert_stat(&s,out); return 0;
 }
-static int64_t do_stat(const char *guest,GuestStat *out) {
+static int64_t do_stat_impl(const char *guest,GuestStat *out) {
     char path[1024]; PlatformStat s;
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
@@ -539,6 +588,12 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     if (save_trace() && save_path(guest)) printf("Save trace: stat(%s) -> %d, %lld bytes\n",guest,r,r ? -1LL : (long long)s.size);
     if (r) return r;
     convert_stat(&s,out); return 0;
+}
+static int64_t do_stat(const char *guest,GuestStat *out) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int64_t r=do_stat_impl(guest,out);
+    trace_resolved("stat",guest,r,start);
+    return r;
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
     pthread_mutex_lock(&lock);
@@ -605,13 +660,19 @@ static int64_t do_truncate(const char *guest,int64_t length) {
     return platform_truncate(path,length);
 }
 static int64_t do_fsync(int fd) { int h=host_fd(fd); if (h<0) return -EBADF; return platform_fsync(h); }
-static int64_t do_access(const char *guest,int mode) {
+static int64_t do_access_impl(const char *guest,int mode) {
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     if (save_path(guest)) current_copy(path,sizeof(path),0);
     int r=platform_access(path,mode&7);
     if (r==-ENOENT && !save_path(guest) && fix_case(path)) r=platform_access(path,mode&7);
+    return r;
+}
+static int64_t do_access(const char *guest,int mode) {
+    uint64_t start=file_trace()>=2 ? platform_monotonic_ns() : 0;
+    int64_t r=do_access_impl(guest,mode);
+    trace_resolved("access",guest,r,start);
     return r;
 }
 

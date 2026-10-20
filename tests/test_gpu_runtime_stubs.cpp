@@ -48,6 +48,8 @@ void runtime_memory_set_guest_chunk_whole(int) {}
 int runtime_memory_vma_info(uintptr_t, int*, int*, uintptr_t*) { std::abort(); }
 int runtime_memory_direct_phys(uintptr_t, uint64_t*, uintptr_t*) { std::abort(); }
 void runtime_wait_report(double) {}
+int runtime_wait_trace_selected() { return 0; }
+void runtime_trace_stamp(char* out, size_t size) { std::snprintf(out, size, "[test] "); }
 void runtime_sleep_stats(uint64_t* calls, uint64_t* ns) { *calls = 0; *ns = 0; }
 uint64_t runtime_heap_growths() { return 0; }
 }

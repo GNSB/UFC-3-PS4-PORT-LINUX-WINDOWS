@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <array>
 #include <thread>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,6 +23,9 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+
+extern "C" int runtime_wait_trace_selected();
+extern "C" void runtime_trace_stamp(char*, size_t);
 
 namespace Libraries::Kernel {
 
@@ -53,6 +58,98 @@ static EqueueInternal* QueueTake(s32 eq) {
     return q;
 }
 static constexpr auto HrTimerSpinlockThresholdNs = 1200000u;
+
+namespace {
+// TraceEvent can run with m_mutex held, including on the kernel timer service.
+// Never write a file or wait for a logger there: a slow stdout pipe used to
+// delay the very event delivery being measured. Bounded, nonblocking producers;
+// the frame-stat reporter drains copied records outside all queue locks.
+struct EqueueTraceRecord {
+    char stamp[96], name[33];
+    const char* action;
+    OrbisKernelEqueue queue;
+    u64 ident;
+    int filter;
+    double duration_us;
+    const void* caller;
+};
+std::array<EqueueTraceRecord, 8192> equeue_trace_records;
+std::atomic_flag equeue_trace_busy = ATOMIC_FLAG_INIT;
+std::atomic<u64> equeue_trace_dropped{0};
+u64 equeue_trace_write = 0, equeue_trace_read = 0;
+
+void DrainEqueueTrace() {
+    // Only ReportEqueueWaits calls this (one consumer). File initialization and
+    // all output happen here, never on guest wait/trigger paths.
+    static FILE* output = nullptr;
+    bool wrote = false;
+    for (size_t i = 0; i < equeue_trace_records.size(); ++i) {
+        if (equeue_trace_busy.test_and_set(std::memory_order_acquire)) break;
+        if (equeue_trace_read == equeue_trace_write) {
+            equeue_trace_busy.clear(std::memory_order_release);
+            break;
+        }
+        const auto record = equeue_trace_records[equeue_trace_read++ % equeue_trace_records.size()];
+        equeue_trace_busy.clear(std::memory_order_release);
+        if (!output) {
+            const char* path = std::getenv("BB_EQUEUE_LOG");
+            output = path && *path ? std::fopen(path, "w") : stdout;
+            if (!output) {
+                std::perror("BB_EQUEUE_LOG");
+                output = stdout;
+            }
+        }
+        std::fprintf(output, "Equeue trace: %s%s eq=%lld name=\"%s\" ident=%llu filter=%d "
+                     "duration_us=%.3f caller=%p\n", record.stamp, record.action,
+                     (long long)record.queue, record.name, (unsigned long long)record.ident,
+                     record.filter, record.duration_us, record.caller);
+        wrote = true;
+    }
+    const u64 dropped = equeue_trace_dropped.exchange(0, std::memory_order_relaxed);
+    if (dropped) {
+        std::fprintf(output ? output : stderr, "Equeue trace incomplete: dropped=%llu records\n",
+                     (unsigned long long)dropped);
+    }
+    if (output && (wrote || dropped)) std::fflush(output);
+}
+} // namespace
+
+bool EqueueInternal::TraceSelected() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_EQUEUE_TRACE");
+        return value && value[0] == '1';
+    }();
+    const bool selected = enabled && runtime_wait_trace_selected();
+    if (selected) m_trace.store(true, std::memory_order_relaxed);
+    // A shared queue can be consumed by a different thread. Trace every
+    // consumer once selected, otherwise a punctual trigger can appear to
+    // disappear and the selected waiter can receive an unrelated timer.
+    return m_trace.load(std::memory_order_relaxed);
+}
+
+void EqueueInternal::TraceEvent(const char* action, const OrbisKernelEvent* event,
+                              double duration_us, const void* caller) const {
+    if (!m_trace.load(std::memory_order_relaxed)) return;
+    EqueueTraceRecord record{};
+    runtime_trace_stamp(record.stamp, sizeof(record.stamp));
+    std::snprintf(record.name, sizeof(record.name), "%s", m_name.c_str());
+    record.action = action; // All callers pass string literals.
+    record.queue = m_handle;
+    record.ident = event ? event->ident : 0;
+    record.filter = event ? int(event->filter) : 0;
+    record.duration_us = duration_us;
+    record.caller = caller;
+    if (equeue_trace_busy.test_and_set(std::memory_order_acquire)) {
+        equeue_trace_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (equeue_trace_write - equeue_trace_read == equeue_trace_records.size()) {
+        equeue_trace_dropped.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        equeue_trace_records[equeue_trace_write++ % equeue_trace_records.size()] = record;
+    }
+    equeue_trace_busy.clear(std::memory_order_release);
+}
 
 EqueueInternal* GetEqueue(OrbisKernelEqueue eq) {
     if (!QueueContains(eq)) {
@@ -275,6 +372,13 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
                     event.Trigger(trigger_data);
                 }
                 has_found = true;
+                if (m_trace.load(std::memory_order_relaxed)) {
+                    const double age_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - event.time_added).count();
+                    // Copy while the waiter cannot consume/delete the event. The
+                    // reporter writes it later without holding this queue's mutex.
+                    TraceEvent("trigger", &event.event, age_us);
+                }
             }
         }
     }
@@ -545,6 +649,7 @@ std::vector<EqueueWaitStat> equeue_wait_stats;
 } // namespace
 
 void ReportEqueueWaits(double frames) {
+    DrainEqueueTrace();
     std::scoped_lock lk{equeue_wait_mutex};
     if (equeue_wait_stats.empty() || frames <= 0) {
         return;
@@ -587,7 +692,17 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
     }
 
     const auto wait_start = std::chrono::steady_clock::now();
+    const bool trace = equeue->TraceSelected();
+    const void* caller = __builtin_return_address(0);
+    if (trace) equeue->TraceEvent("wait-begin", nullptr, timo ? double(*timo) : -1., caller);
     *out = equeue->WaitForEvents(ev, num, timo);
+    // The queue may have been selected while this consumer was already asleep.
+    if (equeue->TraceSelected()) {
+        const double elapsed = std::chrono::duration<double, std::micro>(
+                                   std::chrono::steady_clock::now() - wait_start).count();
+        if (*out == 0) equeue->TraceEvent("timeout", nullptr, elapsed, caller);
+        for (int i = 0; i < *out; ++i) equeue->TraceEvent("delivered", &ev[i], elapsed, caller);
+    }
     {
         const u64 ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)
@@ -654,6 +769,10 @@ s32 PS4_SYSV_ABI sceKernelAddHRTimerEvent(OrbisKernelEqueue eq, int id, OrbisKer
     // large. Even for large delays, we truncate a small portion to complete the wait
     // using the spinlock, prioritizing precision.
     auto* equeue = QueueGet(eq);
+    if (equeue->TraceSelected()) {
+        equeue->TraceEvent("hrtimer-add", &event.event, double(total_ns) / 1000.,
+                           __builtin_return_address(0));
+    }
     if (total_ns < HrTimerSpinlockThresholdNs) {
         return equeue->AddSmallTimer(event) ? ORBIS_OK : ORBIS_KERNEL_ERROR_ENOMEM;
     }

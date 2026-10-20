@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <string>
@@ -155,6 +156,11 @@ public:
         return m_name;
     }
 
+    // UFC-83: opt-in chronology for queues used by BB_WAIT_THREAD_TRACE threads.
+    bool TraceSelected();
+    void TraceEvent(const char* action, const OrbisKernelEvent* event, double duration_us,
+                    const void* caller = nullptr) const;
+
     bool AddEvent(EqueueEvent& event);
     bool ScheduleEvent(u64 id, s16 filter,
                        void (*callback)(OrbisKernelEqueue, const OrbisKernelEvent&));
@@ -183,6 +189,7 @@ public:
 private:
     OrbisKernelEqueue m_handle;
     std::string m_name;
+    std::atomic<bool> m_trace{false};
     std::mutex m_mutex;
     std::vector<EqueueEvent> m_events;
     std::condition_variable m_cond;

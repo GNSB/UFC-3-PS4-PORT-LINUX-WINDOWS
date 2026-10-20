@@ -9,11 +9,62 @@ void runtime_restart(void) { abort(); }
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 
 typedef int (ABI *Register)(GuestCallback);
+#ifdef __linux__
+/* Opt-in smoke for the signal sampler: no guest image or GPU execution. */
+static _Atomic int sample_workers_stop, sample_workers_ready;
+static void *sample_trace_worker(void *unused) {
+    (void)unused;
+    platform_thread_set_name("sample-worker-duplicate");
+    atomic_fetch_add(&sample_workers_ready,1);
+    while (!atomic_load(&sample_workers_stop)) usleep(1000);
+    return NULL;
+}
+static void sample_trace_smoke(void) {
+    char path[]="/tmp/ufc83-sample-XXXXXX";
+    int fd=mkstemp(path); assert(fd>=0); close(fd);
+    platform_thread_set_name("sample-smoke");
+    assert(!setenv("BB_SAMPLE_THREAD","sample-smoke,sample-worker-duplicate",1));
+    assert(!setenv("BB_SAMPLE_LOG",path,1));
+    pthread_t workers[2];
+    for (int i=0;i<2;++i) assert(!pthread_create(&workers[i],NULL,sample_trace_worker,NULL));
+    while (atomic_load(&sample_workers_ready)!=2) usleep(1000);
+    runtime_wait_report(1);
+    errno=EDOM;
+    uint64_t deadline=platform_monotonic_ns()+200000000;
+    while (platform_monotonic_ns()<deadline) { /* signals interrupt a running thread */ }
+    assert(errno==EDOM);
+    FILE *f=fopen(path,"r"); assert(f);
+    char line[4096]; int anchor=0, sample=0, targets=0, worker_samples=0;
+    int worker_tids[2]={0};
+    while (fgets(line,sizeof(line),f)) {
+        anchor|=!strncmp(line,"anchor ",7);
+        if (!strncmp(line,"target ",7) && strstr(line,"name=sample-worker-d")) {
+            char *tid=strstr(line,"tid=");
+            if (targets<2 && tid) worker_tids[targets++]=atoi(tid+4);
+        }
+        if (!strncmp(line,"sample ",7)) {
+            char *tid=strstr(line,"tid=");
+            if (tid && atoi(tid+4)==worker_tids[0]) worker_samples|=1;
+            if (tid && atoi(tid+4)==worker_tids[1]) worker_samples|=2;
+        }
+        sample|=!strncmp(line,"sample mono_ns=",15) && strstr(line," rbp-chain:") && strstr(line," stack-candidates:");
+    }
+    fclose(f);
+    fprintf(stderr,"sampler smoke: anchor=%d sample=%d targets=%d worker_samples=%d log=%s\n",anchor,sample,targets,worker_samples,path);
+    atomic_store(&sample_workers_stop,1);
+    for (int i=0;i<2;++i) assert(!pthread_join(workers[i],NULL));
+    assert(anchor && sample && targets==2 && worker_tids[0]!=worker_tids[1] && worker_samples==3);
+    unlink(path);
+    puts("PASS: comma-separated sampler targets, duplicate/truncated names, per-tid host stacks, interrupted errno preserved");
+}
+#endif
 typedef int (ABI *RegisterCxa)(void (ABI *)(void *), void *, void *);
 typedef int (ABI *Acquire)(uint64_t *);
 typedef void (ABI *Guard)(uint64_t *);
@@ -26,8 +77,72 @@ typedef int32_t (ABI *Map)(void **, uint64_t, int, int, int64_t, uint64_t);
 typedef int32_t (ABI *Unmap)(void *, uint64_t);
 typedef int32_t (ABI *Release)(uint64_t, uint64_t);
 #define GET(type, name) ((type)runtime_resolve(name, 0))
+/* UFC-83: exercise the actual equeue service without loading guest code or a GPU. */
+static void equeue_timer_probe(void) {
+    extern void bbgpu_register_kernel(void);
+    typedef struct {
+        uint64_t ident;
+        int16_t filter;
+        uint16_t flags;
+        uint32_t fflags;
+        uint64_t data;
+        void *udata;
+    } Event;
+    typedef struct { int64_t sec, nsec; } TimerTime;
+    typedef int (ABI *Create)(int64_t *, const char *);
+    typedef int (ABI *Delete)(int64_t);
+    typedef int (ABI *AddTimer)(int64_t, int, TimerTime *, void *);
+    typedef int (ABI *Wait)(int64_t, Event *, int, int *, uint32_t *);
+    bbgpu_register_kernel();
+    Create create=GET(Create,"D0OdFMjp46I");
+    Delete destroy=GET(Delete,"jpFjmgAC5AE");
+    AddTimer add=GET(AddTimer,"R74tt43xP6k");
+    Wait wait=GET(Wait,"fzyMKs9kim0");
+    assert(create && destroy && add && wait);
+    int64_t queue;
+    assert(create(&queue,"UFC-83 timer probe")==0);
+    for (int i=0;i<20;++i) {
+        TimerTime ts={0,3000000};
+        uint32_t timeout=1000000;
+        uint64_t start=platform_monotonic_ns();
+        assert(add(queue,i,&ts,NULL)==0);
+        Event event={0}; int count=0;
+        assert(wait(queue,&event,1,&count,&timeout)==0);
+        double elapsed=(platform_monotonic_ns()-start)/1e6;
+        assert(count==1 && event.ident==(uint64_t)i && event.filter==-15);
+        printf("HR timer probe: requested=3 ms delivered=%.3f ms\n",elapsed);
+    }
+    assert(destroy(queue)==0);
+}
 typedef void *(ABI *TlsAddress)(const uint64_t *);
 typedef void *(ABI *ThreadSelf)(void);
+typedef int32_t (ABI *CreateGuestThread)(void **,void **,void *(ABI *)(void *),void *,const char *);
+typedef int32_t (ABI *JoinGuestThread)(void *,void **);
+typedef struct { _Atomic int release; uint64_t identity; void *handle; } ThreadIdentity;
+static ABI void *identity_worker(void *argument) {
+    ThreadIdentity *identity=argument;
+    void *self=GET(ThreadSelf,"aI+OeCz8xrQ#libkernel")();
+    while (!atomic_load_explicit(&identity->release,memory_order_acquire)) sched_yield();
+    assert(self==identity->handle && *(uint64_t *)self==identity->identity);
+    return argument;
+}
+static void published_thread_identity(void) {
+    uint64_t previous=0;
+    for (int i=0;i<8;++i) {
+        ThreadIdentity identity={0};
+        assert(GET(CreateGuestThread,"6UgtwV+0zb4#libkernel")(
+            &identity.handle,NULL,identity_worker,&identity,"identity-test")==0);
+        /* The child can still be starting. EAThread must already be able to
+         * save a nonzero identity that agrees with the child's later self. */
+        identity.identity=*(uint64_t *)identity.handle;
+        assert(identity.identity && identity.identity!=previous);
+        atomic_store_explicit(&identity.release,1,memory_order_release);
+        void *result=NULL;
+        assert(GET(JoinGuestThread,"onNY9Byn-W8#libkernel")(identity.handle,&result)==0);
+        assert(result==&identity && *(uint64_t *)identity.handle==identity.identity);
+        previous=identity.identity;
+    }
+}
 typedef int32_t (ABI *ThreadGetAttr)(void *,void **);
 typedef int32_t (ABI *ThreadAffinity)(void **,uint64_t *);
 static void *main_identity;
@@ -480,6 +595,11 @@ static void appearance_backpressure(void) {
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
+    if (argc>1 && !strcmp(argv[1],"--thread-identity-probe")) { published_thread_identity(); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--equeue-timer-probe")) { equeue_timer_probe(); return 0; }
+#ifdef __linux__
+    if (argc>1 && !strcmp(argv[1],"--sample-trace-smoke")) { sample_trace_smoke(); return 0; }
+#endif
     assert(runtime_resolve("bzQExy189ZI#wrong#module",0)==0);
     assert(runtime_resolve("unknown",0)==0);
     assert(runtime_resolve("8zTFvBIAIN8#libc",1)==0);
@@ -502,7 +622,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); host_copy_scope(); memory_primitives();
+    published_thread_identity(); libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); host_copy_scope(); memory_primitives();
     assert(host_copy_callbacks==((getenv("BB_HOST_COPY_EXTENTS") && getenv("BB_HOST_COPY_EXTENTS")[0]=='0') ? 0u : 4u));
     runtime_memory_set_host_copy_hook(NULL,NULL);
     rw_lifecycle(); rw_concurrency(); rw_timeouts(); ui_backpressure(); appearance_backpressure();

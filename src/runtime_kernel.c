@@ -452,6 +452,7 @@ static void sample_report(void);
  * game's code on the stack. Shows where the game waits for the GPU (labels, frame pacing). */
 typedef struct { _Atomic uint64_t key; uint64_t site, site2, site3; int tid, kind; char name[16]; _Atomic uint64_t count, ns; } WaitSite;
 static WaitSite wait_sites[512];
+static _Atomic uint64_t wait_sites_dropped;
 static _Thread_local int wait_tid;
 void runtime_guest_call_sites(uint64_t out[3]);
 /* The first three return addresses into the game's code on this thread's stack (guest offsets). */
@@ -464,13 +465,35 @@ static void guest_call_sites(uint64_t out[3]) {
     out[0]=out[1]=out[2]=0;
     for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
 }
+int runtime_wait_trace_selected(void) {
+    static _Thread_local int selected=-1;
+    if (selected<0) {
+        selected=0;
+        const char *p=getenv("BB_WAIT_THREAD_TRACE");
+        char name[32]; platform_thread_get_name(name,sizeof(name));
+        for (;p && *p;) {
+            size_t n=strcspn(p,",");
+            if (n==strlen(name) && !strncmp(p,name,n)) selected=1;
+            p+=n; if (*p) ++p;
+        }
+    }
+    return selected;
+}
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
-    if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;
+    if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL || getenv("BB_WAIT_THREAD_TRACE")!=NULL;
     if (!enabled) return;
     if (!wait_tid) wait_tid=(int)platform_thread_id();
     uint64_t sites[3];
     guest_call_sites(sites);
+    /* Per-call records bypass the bounded aggregate table (which can fill before the menu). */
+    if (getenv("BB_WAIT_TRACE_CALLS") && runtime_wait_trace_selected()) {
+        static const char *kinds[]={"cond","mutex","sema","sleep"};
+        char stamp[96]; runtime_trace_stamp(stamp,sizeof(stamp));
+        printf("Wait trace: %s%s blocked_ms=%.6f sites=%#llx,%#llx,%#llx\n",
+               stamp,kinds[kind&3],ns/1e6,(unsigned long long)sites[0],
+               (unsigned long long)sites[1],(unsigned long long)sites[2]);
+    }
     const uint64_t key=((sites[0]<<20)^(sites[1]*0x9E3779B1ull)^(sites[2]<<7)^((uint64_t)wait_tid<<4)^(uint64_t)kind)|1;
     for (uint64_t i=0,slot=(key*0x9E3779B97F4A7C15ull)>>55;i<512;++i) {
         WaitSite *w=&wait_sites[(slot+i)%512];
@@ -481,10 +504,14 @@ void runtime_wait_note(int kind, uint64_t ns) {
             return;
         }
     }
+    atomic_fetch_add(&wait_sites_dropped, 1);
 }
 void runtime_wait_report(double frames) {
     sample_start();
     sample_report();
+    const uint64_t dropped=atomic_exchange(&wait_sites_dropped, 0);
+    if (dropped) printf("Guest wait profile incomplete: %llu waits omitted (512 call-site slots full)\n",
+                        (unsigned long long)dropped);
     static const char *kinds[]={"cond","mutex","sema","sleep"};
     struct { WaitSite *w; uint64_t ns, count; } rows[512]; int n=0;
     for (int i=0;i<512;++i) {
@@ -510,17 +537,128 @@ void runtime_wait_report(double frames) {
     printf("\n");
 }
 
-/* bbport BB_SAMPLE_THREAD=<name> (with frame stats): where that thread runs, sampled with SIGPROF
- * every 0.5 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
+/* bbport BB_SAMPLE_THREAD=<prefix[,prefix...]> (with frame stats): where that thread runs, sampled with SIGPROF
+ * every 8 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
  * shows up spinning in its polling loop. Linux only (signals, /proc, dladdr); on Windows the
  * variables are reported as unavailable. */
 #ifdef __linux__
 static _Atomic uint64_t sample_keys[1024], sample_counts[1024];
-static uint64_t sample_rips[1024], sample_callers[1024];
+static _Atomic uint64_t sample_rips[1024], sample_callers[1024];
 static _Atomic uint64_t samples_total;
+/* Optional timestamped host stacks. Serialized SIGPROF producers, sampler-thread consumer;
+ * never symbolize or write stdio from a signal handler. rbp chains can skip frames in
+ * libraries built without frame pointers; stack words are candidates, not backtraces. */
+typedef struct {
+    uint64_t ns, rip, regs[9], frames[16], stack[16];
+    int tid;
+    struct { uint64_t pointer, state, buffer, size; char path[192]; } tasks[3];
+    unsigned task_count, depth, words;
+} SampleDetail;
+static SampleDetail sample_details[256];
+static atomic_flag sample_detail_busy=ATOMIC_FLAG_INIT;
+static _Atomic unsigned sample_detail_write, sample_detail_read, sample_detail_dropped;
+static _Atomic int sample_detail_enabled;
+/* UFC-83 / eboot 1.14: read-only snapshots of the whole-file AssetStream
+ * request. Validate its concrete vtable before interpreting any candidate pointer.
+ * process_vm_readv fails safely for stale/unmapped candidates. */
+static void sample_asset_task(SampleDetail *d,uint64_t pointer) {
+    if (!pointer || d->task_count==3) return;
+    for (unsigned i=0;i<d->task_count;++i) if (d->tasks[i].pointer==pointer) return;
+    uint64_t object[22];
+    struct iovec local={object,sizeof(object)},remote={(void *)pointer,sizeof(object)};
+    if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=sizeof(object) ||
+        object[0]!=0x8024b60b8ull) return;
+    const unsigned i=d->task_count++;
+    d->tasks[i].pointer=pointer; d->tasks[i].state=object[7]&15;
+    d->tasks[i].buffer=object[20]; d->tasks[i].size=object[21];
+    memset(d->tasks[i].path,0,sizeof(d->tasks[i].path));
+    local=(struct iovec){d->tasks[i].path,sizeof(d->tasks[i].path)-1};
+    remote=(struct iovec){(void *)object[3],sizeof(d->tasks[i].path)-1};
+    process_vm_readv(getpid(),&local,1,&remote,1,0);
+}
+static void sample_detail_capture(const ucontext_t *uc) {
+    if (!sample_detail_enabled) return;
+    if (atomic_flag_test_and_set_explicit(&sample_detail_busy,memory_order_acquire)) {
+        atomic_fetch_add(&sample_detail_dropped,1); return;
+    }
+    const unsigned w=atomic_load_explicit(&sample_detail_write,memory_order_relaxed);
+    if (w-atomic_load_explicit(&sample_detail_read,memory_order_acquire)>=256) {
+        atomic_fetch_add(&sample_detail_dropped,1);
+        atomic_flag_clear_explicit(&sample_detail_busy,memory_order_release); return;
+    }
+    SampleDetail *d=&sample_details[w%256];
+    d->ns=platform_monotonic_ns(); d->rip=uc->uc_mcontext.gregs[REG_RIP];
+    d->tid=(int)syscall(SYS_gettid);
+    const int ids[]={REG_RAX,REG_RDI,REG_RSI,REG_RDX,REG_R10,REG_RBX,REG_R12,REG_R14,REG_R15};
+    for (unsigned i=0;i<9;++i) d->regs[i]=uc->uc_mcontext.gregs[ids[i]];
+    d->depth=0; d->words=0; d->task_count=0;
+    for (unsigned i=0;i<9;++i) sample_asset_task(d,d->regs[i]);
+    uint64_t rbp=uc->uc_mcontext.gregs[REG_RBP], rsp=uc->uc_mcontext.gregs[REG_RSP];
+    struct iovec local={d->stack,sizeof(d->stack)}, remote={(void *)rsp,sizeof(d->stack)};
+    ssize_t got=process_vm_readv(getpid(),&local,1,&remote,1,0);
+    if (got>0) d->words=(unsigned)got/8;
+    while (d->depth<16 && rbp>=rsp && rbp-rsp<16*1024*1024 && !(rbp&7)) {
+        uint64_t frame[2];
+        local=(struct iovec){frame,sizeof(frame)}; remote=(struct iovec){(void *)rbp,sizeof(frame)};
+        if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=sizeof(frame)) break;
+        d->frames[d->depth++]=frame[1];
+        /* e3e050 was entered from 1bab6eb: its saved r15 is the request
+         * returned by e3c600. This survives host callees changing registers. */
+        if (frame[1]==0x801bab6f0ull) {
+            uint64_t request=0;
+            local=(struct iovec){&request,sizeof(request)};
+            remote=(struct iovec){(void *)(rbp-8),sizeof(request)};
+            if (process_vm_readv(getpid(),&local,1,&remote,1,0)==sizeof(request))
+                sample_asset_task(d,request);
+        }
+        if (frame[0]<=rbp) break;
+        rbp=frame[0];
+    }
+    atomic_store_explicit(&sample_detail_write,w+1,memory_order_release);
+    atomic_flag_clear_explicit(&sample_detail_busy,memory_order_release);
+}
+static void sample_detail_address(FILE *f,uint64_t address) {
+    Dl_info dl={0};
+    if (dladdr((void *)address,&dl)) {
+        const char *name=strrchr(dl.dli_fname,'/');
+        fprintf(f," %s:%s+%#lx",name ? name+1 : dl.dli_fname,dl.dli_sname ? dl.dli_sname : "?",
+                (unsigned long)(address-(uint64_t)(dl.dli_sname ? dl.dli_saddr : dl.dli_fbase)));
+    } else fprintf(f," %#lx",(unsigned long)address);
+}
+static void sample_detail_drain(FILE *f) {
+    unsigned r=atomic_load_explicit(&sample_detail_read,memory_order_relaxed);
+    const unsigned w=atomic_load_explicit(&sample_detail_write,memory_order_acquire);
+    for (;r!=w;++r) {
+        const SampleDetail *d=&sample_details[r%256];
+        fprintf(f,"sample mono_ns=%llu rax=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx tid=%d rbx=%#llx r12=%#llx r14=%#llx r15=%#llx rip:",
+                (unsigned long long)d->ns,(unsigned long long)d->regs[0],(unsigned long long)d->regs[1],
+                (unsigned long long)d->regs[2],(unsigned long long)d->regs[3],(unsigned long long)d->regs[4],d->tid,(unsigned long long)d->regs[5],
+                (unsigned long long)d->regs[6],(unsigned long long)d->regs[7],(unsigned long long)d->regs[8]);
+        sample_detail_address(f,d->rip);
+        fputs(" rbp-chain:",f);
+        for (unsigned i=0;i<d->depth;++i) sample_detail_address(f,d->frames[i]);
+        fputs(" stack-candidates:",f);
+        for (unsigned i=0;i<d->words;++i) sample_detail_address(f,d->stack[i]);
+        fputc('\n',f);
+        for (unsigned i=0;i<d->task_count;++i) {
+            /* Keep each observation on one line even if an asset path is malformed. */
+            char path[192]; memcpy(path,d->tasks[i].path,sizeof(path));
+            for (unsigned j=0;path[j];++j) if ((unsigned char)path[j]<32) path[j]='?';
+            fprintf(f,"asset-task mono_ns=%llu tid=%d task=%#llx state=%llu buffer=%#llx size=%llu path=%s\n",
+                    (unsigned long long)d->ns,d->tid,(unsigned long long)d->tasks[i].pointer,
+                    (unsigned long long)d->tasks[i].state,(unsigned long long)d->tasks[i].buffer,
+                    (unsigned long long)d->tasks[i].size,path);
+        }
+    }
+    atomic_store_explicit(&sample_detail_read,r,memory_order_release);
+    unsigned dropped=atomic_exchange(&sample_detail_dropped,0);
+    if (dropped) fprintf(f,"dropped %u samples\n",dropped);
+}
 static void sample_handler(int sig, siginfo_t *info, void *context) {
     (void)sig; (void)info;
+    const int saved_errno=errno;
     const ucontext_t *uc=(const ucontext_t *)context;
+    sample_detail_capture(uc);
     uint64_t rip=(uint64_t)uc->uc_mcontext.gregs[REG_RIP];
     const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
     /* Host code: keyed with its guest caller, the first return address into the game on the stack. */
@@ -539,32 +677,80 @@ static void sample_handler(int sig, siginfo_t *info, void *context) {
         if (atomic_load(k)==key || atomic_compare_exchange_strong(k,&expected,key)) {
             sample_rips[(slot+i)%1024]=rip; sample_callers[(slot+i)%1024]=caller;
             atomic_fetch_add(&sample_counts[(slot+i)%1024],1);
+            errno=saved_errno;
             return;
         }
     }
+    errno=saved_errno;
+}
+/* Linux comm is limited to 15 bytes. Match each requested prefix against that
+ * visible prefix, and select EVERY matching tid (including duplicate worker names). */
+static int sample_name_matches(const char *list,const char *comm) {
+    for (const char *p=list;*p;) {
+        const char *end=strchr(p,',');
+        size_t n=end ? (size_t)(end-p) : strlen(p);
+        if (n && !strncmp(comm,p,n>15 ? 15 : n)) return 1;
+        if (!end) break;
+        p=end+1;
+    }
+    return 0;
 }
 static void *sampler_main(void *arg) {
-    const char *name=(const char *)arg;
-    pid_t tid=0;
-    while (!tid) {
-        DIR *dir=opendir("/proc/self/task");
-        struct dirent *e;
-        while (dir && (e=readdir(dir))) {
-            char path[300], comm[32]={0};
-            snprintf(path,sizeof(path),"/proc/self/task/%s/comm",e->d_name);
-            FILE *f=fopen(path,"r");
-            if (!f) continue;
-            if (fgets(comm,sizeof(comm),f) && !strncmp(comm,name,strlen(name))) tid=(pid_t)atoi(e->d_name);
-            fclose(f);
+    platform_thread_set_name("bb:sampler");
+    const char *names=(const char *)arg;
+    pid_t tids[64]; unsigned count=0, next=0;
+    uint64_t rescan=0;
+    FILE *detail=NULL;
+    const char *path=getenv("BB_SAMPLE_LOG");
+    if (path && *path) {
+        detail=fopen(path,"w");
+        if (!detail) perror("BB_SAMPLE_LOG");
+        else {
+            char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
+            fprintf(detail,"anchor %smono_ns=%llu threads=%s guest_base=0x800000000; per-thread samples every ~8 ms or slower; rbp-chain may skip frames; stack-candidates are NOT return addresses\n",
+                    stamp,(unsigned long long)platform_monotonic_ns(),names);
+            atomic_store(&sample_detail_enabled,1);
         }
-        if (dir) closedir(dir);
-        if (!tid) sleep(1);
     }
-    printf("Runtime: sampling thread %s (%d)\n",name,(int)tid);
     for (;;) {
-        if (syscall(SYS_tgkill,getpid(),tid,SIGPROF)) break;
-        struct timespec t={0,500000};
+        const uint64_t now=platform_monotonic_ns();
+        if (now>=rescan) {
+            pid_t found[64]; unsigned n=0;
+            DIR *dir=opendir("/proc/self/task");
+            struct dirent *e;
+            while (dir && (e=readdir(dir))) {
+                if (e->d_name[0]<'0' || e->d_name[0]>'9') continue;
+                char path[300],comm[32]={0};
+                snprintf(path,sizeof(path),"/proc/self/task/%s/comm",e->d_name);
+                FILE *f=fopen(path,"r");
+                if (!f) continue;
+                const int match=fgets(comm,sizeof(comm),f) && sample_name_matches(names,comm);
+                fclose(f);
+                if (!match) continue;
+                const pid_t tid=(pid_t)atoi(e->d_name);
+                if (n==64) { puts("Runtime: sampler target limit (64) reached"); break; }
+                found[n++]=tid;
+                unsigned i=0; while (i<count && tids[i]!=tid) ++i;
+                if (i==count) {
+                    comm[strcspn(comm,"\n")]=0;
+                    printf("Runtime: sampling thread %s (%d)\n",comm,(int)tid);
+                    if (detail) fprintf(detail,"target mono_ns=%llu tid=%d name=%s\n",
+                                        (unsigned long long)now,(int)tid,comm);
+                }
+            }
+            if (dir) closedir(dir);
+            memcpy(tids,found,n*sizeof(*tids)); count=n;
+            rescan=now+1000000000;
+        }
+        /* Stagger targets: signaling every worker at once made their handlers
+         * compete for the nonblocking detail slot, starving some tids. */
+        if (count) syscall(SYS_tgkill,getpid(),tids[next++%count],SIGPROF);
+        /* Sample at the detail cadence, rather than sending 16 signals for
+         * every saved stack. The old 2 kHz per target needlessly interrupted
+         * condvars and sleeps on every worker, even when no detail was saved. */
+        struct timespec t={0,count ? 8000000/count : 8000000};
         nanosleep(&t,NULL);
+        if (detail) { sample_detail_drain(detail); fflush(detail); }
     }
     return NULL;
 }

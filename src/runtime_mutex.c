@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
+#include <stdatomic.h>
 typedef struct { int type; } GuestAttr;
 #ifdef _WIN32
 /* Windows (as the GoW3R port): SRW locks and condition variables of the system instead of
@@ -246,7 +247,22 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
 }
 /* Condition variables: opaque handles over host pthread_cond (CLOCK_REALTIME,
  * like FreeBSD's default), sharing the host mutex behind GuestMutex. */
-typedef struct { NativeCond native; } GuestCond;
+typedef struct { NativeCond native; _Atomic int traced; } GuestCond;
+/* UFC-83: opt-in, per-call queue handoff trace. Track condition objects, so signals from
+ * other threads are visible too. No global trace lock is held across a guest wait. */
+static void cond_trace_select(GuestCond *c) {
+    /* Queue selection for equeue diagnostics must not also enable high-volume
+     * stdio under the guest's mutex on every worker handoff. */
+    if (getenv("BB_COND_TRACE") && runtime_wait_trace_selected()) atomic_store(&c->traced, 1);
+}
+static void cond_trace(GuestCond *c, const char *op, uint64_t deadline, int result) {
+    if (!atomic_load(&c->traced)) return;
+    char stamp[96]; runtime_trace_stamp(stamp, sizeof(stamp));
+    uint64_t sites[3]; runtime_guest_call_sites(sites);
+    printf("Cond trace: %s%s cond=%p deadline_rt_ns=%llu result=%d sites=%#llx,%#llx,%#llx\n",
+           stamp, op, (void *)c, (unsigned long long)deadline, result,
+           (unsigned long long)sites[0], (unsigned long long)sites[1], (unsigned long long)sites[2]);
+}
 static size_t conds, waits, wakeups;
 static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     (void)attr; (void)name;
@@ -255,6 +271,7 @@ static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
     if (!c) return orbis_error(ENOMEM);
     int e = native_cond_init(&c->native);
     if (e) { free(c); return orbis_error(e); }
+    atomic_init(&c->traced, 0);
     *out = c; ++conds; return 0;
 }
 static int32_t ensure_cond(GuestCond **cond) {
@@ -282,9 +299,12 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
+    cond_trace_select(*cond);
+    cond_trace(*cond, "begin", 0, 0);
     const uint64_t start = runtime_wait_clock();
     const int e2 = native_cond_wait(&(*cond)->native, &(*mutex)->native, 0);
     runtime_wait_note(0, runtime_wait_clock() - start);
+    cond_trace(*cond, "end", 0, e2);
     return orbis_error(e2);
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, uint64_t end) {
@@ -292,9 +312,12 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, uint64_t en
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
+    cond_trace_select(*cond);
+    cond_trace(*cond, "begin", end, 0);
     const uint64_t start = runtime_wait_clock();
     const int e2 = native_cond_wait(&(*cond)->native, &(*mutex)->native, end);
     runtime_wait_note(0, runtime_wait_clock() - start);
+    cond_trace(*cond, "end", end, e2);
     return timed_error(e2);
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
@@ -305,11 +328,13 @@ static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    cond_trace(*cond, "signal", 0, 0);
     ++wakeups; return orbis_error(native_cond_signal(&(*cond)->native));
 }
 static ABI int32_t cond_broadcast(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
+    cond_trace(*cond, "broadcast", 0, 0);
     ++wakeups; return orbis_error(native_cond_broadcast(&(*cond)->native));
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
