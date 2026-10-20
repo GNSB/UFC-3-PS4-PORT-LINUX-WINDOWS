@@ -105,6 +105,9 @@ if [[ ${1:-} == --test ]]; then
     out/pad-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     out/runtime-test
+    # portheon: master volume, 7.1 fold for stereo devices, soft limiter.
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_audio.c src/platform/platform_posix.c "${libraries[@]}" -lm -o out/audio-test
+    out/audio-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c src/platform/platform_posix.c -o out/file-mods-test
     # Keep running the remaining checks after the known file-mods failure, but retain
     # its exit status so --test still reports the failure.
