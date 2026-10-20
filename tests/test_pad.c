@@ -3,9 +3,18 @@
 #include <unistd.h>
 #include "../src/runtime_pad.c"
 
+/* The window thread's event pump, as during a restart of the gamepad subsystem (UFC-62). */
+static volatile int pumping;
+static void *pump(void *arg) {
+    (void)arg;
+    while (pumping) { SDL_UpdateJoysticks(); SDL_UpdateGamepads(); }
+    return NULL;
+}
+
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
-int bbgpu_pad_rescan_take(void) { return 0; }
+static int rescan;
+int bbgpu_pad_rescan_take(void) { const int r=rescan; rescan=0; return r; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -98,6 +107,56 @@ int main(void) {
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;
     assert(SDL_DetachVirtualJoystick(id));
+    /* UFC-62: a gamepad unplugged and plugged back (as a new SDL instance id) ten times. The
+     * handle stays valid and reads succeed while it is gone, input comes back with it, the loss is
+     * logged and no automatic re-enumeration runs meanwhile (SDL's hot-plug brings it back). */
+    {
+        PadLink l={0};
+        assert(link_update(&l,1,"a")==LINK_FIRST && link_update(&l,1,"a")==LINK_SAME);
+        assert(link_update(&l,0,NULL)==LINK_LOST && !strcmp(l.name,"a") && link_update(&l,0,NULL)==LINK_SAME);
+        assert(link_update(&l,1,"b")==LINK_BACK && !strcmp(l.name,"b"));
+    }
+    for (int round=0;round<10;++round) {
+        rescan_after=0; pad_rescan_attempts=0; /* an automatic re-enumeration would be due */
+        SDL_JoystickID back=SDL_AttachVirtualJoystick(&desc);
+        assert(back!=0);
+        SDL_Joystick *j=SDL_OpenJoystick(back);
+        assert(j && SDL_SetJoystickVirtualButton(j,SDL_GAMEPAD_BUTTON_EAST,true));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        assert(pad_read_state(1,&data)==0 && (data.buttons & BTN_CROSS) && data.connected==1);
+        assert(gamepad && SDL_GetGamepadID(gamepad)==back && links[0].present);
+        SDL_CloseJoystick(j);
+        assert(SDL_DetachVirtualJoystick(back));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        const unsigned before=pad_reinits;
+        assert(pad_read_state(1,&data)==0 && !(data.buttons & BTN_CROSS) && data.connected==1);
+        assert(!gamepad && !links[0].present && pad_reinits==before);
+        assert(pad_read(1,&data,1)==1 && pad_ok_handle(1)==0);
+    }
+    /* "Rescan controllers" restarts the subsystem while another thread pumps it: every gamepad
+     * held here (the active one and an idle one) is dropped first, nothing dangles. */
+    {
+        SDL_JoystickID a=SDL_AttachVirtualJoystick(&desc), b=SDL_AttachVirtualJoystick(&desc);
+        assert(a && b);
+        SDL_UpdateJoysticks();
+        assert(pad_read_state(1,&data)==0 && gamepad);
+        usleep(110000); /* the idle pads are opened ten times a second */
+        assert(pad_read_state(1,&data)==0);
+        int idle=0; for (int i=0;i<other_count;++i) idle+=others[i]!=NULL;
+        assert(idle==1);
+        pthread_t thread; pumping=1;
+        assert(pthread_create(&thread,NULL,pump,NULL)==0);
+        for (int round=0;round<20;++round) {
+            const unsigned before=pad_reinits;
+            rescan=1;
+            assert(pad_read_state(1,&data)==0 && pad_reinits==before+1 && !gamepad);
+            for (int i=0;i<other_count;++i) assert(!others[i]);
+        }
+        pumping=0;
+        pthread_join(thread,NULL);
+    }
     SDL_Quit();
     unlink(path);
     unlink(config);
@@ -122,5 +181,5 @@ int main(void) {
         assert(clone.have_center && clone.center[0]==16380 && clone.base[0]==16380);
         assert(stick_axis(&clone,0,16380)==128 && stick_axis(&clone,0,32760)==255 && stick_axis(&clone,0,0)==0);
     }
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, controls, stick calibration");
+    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, controls, stick calibration, disconnect/reconnect");
 }
