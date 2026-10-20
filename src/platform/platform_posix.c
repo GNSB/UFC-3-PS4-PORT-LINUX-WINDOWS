@@ -132,6 +132,8 @@ int platform_open(const char *path, int flags, int mode) {
     int fd = open(path, r | O_CLOEXEC, mode ? mode : 0644);
     return fd < 0 ? -errno : fd;
 }
+/* rename(2) replaces a destination other descriptors hold open already. */
+int platform_open_shared(const char *path, int flags, int mode) { return platform_open(path, flags, mode); }
 int platform_close(int fd) { return close(fd) ? -errno : 0; }
 ssize_t platform_read(int fd, void *buffer, size_t size) { return read(fd, buffer, size); }
 ssize_t platform_write(int fd, const void *buffer, size_t size) { return write(fd, buffer, size); }

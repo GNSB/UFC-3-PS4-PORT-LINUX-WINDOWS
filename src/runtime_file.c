@@ -278,22 +278,22 @@ enum { GF_CREAT=0x200, GF_TRUNC=0x400, GF_EXCL=0x800 };
 static int open_for_commit(const char *path,const char *source,int flags,int mode,char **commit,char **temp) {
     PlatformStat s;
     int exists=!platform_stat(source,&s);
-    if (exists && !s.is_reg) return platform_open(path,flags,mode ? mode : 0644);
+    if (exists && !s.is_reg) return platform_open_shared(path,flags,mode ? mode : 0644);
     if (exists && (flags&GF_CREAT) && (flags&GF_EXCL)) return -EEXIST;
     if (!exists && !(flags&GF_CREAT)) return -ENOENT;
     size_t n=strlen(path)+32;
     char *t=malloc(n), *c=strdup(path);
     if (!t || !c) { free(t); free(c); return -ENOMEM; }
     snprintf(t,n,"%s.%u.bbtmp",path,__atomic_add_fetch(&temp_serial,1,__ATOMIC_RELAXED));
-    int out=platform_open(t,1|GF_CREAT|GF_TRUNC,exists ? (int)(s.mode&07777) : mode ? mode : 0644);
+    int out=platform_open_shared(t,1|GF_CREAT|GF_TRUNC,exists ? (int)(s.mode&07777) : mode ? mode : 0644);
     int e=out<0 ? -out : 0;
     if (!e && exists && !(flags&GF_TRUNC)) {
-        int in=platform_open(source,0,0);
+        int in=platform_open_shared(source,0,0);
         if (in<0 || copy_contents(in,out)) e=in<0 ? -in : (errno ? errno : EIO);
         if (in>=0) platform_close(in);
     }
     if (out>=0) platform_close(out);
-    int host=e ? -1 : platform_open(t,flags&~(GF_CREAT|GF_EXCL|GF_TRUNC),0);
+    int host=e ? -1 : platform_open_shared(t,flags&~(GF_CREAT|GF_EXCL|GF_TRUNC),0);
     if (host<0) {
         if (!e) e=-host;
         platform_unlink(t); free(t); free(c);
@@ -318,6 +318,7 @@ static int commit_file(const File *f) {
     if (!e) e=-platform_rename(f->temp,f->commit);
     if (e) {
         fprintf(stderr,"Runtime: save file %s not replaced (%s); the old one is kept\n",f->path,strerror(e));
+        printf("Runtime: save file %s not replaced (%s); the old one is kept\n",f->path,strerror(e));
         platform_unlink(f->temp);
         return -e;
     }
@@ -336,6 +337,10 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int host;
     if (save_path(guest) && (flags&3)) {
         host=open_for_commit(path,current,flags,mode,&commit,&temp);
+    } else if (save_path(guest)) {
+        /* A save file read while the game writes it anew: this handle must not stop the commit's
+         * rename from replacing the file (Windows, platform_open_shared). */
+        host=platform_open_shared(current,flags,mode ? mode : 0644);
     } else {
         host=platform_open(current,flags,mode ? mode : 0644);
         if (host==-ENOENT && !(flags&0x200) && !save_path(guest) && fix_case(current)) {

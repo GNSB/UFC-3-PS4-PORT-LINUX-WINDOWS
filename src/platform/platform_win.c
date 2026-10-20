@@ -454,6 +454,25 @@ int platform_fstat(int fd, PlatformStat *out) {
     out->nlink = info.nNumberOfLinks; out->ino = info.nFileIndexLow; out->dev = info.dwVolumeSerialNumber;
     return 0;
 }
+/* A file opened with FILE_SHARE_DELETE too (save data): another of our handles on it does not
+ * stop the commit's rename from replacing it (platform_rename). Guest flag bits as platform_open. */
+int platform_open_shared(const char *path, int flags, int mode) {
+    PlatformStat s;
+    /* Folders, and O_DIRECTORY (ENOTDIR or ENOENT as there), are platform_open's. */
+    if ((platform_stat(path, &s) == 0 && s.is_dir) || (flags & 0x20000)) return platform_open(path, flags, mode);
+    const DWORD access = (flags & 3) == 0 ? GENERIC_READ : (flags & 3) == 1 ? GENERIC_WRITE : GENERIC_READ | GENERIC_WRITE;
+    DWORD disposition;
+    if (flags & 0x200) disposition = (flags & 0x800) ? CREATE_NEW : (flags & 0x400) ? CREATE_ALWAYS : OPEN_ALWAYS;
+    else disposition = (flags & 0x400) && (flags & 3) ? TRUNCATE_EXISTING : OPEN_EXISTING;
+    HANDLE h = CreateFileA(path, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           disposition, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -errno_from_win32(GetLastError());
+    int crt = (flags & 3) == 0 ? _O_RDONLY : 0;
+    if (flags & 0x8) crt |= _O_APPEND;
+    const int fd = _open_osfhandle((intptr_t)h, crt);
+    if (fd < 0) { CloseHandle(h); return -EMFILE; }
+    return fd;
+}
 int platform_open(const char *path, int flags, int mode) {
     (void)mode;
     PlatformStat s;
@@ -539,10 +558,56 @@ int platform_truncate(const char *path, int64_t length) {
     _close(fd);
     return e ? -e : 0;
 }
+/* A rename that replaces the destination even while something has it open with
+ * FILE_SHARE_DELETE (our own handles do, platform_open_shared): POSIX semantics on Windows 10
+ * 1709+ NTFS. 0 on success, else the Win32 error (ERROR_INVALID_PARAMETER: not supported). */
+#ifndef FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+#define FILE_RENAME_FLAG_REPLACE_IF_EXISTS 0x1
+#endif
+#ifndef FILE_RENAME_FLAG_POSIX_SEMANTICS
+#define FILE_RENAME_FLAG_POSIX_SEMANTICS 0x2
+#endif
+static DWORD posix_rename(const char *from, const char *to) {
+    WCHAR target[MAX_PATH * 2];
+    const int n = MultiByteToWideChar(CP_ACP, 0, to, -1, target, MAX_PATH * 2);
+    if (n <= 0) return ERROR_INVALID_PARAMETER;
+    HANDLE h = CreateFileA(from, DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError();
+    const size_t bytes = sizeof(FILE_RENAME_INFO) + (size_t)n * sizeof(WCHAR);
+    FILE_RENAME_INFO *info = calloc(1, bytes);
+    DWORD error = ERROR_NOT_ENOUGH_MEMORY;
+    if (info) {
+        info->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        info->FileNameLength = (DWORD)((n - 1) * sizeof(WCHAR));
+        memcpy(info->FileName, target, (size_t)n * sizeof(WCHAR));
+        /* FileRenameInfoEx (22): mingw headers may not name it. */
+        error = SetFileInformationByHandle(h, (FILE_INFO_BY_HANDLE_CLASS)22, info, (DWORD)bytes) ? 0 : GetLastError();
+        free(info);
+    }
+    CloseHandle(h);
+    return error;
+}
 int platform_rename(const char *from, const char *to) {
     /* POSIX rename replaces an existing destination; the CRT's fails. MOVEFILE_WRITE_THROUGH:
-     * the rename is on disk when the call returns (saves: the old file or the new one, never none). */
-    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -errno_from_win32(GetLastError());
+     * the rename is on disk when the call returns (saves: the old file or the new one, never none).
+     * A file another handle holds (an antivirus scanning the save just written, the game reading
+     * the old one) made MoveFileEx fail at once and a save was lost ("the old one is kept"),
+     * leaving its INDEX and DATA from different saves: the career reported a damaged save. Now
+     * the POSIX rename first (it replaces an open destination), and for sharing and access errors
+     * a few retries over about 2 s. */
+    DWORD error = 0;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+        error = GetLastError();
+        if (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) break;
+        const DWORD posix = posix_rename(from, to);
+        if (!posix) return 0;
+        if (posix != ERROR_ACCESS_DENIED && posix != ERROR_SHARING_VIOLATION && posix != ERROR_LOCK_VIOLATION &&
+            posix != ERROR_INVALID_PARAMETER && posix != ERROR_NOT_SUPPORTED) { error = posix; break; }
+        Sleep(attempt < 10 ? 10 : 60);
+    }
+    return -errno_from_win32(error);
 }
 int platform_unlink(const char *path) {
     if (DeleteFileA(path)) return 0;
