@@ -67,15 +67,20 @@ void ForEachChangedRun(const std::uint8_t* before, const std::uint8_t* after, st
 /// A granule is written only when the guest still holds there what it held when the download
 /// began (`at_start`) and, under an open window, what it held when the window opened (`window`);
 /// either may be null. Returns the bytes kept (the CPU's).
-template <typename Run>
-std::uint64_t ForEachWritableRun(std::uint64_t address, const std::uint8_t* current,
-                                 const std::uint8_t* at_start, const std::uint8_t* window,
-                                 std::uint64_t size, Run&& run) {
+/// ufc4: `keep(granule_address)` true also keeps a granule (the bytes a libc copy wrote in the
+/// window: the CPU's whatever their value).
+template <typename Keep, typename Run>
+std::uint64_t ForEachWritableRunKeeping(std::uint64_t address, const std::uint8_t* current,
+                                        const std::uint8_t* at_start, const std::uint8_t* window,
+                                        std::uint64_t size, Keep&& keep, Run&& run) {
     const auto granule_end = [&](std::uint64_t at) {
         const std::uint64_t end = ((address + at) / Granule + 1) * Granule - address;
         return end < size ? end : size;
     };
     const auto writable = [&](std::uint64_t at) {
+        if (keep((address + at) / Granule * Granule)) {
+            return false;
+        }
         for (std::uint64_t i = at; i < granule_end(at); ++i) {
             if ((at_start && current[i] != at_start[i]) || (window && current[i] != window[i])) {
                 return false;
@@ -98,6 +103,15 @@ std::uint64_t ForEachWritableRun(std::uint64_t address, const std::uint8_t* curr
         at = end;
     }
     return kept;
+}
+
+template <typename Run>
+std::uint64_t ForEachWritableRun(std::uint64_t address, const std::uint8_t* current,
+                                 const std::uint8_t* at_start, const std::uint8_t* window,
+                                 std::uint64_t size, Run&& run) {
+    return ForEachWritableRunKeeping(
+        address, current, at_start, window, size, [](std::uint64_t) { return false; },
+        static_cast<Run&&>(run));
 }
 
 } // namespace VideoCore::WindowMerge

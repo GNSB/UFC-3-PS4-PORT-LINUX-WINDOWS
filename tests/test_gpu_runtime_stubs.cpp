@@ -27,6 +27,9 @@ const uint64_t* runtime_memory_generation() { static const uint64_t generation =
 void runtime_memory_note_write(uintptr_t, uint64_t) { std::abort(); }
 void runtime_memory_set_note_write_hook(void (*)(uintptr_t, uint64_t)) {}
 void runtime_memory_set_cpu_write_hook(void (*)(uintptr_t, uint64_t)) {}
+void runtime_memory_set_host_copy_hook(void (*)(uintptr_t, uint64_t), const uint32_t*) {}
+int runtime_memory_host_copy_enabled(void) { return 0; }
+int runtime_guest_copy_range(uintptr_t*, uintptr_t*) { return 0; }
 void runtime_memory_set_write_watch(uintptr_t, uint64_t, int) { std::abort(); }
 void runtime_memory_set_guest_chunk_allocator(int (*)(uint64_t, uint64_t)) {}
 void runtime_memory_set_guest_chunk_whole(int) {}

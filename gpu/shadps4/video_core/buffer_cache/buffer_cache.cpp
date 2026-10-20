@@ -681,7 +681,10 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
     const bool from_guest = !windows_on || PageManager::FaultFromGuest();
     // UFC-48: a write site whose window rewrote GPU bytes reads back, as with windows off (a
     // window cannot tell a CPU write of the stale guest value over GPU bytes from no write).
-    const bool windows = windows_on && !PageManager::WindowSiteBarred();
+    // PORTHEON 074f3cd: a host copy knows its destination even for a barred site.
+    // Keep the exact overlap checks below (including UFC-61 ownership granules).
+    const bool windows = windows_on && (!PageManager::WindowSiteBarred() ||
+                                        PageManager::FaultInHostCopy(device_addr));
     if (windows_on && !windows) {
         window_barred_faults.fetch_add(1, std::memory_order_relaxed);
         if (!from_guest) {
@@ -2868,6 +2871,13 @@ void BufferCache::Maintain() {
                 std::printf("Write windows: none opened; %.1f faults/s of barred sites read back "
                             "(UFC-48)\n",
                             barred / 5.0);
+            }
+            u64 copy_windows = 0, copy_bytes = 0;
+            PageManager::TakeHostCopyStats(&copy_windows, &copy_bytes);
+            if (copy_windows || copy_bytes) {
+                std::printf("Write windows: %.1f/s opened by libc copies, %.1f KiB/s of their bytes "
+                            "known (no readback)\n",
+                            copy_windows / 5.0, copy_bytes / 5.0 / 1024.0);
             }
             if (const u64 locks = discard_locks.exchange(0)) {
                 std::printf("Discard locks: %.1f/s, %.1f KB/s of dead GPU bytes dropped, %.1f pages/s "

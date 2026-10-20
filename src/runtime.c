@@ -188,17 +188,26 @@ static inline void copy_range_clear(void) {
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    copy_range_set(dst, size); memset(dst, value, size); copy_range_clear();
+    copy_range_set(dst, size);
+    memset(dst, value, size);
+    copy_range_clear();
+    runtime_memory_host_copy_done((uintptr_t)dst, size);
     runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    copy_range_set(dst, size); memcpy(dst, src, size); copy_range_clear();
+    copy_range_set(dst, size);
+    memcpy(dst, src, size);
+    copy_range_clear();
+    runtime_memory_host_copy_done((uintptr_t)dst, size);
     runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    copy_range_set(dst, size); memmove(dst, src, size); copy_range_clear();
+    copy_range_set(dst, size);
+    memmove(dst, src, size);
+    copy_range_clear();
+    runtime_memory_host_copy_done((uintptr_t)dst, size);
     runtime_memory_note_cpu_write((uintptr_t)dst, size); return dst;
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {

@@ -830,6 +830,28 @@ void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch)
         else atomic_fetch_and_explicit(&write_watch[word],~mask,memory_order_release);
     }
 }
+/* PORTHEON 074f3cd: completed libc copies notify windows still open over their pages,
+ * including pages written without faulting. The in-progress range lives in runtime.c.
+ * BB_HOST_COPY_EXTENTS=0 leaves the hook unset, disabling fault and completion handling. */
+static GpuRange hook_host_copy;
+static const uint32_t *host_copy_open_windows;
+static int host_copy_extents_enabled(void) {
+    static int value=-1;
+    if (value<0) { const char *v=getenv("BB_HOST_COPY_EXTENTS"); value=!(v && v[0]=='0'); }
+    return value;
+}
+void runtime_memory_set_host_copy_hook(GpuRange hook, const uint32_t *open_windows) {
+    if (!host_copy_extents_enabled()) { puts("Runtime: host copy extents off (BB_HOST_COPY_EXTENTS=0)"); return; }
+    host_copy_open_windows=open_windows;
+    hook_host_copy=hook;
+}
+int runtime_memory_host_copy_enabled(void) {
+    return hook_host_copy != NULL;
+}
+void runtime_memory_host_copy_done(uintptr_t address, uint64_t size) {
+    if (hook_host_copy && size && size <= UINTPTR_MAX-address && host_copy_open_windows && __atomic_load_n(host_copy_open_windows,__ATOMIC_ACQUIRE))
+        hook_host_copy(address,size);
+}
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size) {
     if (!write_watch || !size || address>=WATCH_LIMIT || address+size>WATCH_LIMIT) return;
     const uint64_t first=address>>12, last=(address+size-1)>>12;

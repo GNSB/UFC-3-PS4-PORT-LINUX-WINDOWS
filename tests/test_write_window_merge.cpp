@@ -182,6 +182,31 @@ void WritableRuns() {
     assert(ForEachWritableRun(0x1001004, current, nullptr, nullptr, 20,
                               [&](auto at, auto n) { runs.emplace_back(at, n); }) == 0);
     assert((runs == Runs{{0, 20}}));
+    // ufc4: a granule a libc copy wrote is kept even when its bytes equal the guest's (the copy
+    // rewrote the stale value over GPU bytes): [12,20) here, at 0x1001010.
+    runs.clear();
+    const auto kept_known = ForEachWritableRunKeeping(
+        0x1001004, current, nullptr, nullptr, 20,
+        [](std::uint64_t granule) { return granule == 0x1001010; },
+        [&](auto at, auto n) { runs.emplace_back(at, n); });
+    assert(kept_known == 8);
+    assert((runs == Runs{{0, 12}}));
+    // UFC-69: an in-flight readback must keep a same-value CPU rewrite even
+    // when both snapshots match; untouched GPU granules still download.
+    runs.clear();
+    const auto kept_middle = ForEachWritableRunKeeping(
+        0x1001004, current, current, current, 20,
+        [](std::uint64_t granule) { return granule == 0x1001008; },
+        [&](auto at, auto n) { runs.emplace_back(at, n); });
+    assert(kept_middle == 8);
+    assert((runs == Runs{{0, 4}, {12, 8}}));
+    // A partial payload inside a known granule is kept in full.
+    runs.clear();
+    assert(ForEachWritableRunKeeping(
+        0x100100b, current, current, current, 2,
+        [](std::uint64_t granule) { return granule == 0x1001008; },
+        [&](auto at, auto n) { runs.emplace_back(at, n); }) == 2);
+    assert(runs.empty());
 }
 
 // The free-list link written through a window over GPU bytes, then a readback of the page.
