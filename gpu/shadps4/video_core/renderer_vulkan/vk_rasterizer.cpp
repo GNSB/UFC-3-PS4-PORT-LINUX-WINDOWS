@@ -2971,6 +2971,8 @@ struct DepthAsColor {
         vk::ImageView src_view{};
         VkImage src_image = VK_NULL_HANDLE; // the backing can change under the same image
         VideoCore::ImageId src_id{};
+        // UFC-60: the source's Image::write_count when this copy was converted; ~0 none yet.
+        u64 converted_writes = ~0ULL;
     };
     vk::UniqueDescriptorSetLayout set_layout;
     vk::UniquePipelineLayout layout;
@@ -2982,7 +2984,24 @@ struct DepthAsColor {
     // reuse) lets copies go away with their image.
     std::map<std::pair<u64, u32>, Copy> copies;
     u64 swept_tick = 0;
+    // UFC-60: conversions run and reused since the last report (every 5 s while there are any).
+    u64 converted = 0, reused = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
+
+// ufc3 (UFC-60): a depth layer read as R16/R32_UINT is converted again only once something
+// has written the depth image since its last conversion (Image::write_count), instead of at
+// every bind. Every conversion ends the render pass and runs a full-image dispatch between two
+// global barriers; a scene that reads the spot-light shadow map in many draws (Career's menu
+// after the second belt is the suspect, GitHub #18/#36) paid that per draw.
+// BB_DEPTH_AS_COLOR_REUSE=0: convert at every bind, as before.
+bool DepthAsColorReuse() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_DEPTH_AS_COLOR_REUSE");
+        return !env || env[0] != '0';
+    }();
+    return on;
+}
 
 DepthAsColor& DepthAsColorState(const Instance& instance) {
     static DepthAsColor state = [&] {
@@ -3038,16 +3057,29 @@ void DestroyDepthAsColor(const Instance& instance, Scheduler& scheduler, VkImage
     });
 }
 
-const DepthAsColor::Copy* DepthAsColorCopy(const Instance& instance, Scheduler& scheduler,
-                                           VideoCore::TextureCache& texture_cache,
-                                           VideoCore::ImageId src_id, vk::Image src_image,
-                                           vk::Format src_format, u64 src_uid, u32 layer,
-                                           u32 width, u32 height, bool is32) {
+DepthAsColor::Copy* DepthAsColorCopy(const Instance& instance, Scheduler& scheduler,
+                                     VideoCore::TextureCache& texture_cache,
+                                     VideoCore::ImageId src_id, vk::Image src_image,
+                                     vk::Format src_format, u64 src_uid, u32 layer, u32 width,
+                                     u32 height, bool is32) {
     auto& state = DepthAsColorState(instance);
     const u64 tick = scheduler.CurrentTick();
     // Once per submission: free the copies of images the texture cache has deleted.
     if (tick != state.swept_tick) {
         state.swept_tick = tick;
+        // UFC-60: how often a depth layer read as colour was converted, and how often reused.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - state.reported >= std::chrono::seconds(5)) {
+            const double seconds = std::chrono::duration<double>(now - state.reported).count();
+            if (state.converted != 0 || state.reused != 0) {
+                std::printf("Depth as color: %.1f conversions/s, %.1f reused/s "
+                            "(BB_DEPTH_AS_COLOR_REUSE %s)\n",
+                            state.converted / seconds, state.reused / seconds,
+                            DepthAsColorReuse() ? "on" : "off");
+            }
+            state.converted = state.reused = 0;
+            state.reported = now;
+        }
         for (auto it = state.copies.begin(); it != state.copies.end();) {
             if (texture_cache.TryGetImage(it->second.src_id, it->first.first)) {
                 ++it;
@@ -3066,6 +3098,7 @@ const DepthAsColor::Copy* DepthAsColorCopy(const Instance& instance, Scheduler& 
         DestroyDepthAsColor(instance, scheduler, copy.image, copy.allocation, copy.view, {});
         copy.image = VK_NULL_HANDLE;
         copy.view = vk::ImageView{};
+        copy.converted_writes = ~0ULL;
     }
     // A new backing behind this image: a new source view, the old one destroyed once the frames
     // in flight are done with it.
@@ -3073,6 +3106,7 @@ const DepthAsColor::Copy* DepthAsColorCopy(const Instance& instance, Scheduler& 
         DestroyDepthAsColor(instance, scheduler, VK_NULL_HANDLE, VK_NULL_HANDLE, {},
                             copy.src_view);
         copy.src_view = vk::ImageView{};
+        copy.converted_writes = ~0ULL;
     }
     if (!copy.src_view) {
         copy.src_view = Check(instance.GetDevice().createImageView({
@@ -3113,6 +3147,7 @@ const DepthAsColor::Copy* DepthAsColorCopy(const Instance& instance, Scheduler& 
         }));
         copy.width = width;
         copy.height = height;
+        copy.converted_writes = ~0ULL;
         std::printf("Depth as %s: %ux%u copy of layer %u for a depth image read as raw Z%u bits "
                     "(%zu copies)\n",
                     is32 ? "R32_UINT" : "R16_UINT", width, height, layer, is32 ? 32u : 16u,
@@ -3427,12 +3462,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 (desc.view_info.format == vk::Format::eR16Uint || depth_as_r32) &&
                 desc.view_info.range.base.level == 0 && desc.view_info.range.extent.layers == 1) {
                 const u32 width = image.info.size.width, height = image.info.size.height;
-                const auto* copy = DepthAsColorCopy(
+                auto* copy = DepthAsColorCopy(
                     instance, scheduler, texture_cache, image_id, image.GetImage(),
                     instance.GetSupportedFormat(image.info.pixel_format, image.format_features),
                     image.image_uid, desc.view_info.range.base.layer, width, height,
                     depth_as_r32);
-                if (copy) {
+                auto& as_color = DepthAsColorState(instance);
+                if (copy && DepthAsColorReuse() && copy->converted_writes == image.write_count) {
+                    // UFC-60: nothing wrote the depth image since this copy was made.
+                    ++as_color.reused;
+                    view = copy->view;
+                    layout = vk::ImageLayout::eGeneral;
+                    set_ok = false;
+                } else if (copy) {
+                    copy->converted_writes = image.write_count;
+                    ++as_color.converted;
                     // The depth image was transited for reading above; the copy is rebuilt now.
                     scheduler.EndRendering();
                     runtime.FlushBarriers();

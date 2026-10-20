@@ -267,6 +267,16 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     BeforeImageAccess();
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
+    // ufc3 (UFC-60): every write to an image goes through here first (see Image::write_count).
+    constexpr auto writes = vk::AccessFlagBits2::eShaderWrite |
+                            vk::AccessFlagBits2::eShaderStorageWrite |
+                            vk::AccessFlagBits2::eColorAttachmentWrite |
+                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                            vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite |
+                            vk::AccessFlagBits2::eHostWrite;
+    if (dst_access & writes) {
+        ++image->write_count;
+    }
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
     return image_barriers.size() != prev_num_barriers;

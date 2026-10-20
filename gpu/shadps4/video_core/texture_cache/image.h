@@ -166,6 +166,10 @@ public:
     /// bbport: scheduler tick of the last binding that lets the GPU write it (render or depth target,
     /// storage image); 0 never.
     u64 gpu_write_tick{};
+    /// ufc3 (UFC-60): Runtime::Transit calls that let something write the image (render or depth
+    /// target, storage, copy or upload destination). Equal counts mean equal contents: the
+    /// depth-as-colour conversion is reused while the count has not moved.
+    u64 write_count{};
     ImageId depth_id{};
     u64 depth_uid{};
     u64 image_uid{};
