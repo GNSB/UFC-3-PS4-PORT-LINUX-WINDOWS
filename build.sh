@@ -85,6 +85,35 @@ printf '%s\n' "$version" > out/VERSION
 echo "Version: $version (out/VERSION)"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
+# GPU regressions run serially under ufc3-build's machine-wide lock; no game is launched.
+if [[ ${1:-} == --gpu-tests ]]; then
+    gpu_tests=(copy-bounds motion-history motion-shader ui-composition label-guard
+               write-window-merge page-watch-perms settings scene-resolution taa-shader
+               camera-motion upscaler-support)
+    if (( $# > 1 )); then gpu_tests=("${@:2}"); fi
+    gpu_targets=("${gpu_tests[@]/%/-test}")
+    ninja -C out/gpu "${gpu_targets[@]}"
+    mkdir -p out/gpu-tests/motion
+    gpu_test_status=0
+    for test in "${gpu_tests[@]}"; do
+        echo "GPU test: $test"
+        gpu_test_args=()
+        if [[ $test == motion-shader ]]; then gpu_test_args=(out/gpu-tests/motion); fi
+        if out/gpu/"$test"-test "${gpu_test_args[@]}"; then
+            echo "GPU test passed: $test"
+        else
+            gpu_test_status=1
+            echo "GPU test FAILED: $test" >&2
+        fi
+    done
+    if command -v spirv-val >/dev/null; then
+        for shader in out/gpu-tests/motion/*.spv; do
+            [[ -f $shader ]] || continue
+            spirv-val --target-env vulkan1.3 "$shader" || gpu_test_status=1
+        done
+    fi
+    exit "$gpu_test_status"
+fi
 # Fast identity checks; --version returns before reserving memory or initializing the GPU.
 if [[ ${1:-} == --test || ${1:-} == --version-test ]]; then
     "$CC" -std=c11 -O2 -Wall -Wextra -Werror -Isrc tests/test_build_version.c -o out/build-version-test

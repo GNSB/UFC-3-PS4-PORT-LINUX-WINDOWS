@@ -352,3 +352,9 @@ add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
 target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
+
+# UFC-71: transfer bounds are checked without a Vulkan device or the game.
+add_executable(copy-bounds-test EXCLUDE_FROM_ALL ../tests/test_copy_bounds.cpp)
+target_compile_options(copy-bounds-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-missing-field-initializers)
+target_include_directories(copy-bounds-test PRIVATE shadps4)
+target_link_libraries(copy-bounds-test PRIVATE Vulkan::Headers)
