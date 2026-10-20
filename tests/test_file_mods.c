@@ -50,6 +50,10 @@ int main(void) {
     assert(do_write(save,"save",4)==4 && !do_close(save));
     assert(!path_op("/data/test-save",2,0));
     assert(!unlink(link) && !unlink(source) && !rmdir(game));
+    /* runtime_file_configure also pre-creates temp0/images{,/career,/match} and temp0/createplayer;
+     * remove them leaf-first before the mounts can be rmdir'd (the save was unlinked above). */
+    const char *ufc_dirs[]={"temp0/images/career","temp0/images/match","temp0/images","temp0/createplayer"};
+    for (int i=0;i<4;++i) { char p[1024]; snprintf(p,sizeof(p),"%s/%s",user,ufc_dirs[i]); assert(!rmdir(p)); }
     const char *dirs[]={"temp0","download0","data"};
     for (int i=0;i<3;++i) { char p[1024]; snprintf(p,sizeof(p),"%s/%s",user,dirs[i]); assert(!rmdir(p)); }
     assert(!rmdir(user) && !rmdir(root));
