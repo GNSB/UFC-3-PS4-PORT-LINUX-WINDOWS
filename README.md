@@ -19,17 +19,24 @@ the native Bloodborne port. All code is GPL-2.0-or-later.
 
 ## Status
 
-**Current release: [0.1.5](../../releases)** ([notes](docs/ufc3/releases/0.1.5.md)). What's new:
-write windows on Windows again (a Career fight on an RTX 3060 laptop goes from about 30 to
-60–70 FPS), blood and sweat on hits are back, a fixed GPU hang in the Career fighter editor, a
-possible fix for AMD freezes, new Windows and Linux launchers, private online play with working
-rematches, and experimental 2K/4K.
+**Current release: [0.1.8](../../releases)** ([notes](docs/ufc3/releases/0.1.8.md)). What's new
+since 0.1.6:
+
+- **0.1.8:**
+  - the Career menu no longer drops to 10–30 FPS after winning the 2nd belt;
+  - a controller can disconnect and reconnect without crashing the game;
+  - blood and sweat are fixed with `BB_WRITE_WINDOW=2`;
+  - old cached textures are freed, so FPS should no longer go down over long sessions.
+- **0.1.7:** two Career crashes are fixed (entering Career or loading a save after a title fight,
+  and moving the Create Fighter sliders), and the launcher explains when the CPU is too old.
 
 **Playable.** Menus, loading, fights (including the menu's attract-mode fight), sound, controller
 and saves. What works today:
 
-- **Career**: it saves, it no longer crashes on entry, and changing hair/head repeatedly in the
-  fighter editor no longer hangs the GPU.
+- **Career**: it saves, and saves made after a title fight load again. It no longer crashes on
+  entry or when you move the Create Fighter sliders or change presets. Changing hair/head
+  repeatedly in the fighter editor no longer hangs the GPU, and the menu stays fast after you
+  win belts.
 - **Blood and sweat** on hits, with the created fighter's skin still correct.
 - **PS4 Pro mode** (the game renders 1080p instead of 900p), with a checkbox in the Windows
   launcher (`BB_NEO=1` on Linux).
@@ -63,8 +70,11 @@ and saves. What works today:
 - Fights on Windows still run below Linux.
 - Keep the log folder on a local disk for the best FPS.
 - "Clear the shader cache at start" recompiles every shader on each start: leave it off.
-- AMD freezes and closes may be fixed in 0.1.5 (late EOS labels were being dropped): **AMD users,
-  please report** whether it helps.
+- The 0.1.8 fixes (Career menu FPS, controller reconnect, blood/sweat in mode 2, long sessions)
+  were checked with tests and code review, not yet by many players: if one does not fix your case,
+  please reopen the issue with the new log.
+- The 2K/4K internal resolutions are still experimental. If the game crashes with one of them,
+  try again without it before you report the crash.
 - Moving the window to another monitor *during startup* can crash the NVIDIA driver
   (`Swapchain::Destroy`).
 - Some long hairstyles leave a slightly lighter line at the base of the neck.
@@ -120,7 +130,8 @@ Since 0.1.5 the launcher has a UFC 3 dark/gold look, with your dump's own artwor
 | Log folder | a folder (empty: `%LOCALAPPDATA%\UFC3Native\logs`) | Where the run logs and frame/readback CSVs go; `BB_LOG_DIR` wins over it. A network drive works, but a local disk gives the best FPS. |
 
 Environment variables you already have set take precedence over the launcher (for example a
-`.bat` with `set BB_WRITE_WINDOW=0` before starting `UFC3.exe`).
+`.bat` with `set BB_WRITE_WINDOW=2` before starting `UFC3.exe`). Since 0.1.7 you no longer need
+`BB_WRITE_WINDOW=0` to avoid the Career crashes.
 
 ## Linux
 
@@ -189,7 +200,7 @@ bash scripts/release.sh <version>   # tags ufc3-v<version>, builds, packages, pu
 | `BB_VBLANK_HZ` / `BB_FLIP_RATE` | 480 / 0 | The game asks for 30 Hz; with flip rate 0 and a high virtual vblank it runs at the real rate (the simulation follows real frame time). |
 | `BB_READBACKS` / `BB_READBACK_LINEAR` | 2 / 1 | Precise reads of GPU-written memory (without them the fight renders black, as UFC 4 does in shadPS4). |
 | `BB_WRITE_STEP` | 1 | CPU writes next to a few GPU-written bytes are single-stepped instead of waiting for the GPU; write windows need it. Validated on Windows (UFC-48 coherent windows) with correct created/career skin. |
-| `BB_WRITE_WINDOW` | 1 (`run.sh` and the Windows launcher, since 0.1.5) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). The 0.1.4 Windows heap corruption is fixed by UFC-48's coherent windows (validated on an RTX 3060: second fight and contract without a crash). `BB_WRITE_WINDOW=0` turns it off. `BB_WRITE_WINDOW=2` opens a window only when the faulting write's exact bytes are known (a guest `memcpy`/`memmove`/`memset`, or a guest store decoded as one plain store) and they do not cover GPU bytes; any other write is handled as with 0 (single step or readback). It removes the per-frame readbacks of the `Map(WRITE_DISCARD)` + `memcpy` at guest `+0x431c4f` and the stores at `+0x4219b8` (see `docs/ufc3/WINDOWS-EXACT-WRITE-WINDOWS.md`). |
+| `BB_WRITE_WINDOW` | 1 (`run.sh` and the Windows launcher, since 0.1.5) | Pages shared by CPU and GPU data stay open for the CPU until the game's next submission; then only what changed is uploaded (see *Performance*). The 0.1.4 Windows heap corruption is fixed by UFC-48's coherent windows (validated on an RTX 3060: second fight and contract without a crash). `BB_WRITE_WINDOW=0` turns it off. `BB_WRITE_WINDOW=2` opens a window only when the faulting write's exact bytes are known (a guest `memcpy`/`memmove`/`memset`, or a guest store decoded as one plain store) and they do not cover GPU bytes; any other write is handled as with 0 (single step or readback). It removes the per-frame readbacks of the `Map(WRITE_DISCARD)` + `memcpy` at guest `+0x431c4f` and the stores at `+0x4219b8` (see `docs/ufc3/WINDOWS-EXACT-WRITE-WINDOWS.md`). Since 0.1.8 mode 2 no longer overwrites GPU data next to a CPU write, which broke blood and sweat. |
 | `BB_PREUPLOAD` | 1 | Background upload of rewritten game memory into VRAM (1 = resident memory, 2 = all of it). Restores blood/sweat on hits (UFC-49); validated on Linux and Windows. A user-set value overrides the default. |
 | `BB_ALPHA_TO_MASK` | on | Hair/beard coverage (`DB_ALPHA_TO_MASK` emulated as a shader dither). `0` turns it off; `coverage` uses Vulkan alpha-to-coverage on MSAA targets; `colourmap` limits it to draws sampling the hair colour map (Create Fighter only). |
 | `SHADPS4_BC_MODE` | 3 | GPU-compressed textures go through memory (created-fighter skin). `0` restores the older compressed-view/copy behaviour, for comparison. |
@@ -202,6 +213,11 @@ bash scripts/release.sh <version>   # tags ufc3-v<version>, builds, packages, pu
 | `BB_USER_NAME` | `Player 1` | The PS4 user name the game shows (16 bytes). |
 | `BB_LANGUAGE` | 1 (launcher: "Game language") | The PS4 system language: 1 English (US), 2 French, 3 Spanish (Spain), 4 German, 5 Italian, 0 Japanese, 7 Portuguese (Portugal; the game has no text for it), 8 Russian, 10 Chinese (Traditional), 16 Polish, 17 Portuguese (Brazil), 20 Spanish (Latin America). |
 | `BB_FRAME_STATS` | 1 in `run.sh` | Periodic statistics in the log (FPS, µs per draw, readbacks, write sites…). |
+| `BB_UI_BACKPRESSURE` | 1 | A UI scene built 8 times since the last frame waits for the next frame, up to 250 ms. This fixes the Career crash in the "UI Update" thread (0.1.7). `0` turns it off. |
+| `BB_APPEARANCE_BACKPRESSURE` | 1 | When the fighter appearance pool is full, the game waits up to 250 ms for an entry to be freed. This fixes the Create Fighter crash (0.1.7). `0` turns it off. |
+| `BB_DEPTH_AS_COLOR_REUSE` | 1 | A shadow map read as color is converted only again after it changes, instead of at every draw. This fixes the slow Career menu after winning the 2nd belt (0.1.8). `0` converts at every draw, as before. |
+| `BB_GC_STALE_SECONDS` | on | Frees cached textures that the game overwrote and that were not used for 60 s, even when memory use is low (0.1.8). `N` (1–63) changes the number of seconds; `0` turns it off. |
+| `BB_GROWTH_SECONDS` | 60 | How often the log prints a `Growth` line with cache sizes, memory and FPS. `0` turns it off. |
 
 There are also purely diagnostic switches (`*_TRACE`, `*_SKIP`, `*_DRAWS`…); they are described
 in the [release notes](docs/ufc3/releases/).
@@ -259,6 +275,8 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - `BB_SKIP_SHADERS`, `BB_SKIP_FILE`, `BB_CAPTURE_ON_FLIP`, `BB_PATCH_SHADERS` — isolate shaders
   and capture frames.
 - `BB_DISCARD_HOOK=1` (experimental, Linux) — reports the ranges handed out by the discard lock.
+- `BB_WRITE_STORE_DIAG=1` (with `BB_WRITE_WINDOW=2`) — logs, once per site, the game's stores
+  whose exact bytes the port cannot tell.
 
 ## Credits
 
@@ -278,13 +296,19 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - **HeuZ** — Windows RTX 4090 logs that located the write-window crash; **pvict** (GitHub) —
   Portuguese testing with `BB_LANGUAGE` that motivated the Windows language selector.
   Thanks to everyone who sent Windows logs and reports.
+- **@SinLeeke** — exact write windows (`BB_WRITE_WINDOW=2`) and the guest frame limit (PR #13).
+- Players whose reports and logs led to the 0.1.7–0.1.8 fixes: **@DieYoung0800**,
+  **@Cheburechek02**, **@nomadsdad**, **@ThallesCosta-dev**, **@VHXXIII**, **@waghrudraksh**,
+  **@bigozerkibigozerki-jpg**, **@paulkresnik**, **@Beiudo** and **@SercanDmr**.
 - **[Flawlessix](https://www.reddit.com/user/Flawlessix/)** (Reddit) — testing on AMD.
 
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
   [FSR](https://github.com/GPUOpen-Effects/FidelityFX-FSR), Dear ImGui.
 
 Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md),
-[`0.1.4`](docs/ufc3/releases/0.1.4.md) and [`0.1.5`](docs/ufc3/releases/0.1.5.md).
+[`0.1.4`](docs/ufc3/releases/0.1.4.md), [`0.1.5`](docs/ufc3/releases/0.1.5.md),
+[`0.1.6`](docs/ufc3/releases/0.1.6.md), [`0.1.7`](docs/ufc3/releases/0.1.7.md) and
+[`0.1.8`](docs/ufc3/releases/0.1.8.md).
 
 ## License
 
