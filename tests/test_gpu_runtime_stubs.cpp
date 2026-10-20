@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <cstdlib>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <setjmp.h>
 // Renderer tests have no guest process. Clock/host-thread services work; guest accesses abort.
 extern "C" {
+// Fallback host diagnostics; label-guard-test supplies its own versions.
+__attribute__((weak)) void platform_describe_address(uintptr_t address, char* out, size_t size) {
+    std::snprintf(out, size, "%#llx", (unsigned long long)address);
+}
+__attribute__((weak)) int platform_backtrace(void**, int) { return 0; }
+__attribute__((weak)) void platform_thread_get_name(char* out, size_t size) {
+    std::snprintf(out, size, "test");
+}
+__attribute__((weak)) uint32_t platform_thread_id() { return 1; }
 thread_local sigjmp_buf* runtime_fault_recover = nullptr;
 uint32_t runtime_disabled_optimizations = 0;
 uint64_t runtime_experiment_bits = 0;
+int runtime_guest_copy_range(uintptr_t*, uintptr_t*) { return 0; }
+void runtime_ui_guest_flip() { std::abort(); }
 uint64_t runtime_tsc_frequency() { return 1000000000; }
 int runtime_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t) { std::abort(); }

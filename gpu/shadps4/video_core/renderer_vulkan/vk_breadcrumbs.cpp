@@ -157,6 +157,10 @@ void PrintEntry(const Stream& stream, u64 id, const char* label) {
     switch (c.kind) {
     case Kind::Pass:
         std::printf(" %s", c.name ? c.name : "?");
+        if (c.address) { // portheon: the image a transfer or tiling pass works on
+            std::printf(" (image %#llx %ux%u, levels %u, %u bytes)", (unsigned long long)c.address,
+                        c.count[0], c.count[1], c.count[2] & 0xffff, c.args_slot);
+        }
         break;
     case Kind::Draw:
     case Kind::DrawIndexed:
@@ -264,7 +268,7 @@ u32 Note(u32 stream_index, const Crumb& crumb) {
     Entry& entry = stream.ring[id & (RingSize - 1)];
     entry.crumb = crumb;
     entry.id = id;
-    if (crumb.args_slot < ArgSlots) {
+    if (crumb.kind == Kind::DispatchIndirect && crumb.args_slot < ArgSlots) {
         args_notes[crumb.args_slot] = {id, stream_index, crumb.hash[0]};
     }
     return u32(id);

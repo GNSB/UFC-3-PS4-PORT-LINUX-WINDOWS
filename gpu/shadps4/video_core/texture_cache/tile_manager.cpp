@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
+#include "video_core/renderer_vulkan/vk_copy_bounds.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -193,11 +195,60 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
     return handle;
 }
 
+// portheon: a tiling pass reads and writes guest_size bytes of both buffers and every level's
+// layout: one that reaches past either buffer is skipped and logged (the first 20) instead of
+// faulting on the GPU (UFC 2's Create Fighter: device lost between tiling passes).
+static bool TilingInBounds(const VideoCore::ImageInfo& info, const VideoCore::Buffer* tiled,
+                           u64 tiled_offset, const VideoCore::Buffer* linear, u64 linear_offset,
+                           u32 levels, const char* what) {
+    u64 layout_end = 0;
+    bool layout_valid = levels && levels <= info.resources.levels &&
+                        levels <= info.mips_layout.size() && info.num_bits >= 8;
+    for (u32 mip = 0; mip < std::min<u32>(levels, info.mips_layout.size()); ++mip) {
+        const auto& layout = info.mips_layout[mip];
+        layout_end = std::max(layout_end, u64(layout.offset) + layout.size);
+        layout_valid &= layout.size && layout.pitch && layout.height;
+    }
+    // The shader dispatch covers guest_size, including padding. Missing mip parameters
+    // would make GetMipLevel run beyond the uniform array, even with large enough buffers.
+    const bool ok =
+        layout_valid &&
+        Vulkan::CopyBounds::TilingLayout(std::span<const ImageInfo::MipInfo>{info.mips_layout},
+                                         levels, info.guest_size) &&
+        layout_end <= info.guest_size &&
+        Vulkan::CopyBounds::Range(tiled_offset, info.guest_size, tiled->SizeBytes()) &&
+        Vulkan::CopyBounds::Range(linear_offset, info.guest_size, linear->SizeBytes());
+    if (!ok) {
+        static int logged;
+        if (logged < 20) {
+            ++logged;
+            std::printf("Copy check: %s of image %#llx %ux%u (levels %u, guest bytes %u, layout "
+                        "end %llu) skipped: tiled %llu+%u of %llu, linear %llu+%u of %llu\n",
+                        what, (unsigned long long)info.guest_address, info.size.width,
+                        info.size.height, levels, info.guest_size, (unsigned long long)layout_end,
+                        (unsigned long long)tiled_offset, info.guest_size,
+                        (unsigned long long)tiled->SizeBytes(), (unsigned long long)linear_offset,
+                        info.guest_size, (unsigned long long)linear->SizeBytes());
+        }
+    }
+    return ok;
+}
+
 void TileManager::RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,
                                        const vk::DescriptorBufferInfo& linear,
-                                       const vk::DescriptorBufferInfo& params, u32 dim_x) {
-    scheduler.RecordCrumb({.name = "tiling"}, [pipeline, layout = *pl_layout, tiled, linear,
-                                              params, dim_x](vk::CommandBuffer cmdbuf) {
+                                       const vk::DescriptorBufferInfo& params, u32 dim_x,
+                                       const VideoCore::ImageInfo* image) {
+    // portheon: the image in the breadcrumb, for a GPU loss in a tiling pass.
+    Vulkan::Breadcrumbs::Crumb crumb{.name = "tiling"};
+    if (image) {
+        crumb.address = image->guest_address;
+        crumb.count[0] = image->size.width;
+        crumb.count[1] = image->size.height;
+        crumb.count[2] = image->resources.levels;
+        crumb.args_slot = image->guest_size;
+    }
+    scheduler.RecordCrumb(crumb, [pipeline, layout = *pl_layout, tiled, linear, params,
+                                  dim_x](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
         const std::array<vk::WriteDescriptorSet, 3> set_writes = {{
             {
@@ -230,6 +281,12 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         return {in_buffer, in_offset};
     }
 
+    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    if (!TilingInBounds(info, in_buffer, in_offset, staging.buffer, staging.offset,
+                        info.resources.levels, "detiling")) {
+        return {in_buffer, in_offset};
+    }
+
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
     params.micro_tiled_mips = info.micro_tiled_mips;
@@ -249,8 +306,6 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
-
     scheduler.EndRendering();
     runtime.FlushBarriers();
 
@@ -267,7 +322,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, false), tiled_buffer_info, linear_buffer_info,
-                         params_buffer_info, dim_x);
+                         params_buffer_info, dim_x, &info);
     // bbport: the source may be the arena (BB_PREUPLOAD), which later uploads write: a copy into
     // it must wait for this read.
     runtime.AccessBuffer(in_buffer, in_offset, info.guest_size,
@@ -284,11 +339,42 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                             const VideoCore::Buffer* out_buffer, u64 out_offset) {
     const auto& info = in_image.info;
+    {
+        // portheon: which images are written back to guest memory (once each, up to 200): the
+        // last ones before a GPU loss in a tiling pass.
+        static std::unordered_set<u64> seen;
+        if (seen.size() < 200 && seen.insert(info.guest_address).second) {
+            std::printf("Tiling to memory: image %#llx %s %ux%u levels %u layers %u samples %u "
+                        "tile %u, guest bytes %u, buffer %llu+ of %llu\n",
+                        (unsigned long long)info.guest_address,
+                        vk::to_string(info.pixel_format).c_str(), info.size.width, info.size.height,
+                        info.resources.levels, info.resources.layers, info.num_samples,
+                        u32(info.tile_mode), info.guest_size, (unsigned long long)out_offset,
+                        (unsigned long long)out_buffer->SizeBytes());
+        }
+    }
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {
-            copy.bufferOffset += out_offset;
+            if (copy.bufferOffset > std::numeric_limits<u64>::max() - out_offset) {
+                static u32 logged;
+                if (logged < 20) {
+                    ++logged;
+                    std::printf(
+                        "Copy check: download of image %#llx skipped: buffer offset overflow\n",
+                        (unsigned long long)info.guest_address);
+                }
+                copy.imageExtent = vk::Extent3D{0, 0, 0};
+            } else {
+                copy.bufferOffset += out_offset;
+            }
         }
         runtime.DownloadImage(&in_image, out_buffer, buffer_copies);
+        return;
+    }
+
+    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    if (!TilingInBounds(info, out_buffer, out_offset, staging.buffer, staging.offset,
+                        static_cast<u32>(buffer_copies.size()), "tiling to memory")) {
         return;
     }
 
@@ -311,9 +397,13 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
-        copy.bufferOffset += staging.offset;
+        if (copy.bufferOffset > info.guest_size) {
+            // DownloadImage logs and discards this invalid region.
+            copy.imageExtent = vk::Extent3D{0, 0, 0};
+        } else {
+            copy.bufferOffset += staging.offset;
+        }
     }
 
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
@@ -332,7 +422,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const auto dim_x = static_cast<u32>((info.guest_size / (info.num_bits / 8)) / 64);
     // bbport: recorded with copies of the descriptor infos (threaded recording).
     RecordTilingDispatch(GetTilingPipeline(info, true), tiled_buffer_info, linear_buffer_info,
-                         params_buffer_info, dim_x);
+                         params_buffer_info, dim_x, &info);
 
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
