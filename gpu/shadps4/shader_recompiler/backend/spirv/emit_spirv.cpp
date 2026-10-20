@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
@@ -151,8 +153,23 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+// bbport (loop guard, ported from PORTHEON 44edf33): every loop counts its consecutive iterations
+// in a function variable and leaves after kLoopGuardLimit of them. A shader that reads its trip
+// count from memory (a light list, an MSAA sample count) and gets a garbage value there (stale or
+// half written data) would otherwise run until the driver resets the GPU (device lost: UFC 4's
+// fighter select, ps 7f438824; the Steam Deck's start, cs 841be7c8). Legitimate loops run a few
+// hundred iterations at most. The counter is reset at the loop's merge block (every exit of a
+// structured loop goes through it: the loop condition and breaks), so a loop entered again starts
+// from zero. BB_SHADER_LOOP_GUARD=0 turns it off (LoopGuardEnabled, below).
+constexpr u32 kLoopGuardLimit = 65536;
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    // One counter per loop: declared in the first block (SPIR-V wants Function variables there),
+    // found by the loop's merge block.
+    std::unordered_map<const IR::Block*, Id> loop_counters;
+    std::unordered_map<const IR::Block*, Id> resets; // merge block -> its loop's counter
+    bool declared = !LoopGuardEnabled();
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -162,8 +179,28 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (!declared) {
+                declared = true;
+                const Id counter_ptr{ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1])};
+                for (const IR::AbstractSyntaxNode& loop : program.syntax_list) {
+                    if (loop.type == IR::AbstractSyntaxNode::Type::Loop) {
+                        loop_counters[loop.data.loop.merge] = ctx.AddLocalVariable(
+                            counter_ptr, spv::StorageClass::Function, ctx.u32_zero_value);
+                    }
+                }
+            }
+            const auto reset = resets.find(node.data.block);
+            bool reset_done = reset == resets.end();
             for (IR::Inst& inst : node.data.block->Instructions()) {
+                // Phis must stay first in the block: the reset goes after them.
+                if (!reset_done && inst.GetOpcode() != IR::Opcode::Phi) {
+                    ctx.OpStore(reset->second, ctx.u32_zero_value);
+                    reset_done = true;
+                }
                 EmitInst(ctx, &inst);
+            }
+            if (!reset_done) {
+                ctx.OpStore(reset->second, ctx.u32_zero_value);
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;
@@ -182,6 +219,10 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
 
             ctx.OpLoopMerge(endloop_label, continue_label, spv::LoopControlMask::MaskNone);
             ctx.OpBranch(body_label);
+            if (const auto counter = loop_counters.find(node.data.loop.merge);
+                counter != loop_counters.end()) {
+                resets[node.data.loop.merge] = counter->second;
+            }
             break;
         }
         case IR::AbstractSyntaxNode::Type::Break: {
@@ -197,6 +238,15 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (const auto counter = loop_counters.find(node.data.repeat.merge);
+                counter != loop_counters.end()) {
+                const Id count{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], counter->second),
+                                          ctx.ConstU32(1U))};
+                ctx.OpStore(counter->second, count);
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], count,
+                                                        ctx.ConstU32(kLoopGuardLimit)));
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
@@ -653,6 +703,14 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
     });
 }
 } // Anonymous namespace
+
+bool LoopGuardEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("BB_SHADER_LOOP_GUARD");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {

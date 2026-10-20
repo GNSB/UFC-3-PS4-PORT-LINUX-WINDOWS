@@ -13,4 +13,8 @@ namespace Shader::Backend::SPIRV {
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                                          const IR::Program& program, Bindings& binding);
 
+// bbport: loops leave after 65536 consecutive iterations unless BB_SHADER_LOOP_GUARD=0. The
+// pipeline cache keys its SPIR-V on this, so switching it retranslates the cached shaders.
+[[nodiscard]] bool LoopGuardEnabled();
+
 } // namespace Shader::Backend::SPIRV
