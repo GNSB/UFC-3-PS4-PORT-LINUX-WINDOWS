@@ -33,6 +33,14 @@ OLD_IMAGES = {
 }
 # Other builds of the supported update (none known for UFC 3).
 KNOWN_672 = set()
+# Plain-text files the game parses before main() (path -> lines a readable copy has). memory.cfg
+# declares the allocators and categories ("Sys" among them): read but unusable (blank, binary, a
+# compressed PFS block left by a bad extraction), no category exists and the first allocation calls
+# through a vtable that is not one, an execute fault at 0x1 under guest 0xcc1 (GitHub #31).
+CONFIG_FILES = {
+    'samplegame/data/common/config/memory.cfg': ('AddAllocatorContainer.kettle', 'AddCategory'),
+    'samplegame/data/common/config/videoheap.cfg': ('AddAllocator.kettle',),
+}
 SUPPORTED_TITLE = 'CUSA06534'
 SUPPORTED_VERSION = '01.14'
 SUPPORTED_IMAGE = '46c2477702ae5d3fbff3a1911f10841aa150d20941d515ffb3edec75153f055b'
@@ -58,7 +66,7 @@ def profile(game, image_hash=None):
         image_hash = None
     if image_hash in SUPPORTED:
         return dict(SUPPORTED[image_hash], variant='5.05')
-    if image_hash and problem(game, image_hash) is None and os.environ.get('BB_SKIP_GAME_CHECK') != '1':
+    if image_hash and executable_problem(game, image_hash) is None and os.environ.get('BB_SKIP_GAME_CHECK') != '1':
         info = sfo_info(game)
         return dict(BY_TITLE[info['TITLE_ID']], variant='6.72+', known=image_hash in KNOWN_672)
     if os.environ.get('BB_SKIP_GAME_CHECK') != '1':
@@ -76,10 +84,39 @@ def sfo_info(game):
         return {}
 
 
+def damaged_configs(game):
+    """The CONFIG_FILES that are missing or not the plain text the game parses."""
+    damaged = []
+    for name, markers in CONFIG_FILES.items():
+        try:
+            data = (Path(game) / name).read_bytes()
+        except OSError:
+            damaged.append(name)
+            continue
+        if b'\0' in data or not all(m.encode() in data for m in markers):
+            damaged.append(name)
+    return damaged
+
+
 def problem(game, image_hash=None):
-    """None for a supported game, else (kind, title, version): kind is 'missing_update' (base
-    game or an older update), 'wrong_eboot' (param.sfo names the supported update, eboot.bin is
-    another version), 'other_title' (another edition, region or game) or 'unreadable'."""
+    """None for a supported game, else (kind, title, version[, detail]): kind is 'missing_update'
+    (base game or an older update), 'wrong_eboot' (param.sfo names the supported update, eboot.bin
+    is another version), 'other_title' (another edition, region or game), 'unreadable' or
+    'damaged_files' (detail: the game files that are missing or damaged)."""
+    found = executable_problem(game, image_hash)
+    if found:
+        return found
+    if os.environ.get('BB_SKIP_GAME_CHECK') == '1':
+        return None
+    damaged = damaged_configs(game)
+    if damaged:
+        info = sfo_info(game)
+        return 'damaged_files', info.get('TITLE_ID', '?'), info.get('APP_VER', '?'), damaged
+    return None
+
+
+def executable_problem(game, image_hash=None):
+    """problem() for eboot.bin and param.sfo alone."""
     if os.environ.get('BB_SKIP_GAME_CHECK') == '1':
         return None
     from prepare import sfo
@@ -103,7 +140,7 @@ def problem(game, image_hash=None):
     return None  # another 1.21 build (6.72+): accepted, see the module docstring
 
 
-def explain(kind, title, version):
+def explain(kind, title, version, detail=None):
     """What is wrong and what to do, for the log (English)."""
     found = f'Found {title} version {version} (sce_sys/param.sfo).'
     p = BY_TITLE.get(title, BY_TITLE[SUPPORTED_TITLE])
@@ -117,6 +154,10 @@ def explain(kind, title, version):
         'other_title': f'{found} Supported: {supported}; other editions and regions have a different executable.',
         'unreadable': f'{found} eboot.bin could not be read as a decrypted PS4 executable: dump '
                       'the game and its update again.',
+        'damaged_files': f"{found} These game files are missing or damaged (not the plain text the game "
+                         f"reads): {', '.join(detail or [])}. The game would close at start. Extract the "
+                         f"game and the {p['version']} update again (a fully decrypted dump) and copy the "
+                         'files over, replacing the old ones.',
     }[kind]
 
 

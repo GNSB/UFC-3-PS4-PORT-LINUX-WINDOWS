@@ -834,7 +834,9 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
         const wchar_t *args[] = {game};
         if (script(L"scripts", L"game_check.py", args, 1, profile, sizeof(profile))) {
             logf("%s", profile);
-            fail(L"The game check failed (see the log): the folder is not EA SPORTS UFC 3 CUSA06534 with the 1.14 update (CUSA06534-patch) beside it or merged in.");
+            fail(strstr(profile, "missing or damaged")
+                 ? L"The game check failed (see the log): some game files are missing or damaged. Extract the game and the 1.14 update again."
+                 : L"The game check failed (see the log): the folder is not EA SPORTS UFC 3 CUSA06534 with the 1.14 update (CUSA06534-patch) beside it or merged in.");
             return 2;
         }
         trim(profile);

@@ -95,6 +95,37 @@ class GameCheckTests(unittest.TestCase):
             self.assertIn('CUSA', game_check.explain(kind, 'CUSA13795', '01.00'))
             self.assertIn('CUSA', game_check.explain(kind, 'CUSA00000', '01.00'))
 
+    def configs(self, memory=None):
+        """CONFIG_FILES with readable contents; memory: other bytes for memory.cfg (b'' = none)."""
+        path = Path(self.tmp.name)
+        for name, markers in game_check.CONFIG_FILES.items():
+            (path / name).parent.mkdir(parents=True, exist_ok=True)
+            data = ('# config\n' + '\n'.join(f'{m} X [ size=1M ]' for m in markers) + '\n').encode()
+            if name.endswith('/memory.cfg') and memory is not None:
+                data = memory
+            if data:
+                (path / name).write_bytes(data)
+        return path
+
+    def test_readable_configs_pass(self):
+        self.assertEqual(game_check.damaged_configs(self.configs()), [])
+
+    def test_damaged_memory_config(self):
+        # GitHub #31: memory.cfg read but unusable -> no "Sys" category -> execute fault at 0x1.
+        name = 'samplegame/data/common/config/memory.cfg'
+        for data in (b'', b'\0' * 23127, b'PFSC' + b'\x8a' * 64):
+            self.tmp.cleanup()
+            self.tmp = tempfile.TemporaryDirectory()
+            self.assertEqual(game_check.damaged_configs(self.configs(data)), [name])
+        game = self.configs(b'\0' * 64)
+        table = {game_check.image_sha256(self.game('CUSA06534', '01.14')): game_check.SUPPORTED[game_check.SUPPORTED_IMAGE]}
+        with mock.patch.object(game_check, 'SUPPORTED', table):
+            found = game_check.problem(game)
+            self.assertEqual(found[0], 'damaged_files')
+            self.assertIn('memory.cfg', game_check.explain(*found))
+            with mock.patch.dict(os.environ, {'BB_SKIP_GAME_CHECK': '1'}):
+                self.assertIsNone(game_check.problem(game))
+
 
 if __name__ == '__main__':
     unittest.main()
