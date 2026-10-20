@@ -1,10 +1,76 @@
 # UFC-83 / issue #44: tarea que bloquea a posix
 
-**Estado: identificada estáticamente la tarea y el hilo que publica su terminación.
-Pendiente medir qué etapa consume los 60–100 ms; no hay arreglo de latencia demostrado.**
-La entrega agrega instrumentación para una sola corrida de la cadena completa.
-No se ejecutó el juego. No se modificaron readbacks, labels, write windows,
-persistencia, ni las protecciones de Career/post-pelea (UFC-27/UFC-47).
+**Estado tras la corrida fallida de 14:39: issue #44 sigue abierto.**
+La petición y el productor están identificados, pero las nuevas muestras contradicen
+que la pausa observada sea necesariamente la duración de AssetStream. Hay peticiones
+ya terminadas mientras su solicitante sigue dentro del sleep por equeue. Se corrige
+el diagnóstico y se reduce la instrumentación; no hay arreglo de latencia demostrado.
+No se ejecutó el juego ni se tocaron readbacks, labels, write windows, persistencia
+ni las protecciones de Career/post-pelea (UFC-27/UFC-47).
+
+## Hallazgo de 14:39 y límites de la corrida
+
+Fuentes: `logs/20261020_143957.log`, `logs/ufc83-task.samples` y
+`logs/ufc83-task.waits`. El log tiene exactamente **76.412 líneas Wait/Cond trace**
+y termina a 40.474 s; no llegó a press start ni al menú objeto del ticket.
+Además registró **22.147 eventos de FlipManager**, frente a 1.152 registros
+de la cola de timers compartida 262144. El comando anterior era demasiado
+invasivo y no debe repetirse.
+
+La instrumentación imprimía en cada handoff reteniendo mutex guest (cond_wait)
+o el mutex global del servicio de semáforos (wait_count). Las últimas muestras
+incluyen `AssetStream::Lo` en `_IO_printf → _IO_file_write` a
+`mono_ns=11219455112792` y `AssetStream::Un` bloqueado en
+`__lll_lock_wait_private → _IO_printf → runtime_wait_note` a
+`11219461034576`. Esto acredita contención introducida por el diagnóstico,
+**no prueba por sí solo un deadlock ni la causa de la falta de progreso**.
+Entre aproximadamente 15 y 35 s predominan workers en cond_timedwait; tampoco
+se puede atribuir todo ese intervalo a stdout.
+
+El anchor del archivo de muestras es `[6.873443] mono_ns=11185858239728`.
+Restándolo se correlacionan snapshots con timestamps del log (precisión aproximada):
+
+| Tiempo (s) | Hilo/sitio | Observación |
+| --- | --- | --- |
+| 12.095889 | posix, +0x43e4c | Agrega timer **224**, **3000 us**, queue **262144** |
+| 12.097834 | posix, +0x43e64 ← +0xe3e0dc ← +0x1bab6f0 | `Zinc.swf`, petición `0x7005bf5df0`, estado **0** |
+| 12.099432 | bb:kernel_servi | Dispara **224** tras **3523.677 us** |
+| 12.108394 | posix, misma pila | Misma petición, estado **4**, buffer `0x70174179a0`, 203074 bytes |
+| 12.118623–12.255450 | posix, misma pila | Sigue dentro de WaitEqueue, estado **4** en todas las muestras |
+| 12.258456 | bb:kernel_servi | Dispara timer **222**, de **250 ms** |
+| 12.258469 | posix, +0x43e64 | Recibe **222**, tras **162558.145 us** de wait |
+| 12.330812 | posix, +0x43e4c | Agrega **228**, **3000 us**, misma queue |
+| 12.333832 | bb:kernel_servi | Dispara **228** tras **3013.211 us** |
+| 12.386266 | posix, +0x43e64 | Recibe **229** (timer de 50 ms), espera **55443.422 us** |
+
+De los 93 snapshots asset-task, **86 tienen estado 4, cinco 1, uno 0 y uno 2**.
+Son observaciones, no porcentajes de tiempo del juego sin instrumentación.
+También `betaWarning.gnf` está en estado 4 desde **38.846730** hasta al menos
+**38.939962**, con la misma pila de sleep. El desfase no es exclusivo de SWF.
+
+**Cadena revisada:** UI Update → posix → petición AssetStream → Translate publica
+estado 3/4 → posix aún puede quedar en +0x43d30/WaitEqueue antes de volver a consultar.
+La publicación del timer es puntual en los ejemplos; **la entrega al solicitante
+no lo es**. El anterior probe monohilo de 3 ms no cubre este caso compartido.
+No hay evidencia para cambiar GPU/EOP ni para decir que el juego tarda 70 ms
+por descompresión. Tampoco hay una comparación equivalente con PS4.
+
+El sleep guest explica por qué hay una cola compartida: +0x43ddb lee TLS,
++0x43de7 obtiene el objeto EAThread de TLS[-0x18]; si es nulo, +0x43e89 busca
+el hilo en 128 registros de +0x297c350. A +0x43ebb selecciona el timer de
+respaldo **+0x297c338** si no lo encuentra. Registra un ident creciente en
++0x43e42 y espera **cualquier evento** en +0x43e5f (num=1, timeout=NULL).
+No comprueba que el ident recibido sea el solicitado. Los threads externos a
+EAThread pueden competir por ese respaldo. **Esto no demuestra un fallo de TLS,
+ni autoriza a privatizar colas o entregar eventos según su creador:** la API de
+colas admite consumidores distintos del productor.
+
+El trazado anterior sólo registraba `delivered` cuando el consumidor tenía un
+nombre seleccionado; los `trigger` sí se imprimían para toda la cola marcada.
+Por tanto, no se sabe quién consumió 224/228. La entrega ahora registra a **todos
+los consumidores de una cola marcada**, incluyendo nombres/tid de los no
+seleccionados. Ésa es la evidencia que faltaba para distinguir consumo por otro
+hilo, demora efectiva de despertar y perturbación por trazado.
 
 ## Evidencia temporal existente
 
@@ -30,8 +96,8 @@ Fuentes: `logs/20261020_141917.log`, `logs/ufc83-host.samples`,
 HR OneShot y espera su equeue. La cola es **EAThread Timer Queue**, filter=-15;
 la dispara el servicio de kernel, no un EOP. El probe previo sin guest entregó
 20/20 timers, mediana 3.040 ms y máximo 3.076 ms. No mide carga guest.
-La revisión del Jefe establece que los timers son puntuales: por ello se sigue
-al productor del estado, en lugar de pedir otra corrida dedicada al timer.
+La puntualidad del callback no implica entrega puntual al solicitante: véase
+la corrección con tareas ya terminadas y consumidores de la cola compartida arriba.
 
 ## Análisis estático: qué operación es y quién la completa
 
@@ -102,62 +168,54 @@ El propio guest serializa estas peticiones y elige el polling de 3 ms. Esto no
 demuestra que cada petición tarde 70 ms en PS4. Sin muestras de esos productores
 no se puede afirmar un tick de UI, un retraso de EOP, ni un bug de scheduler.
 
-## Cambios de esta entrega
+## Cambios tras la corrida fallida
 
-- `src/runtime_kernel.c`: BB_SAMPLE_THREAD acepta una **lista de prefijos**,
-  selecciona **todos los tid coincidentes** y redescubre threads cada segundo.
-  Considera la truncación de comm a 15 caracteres en Linux. Antes sólo elegía un
-  tid y no podía observar ambos Unpack/Translate. El sampler tiene nombre propio
-  para no seleccionarse al heredar el nombre del padre.
-- Cada muestra incluye tid, timestamp monotónico, registros rbx/r12/r14/r15,
-  pila host simbolizada y retornos guest. La cola de muestras tiene exclusión
-  **sin esperar** entre signal handlers y reporta muestras descartadas. No hay
-  stdio, simbolización ni locks bloqueantes dentro del handler. Los agregados
-  `Thread samples` combinan los hilos; el archivo detallado distingue cada tid.
-- En BB_SAMPLE_LOG se agregan observaciones **`asset-task`**: puntero, estado,
-  buffer, tamaño y ruta. Sólo interpreta candidatos tras validar la vtable
-  concreta +0x24b60b8. Durante el polling recupera además el r15 guardado en
-  el frame que retorna a +0x1bab6f0. Lee con process_vm_readv: un puntero inválido
-  falla sin desreferenciarlo. Son snapshots de diagnóstico, no transiciones
-  exactas ni lecturas atómicas del objeto completo. No se escribe memoria guest.
-  La captura de tareas es específica de este ELF; otras revisiones simplemente
-  no producirán esa evidencia si sus vtables/retornos cambian.
-- `tests/test_runtime.c`: smoke optativo con un thread activo y dos workers con
-  nombres largos duplicados; comprueba selección múltiple, tid distintos,
-  muestras de ambos y preservación de errno frente a señales.
-- `tools/re/ufc83_asset_task.py`: reproducción estática y validación de offsets.
-- Se reutilizan BB_FILE_TRACE=2 (tiempo de resolución), BB_EQUEUE_TRACE=1 y
-  BB_WAIT_THREAD_TRACE de las entregas anteriores.
+- `src/runtime_kernel.c`: el sampler envía una señal cada **8 ms por tid**, y
+  guarda el detalle en cada señal, en vez de enviar cada 0.5 ms y guardar una
+  de cada 16. Reduce aproximadamente 16 veces las interrupciones conservando
+  la cadencia de detalle. Las señales se escalonan entre tid para evitar que
+  sus handlers compitan simultáneamente y dejen hilos sin muestras. El smoke
+  detectó ese problema al bajar la frecuencia y pasa tras escalonarlas. Mantiene
+  snapshots validados y contador de pérdidas.
+- Los registros Wait por llamada requieren además **BB_WAIT_TRACE_CALLS=1**.
+  `src/runtime_mutex.c`: los registros Cond requieren **BB_COND_TRACE=1**.
+  Seleccionar un hilo para equeue ya no activa ambos logs de alto volumen.
+  Los agregados BB_WAIT_LOG siguen disponibles. Ambas opciones se dejan
+  desactivadas en la prueba propuesta.
+- `gpu/shadps4/core/libraries/kernel/equeue.cpp`: una cola seleccionada registra
+  todos sus consumidores y sus altas de timer, para identificar quién recibe
+  cada evento; incluye consumidores que ya esperaban cuando se marcó la cola. La selección inicial se limita a posix/UI Update y no marca
+  FlipManager por seleccionar RenderThread. No cambia la semántica de eventos.
+- `tools/re/ufc83_asset_task.py`: amplía la reproducción estática al sleep y
+  la selección de la cola de respaldo.
+
+No se presenta esto como arreglo del cuelgue: disminuye su perturbación conocida,
+pero no se ha reproducido ni descartado un bloqueo bajo carga guest.
 
 ## Una sola corrida manual
 
-Desde este worktree, mismos ajustes y sin borrar temp0:
+Desde este worktree, mismos ajustes y sin borrar temp0. El comando elimina las
+opciones de alto volumen aunque estén heredadas del entorno:
 
 ```bash
+env -u BB_COND_TRACE -u BB_WAIT_TRACE_CALLS \
 BB_SAVE_LOG=1 BB_FRAME_STATS=1 BB_FILE_TRACE=2 BB_EQUEUE_TRACE=1 \
-BB_SAMPLE_THREAD='posix,AssetStream::,UI Update,RenderThread' \
-BB_SAMPLE_LOG="$PWD/logs/ufc83-task.samples" \
-BB_WAIT_THREAD_TRACE='posix,AssetStream::Lo,AssetStream::Un,AssetStream::Tr,UI Update,RenderThread' \
-BB_WAIT_LOG="$PWD/logs/ufc83-task.waits" bash ./run.sh
+BB_WAIT_THREAD_TRACE='posix,UI Update' \
+BB_SAMPLE_THREAD='posix,AssetStream::,UI Update' \
+BB_SAMPLE_LOG="$PWD/logs/ufc83-delivery.samples" \
+BB_WAIT_LOG="$PWD/logs/ufc83-delivery.waits" bash ./run.sh
 ```
 
 Menú hasta ver imágenes → Fight Modes → volver y esperar → Fight Now hasta ver
-retratos → volver → salir. Entregar el log automático, frames.csv,
-`ufc83-task.samples` y `ufc83-task.waits`. La lista de waits usa los nombres
-truncados exactos de Linux; la lista del sampler usa prefijos.
+retratos → volver → salir. Entregar el log automático, frames.csv y ambos
+archivos ufc83-delivery. Si vuelve a no llegar a press start, interrumpir esa
+misma corrida y entregar lo generado; no repetirla con más variables.
 
-En la misma ventana entre GNF, seguir `asset-task task=... path=...` en posix;
-clasificar estado 0 (en cola), 1 (carga/bloques) o 2 (Translate/stream). Correlacionar
-las muestras **por tid** de los cinco workers con ese intervalo y puntero. Una
-espera del stream en Translate y CPU activa en Unpack identifica descompresión;
-Load bloqueado en imports identifica la lectura/servicio; Translate en allocator,
-callback o runtime identifica esa dependencia concreta. Los stacks y waits de
-UI/Render cubren eventuales dependencias de esos hilos. El equeue trace permite
-verificar los sleeps dentro de la misma corrida, sin pedir otra sólo para timers.
-El sampler es de ~9 ms por hilo bajo carga normal, no una medición instrucción
-por instrucción; pérdidas quedan explícitas. Es una corrida diagnóstica: todavía
-no se promete una reducción de los 3 s ni que una muestra capture una transición
-muy corta.
+En cada intervalo GNF correlacionar la petición/estado de posix con las muestras
+por tid de Load/Unpack/Translate. Si ya está completa, seguir el ident de su timer
+entre `hrtimer-add`, `trigger` y **todos** los `delivered` de la misma queue.
+Esto captura la dependencia AssetStream y el destino de los eventos en una sola
+corrida. El sampling no entrega transiciones exactas; sus pérdidas son explícitas.
 
 ## Alcance pendiente y UFC-81
 
@@ -171,18 +229,15 @@ misma corrida; no se extrapola el estado del menú a todos los retratos.
 **UFC-81 sigue valiendo como optimización de picos de upload/protección en Deck;
 el A/B en PC no mejoró la latencia y no resuelve issue #44.**
 
-## Verificación final
+## Verificación de esta revisión
 
-- `ufc3-build --test`: **exit 0**, incluidos los checks nativos y **42 tests
-  Python OK**. Log `/tmp/ufc83-task-build.log`.
-- `out/runtime-test --sample-trace-smoke`: **exit 0**; ambos workers duplicados
-  tienen muestras, tids distintos y errno preservado. La enumeración excluye
-  las entradas `.`/`..` de proc y el propio sampler.
-  Log `/tmp/ufc83-task-sampler-smoke.log`.
-- `python tools/re/ufc83_asset_task.py out/eboot.elf --disassemble`: **exit 0**;
-  valida gestor, vtable, strings, retorno del polling y escritura de estado.
-- `git diff --check`: OK. No se ejecutó el juego ni se hicieron commits.
-
-El submódulo `gpu/third_party/fsr-vulkan` ya figuraba modificado al empezar;
-esta entrega no lo toca. Los cambios propios son los cuatro archivos indicados
-(runtime, test, herramienta estática e informe).
+- `ufc3-build --test`: **exit 0**, checks nativos y **42 tests Python OK**.
+  Log `/tmp/ufc83-review-final-build.log`.
+- `out/runtime-test --sample-trace-smoke`: exit 0 tras escalonar señales;
+  ambos workers duplicados tienen muestras y errno se preserva.
+  Log `/tmp/ufc83-review-sampler.log`.
+- `python tools/re/ufc83_asset_task.py out/eboot.elf --disassemble`: exit 0.
+  Log `/tmp/ufc83-review-static.log`.
+- `git diff --check`: OK.
+El submódulo `gpu/third_party/fsr-vulkan` ya figuraba modificado al empezar y no
+se tocó. No se ejecutó el juego, ni se hicieron commits o cambios de rama.

@@ -251,7 +251,9 @@ typedef struct { NativeCond native; _Atomic int traced; } GuestCond;
 /* UFC-83: opt-in, per-call queue handoff trace. Track condition objects, so signals from
  * other threads are visible too. No global trace lock is held across a guest wait. */
 static void cond_trace_select(GuestCond *c) {
-    if (runtime_wait_trace_selected()) atomic_store(&c->traced, 1);
+    /* Queue selection for equeue diagnostics must not also enable high-volume
+     * stdio under the guest's mutex on every worker handoff. */
+    if (getenv("BB_COND_TRACE") && runtime_wait_trace_selected()) atomic_store(&c->traced, 1);
 }
 static void cond_trace(GuestCond *c, const char *op, uint64_t deadline, int result) {
     if (!atomic_load(&c->traced)) return;

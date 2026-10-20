@@ -65,7 +65,10 @@ bool EqueueInternal::TraceSelected() {
     }();
     const bool selected = enabled && runtime_wait_trace_selected();
     if (selected) m_trace.store(true, std::memory_order_relaxed);
-    return selected;
+    // A shared queue can be consumed by a different thread. Trace every
+    // consumer once selected, otherwise a punctual trigger can appear to
+    // disappear and the selected waiter can receive an unrelated timer.
+    return m_trace.load(std::memory_order_relaxed);
 }
 
 void EqueueInternal::TraceEvent(const char* action, const OrbisKernelEvent* event,
@@ -620,10 +623,11 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
 
     const auto wait_start = std::chrono::steady_clock::now();
     const bool trace = equeue->TraceSelected();
-    const void* caller = trace ? __builtin_return_address(0) : nullptr;
+    const void* caller = __builtin_return_address(0);
     if (trace) equeue->TraceEvent("wait-begin", nullptr, timo ? double(*timo) : -1., caller);
     *out = equeue->WaitForEvents(ev, num, timo);
-    if (trace) {
+    // The queue may have been selected while this consumer was already asleep.
+    if (equeue->TraceSelected()) {
         const double elapsed = std::chrono::duration<double, std::micro>(
                                    std::chrono::steady_clock::now() - wait_start).count();
         if (*out == 0) equeue->TraceEvent("timeout", nullptr, elapsed, caller);

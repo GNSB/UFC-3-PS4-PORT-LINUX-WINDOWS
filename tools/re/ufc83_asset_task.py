@@ -61,7 +61,8 @@ def main():
                            (0xe3e050, 0xe3e0ed), (0xe42700, 0xe4270a),
                            (0xe3d170, 0xe3d1de), (0xe40800, 0xe40891),
                            (0xe40944, 0xe40973), (0xe40a61, 0xe40aa0),
-                           (0xe3c6f0, 0xe3c7c0), (0xe3f1e0, 0xe3f37f)]:
+                           (0xe3c6f0, 0xe3c7c0), (0xe3f1e0, 0xe3f37f),
+                           (0x43d30, 0x43eea)]:
                 subprocess.run(['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64',
                                 '-Mintel', f'--adjust-vma={text[3]}',
                                 f'--start-address={lo}', f'--stop-address={hi}', f.name],

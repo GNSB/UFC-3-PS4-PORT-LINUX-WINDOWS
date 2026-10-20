@@ -487,7 +487,7 @@ void runtime_wait_note(int kind, uint64_t ns) {
     uint64_t sites[3];
     guest_call_sites(sites);
     /* Per-call records bypass the bounded aggregate table (which can fill before the menu). */
-    if (runtime_wait_trace_selected()) {
+    if (getenv("BB_WAIT_TRACE_CALLS") && runtime_wait_trace_selected()) {
         static const char *kinds[]={"cond","mutex","sema","sleep"};
         char stamp[96]; runtime_trace_stamp(stamp,sizeof(stamp));
         printf("Wait trace: %s%s blocked_ms=%.6f sites=%#llx,%#llx,%#llx\n",
@@ -538,7 +538,7 @@ void runtime_wait_report(double frames) {
 }
 
 /* bbport BB_SAMPLE_THREAD=<prefix[,prefix...]> (with frame stats): where that thread runs, sampled with SIGPROF
- * every 0.5 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
+ * every 8 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
  * shows up spinning in its polling loop. Linux only (signals, /proc, dladdr); on Windows the
  * variables are reported as unavailable. */
 #ifdef __linux__
@@ -577,8 +577,7 @@ static void sample_asset_task(SampleDetail *d,uint64_t pointer) {
     process_vm_readv(getpid(),&local,1,&remote,1,0);
 }
 static void sample_detail_capture(const ucontext_t *uc) {
-    static _Thread_local unsigned stride;
-    if (!sample_detail_enabled || (++stride & 15)) return;
+    if (!sample_detail_enabled) return;
     if (atomic_flag_test_and_set_explicit(&sample_detail_busy,memory_order_acquire)) {
         atomic_fetch_add(&sample_detail_dropped,1); return;
     }
@@ -699,7 +698,7 @@ static int sample_name_matches(const char *list,const char *comm) {
 static void *sampler_main(void *arg) {
     platform_thread_set_name("bb:sampler");
     const char *names=(const char *)arg;
-    pid_t tids[64]; unsigned count=0;
+    pid_t tids[64]; unsigned count=0, next=0;
     uint64_t rescan=0;
     FILE *detail=NULL;
     const char *path=getenv("BB_SAMPLE_LOG");
@@ -708,7 +707,7 @@ static void *sampler_main(void *arg) {
         if (!detail) perror("BB_SAMPLE_LOG");
         else {
             char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
-            fprintf(detail,"anchor %smono_ns=%llu threads=%s guest_base=0x800000000; per-thread samples every ~9 ms; rbp-chain may skip frames; stack-candidates are NOT return addresses\n",
+            fprintf(detail,"anchor %smono_ns=%llu threads=%s guest_base=0x800000000; per-thread samples every ~8 ms or slower; rbp-chain may skip frames; stack-candidates are NOT return addresses\n",
                     stamp,(unsigned long long)platform_monotonic_ns(),names);
             atomic_store(&sample_detail_enabled,1);
         }
@@ -743,8 +742,13 @@ static void *sampler_main(void *arg) {
             memcpy(tids,found,n*sizeof(*tids)); count=n;
             rescan=now+1000000000;
         }
-        for (unsigned i=0;i<count;++i) syscall(SYS_tgkill,getpid(),tids[i],SIGPROF);
-        struct timespec t={0,500000};
+        /* Stagger targets: signaling every worker at once made their handlers
+         * compete for the nonblocking detail slot, starving some tids. */
+        if (count) syscall(SYS_tgkill,getpid(),tids[next++%count],SIGPROF);
+        /* Sample at the detail cadence, rather than sending 16 signals for
+         * every saved stack. The old 2 kHz per target needlessly interrupted
+         * condvars and sleeps on every worker, even when no detail was saved. */
+        struct timespec t={0,count ? 8000000/count : 8000000};
         nanosleep(&t,NULL);
         if (detail) { sample_detail_drain(detail); fflush(detail); }
     }
