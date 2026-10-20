@@ -35,6 +35,8 @@ int runtime_guest_copy_range(uintptr_t *begin, uintptr_t *end);
 void runtime_wait_note(int kind, uint64_t ns);
 void runtime_wait_report(double frames);
 void runtime_guest_call_sites(uint64_t out[3]);
+/* File and condition traces share the file-system configure epoch. */
+void runtime_trace_stamp(char *out, size_t size);
 /* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */
 uint64_t runtime_heap_growths(void);
 static inline uint64_t runtime_wait_clock(void) { return platform_monotonic_ns(); }

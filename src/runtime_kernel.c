@@ -452,6 +452,7 @@ static void sample_report(void);
  * game's code on the stack. Shows where the game waits for the GPU (labels, frame pacing). */
 typedef struct { _Atomic uint64_t key; uint64_t site, site2, site3; int tid, kind; char name[16]; _Atomic uint64_t count, ns; } WaitSite;
 static WaitSite wait_sites[512];
+static _Atomic uint64_t wait_sites_dropped;
 static _Thread_local int wait_tid;
 void runtime_guest_call_sites(uint64_t out[3]);
 /* The first three return addresses into the game's code on this thread's stack (guest offsets). */
@@ -466,11 +467,25 @@ static void guest_call_sites(uint64_t out[3]) {
 }
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
-    if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;
+    if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL || getenv("BB_WAIT_THREAD_TRACE")!=NULL;
     if (!enabled) return;
     if (!wait_tid) wait_tid=(int)platform_thread_id();
     uint64_t sites[3];
     guest_call_sites(sites);
+    /* Per-call records bypass the bounded aggregate table (which can fill before the menu). */
+    static _Thread_local int trace_thread=-1;
+    if (trace_thread<0) {
+        const char *selected=getenv("BB_WAIT_THREAD_TRACE");
+        char name[32]; platform_thread_get_name(name,sizeof(name));
+        trace_thread=selected && *selected && !strcmp(selected,name);
+    }
+    if (trace_thread) {
+        static const char *kinds[]={"cond","mutex","sema","sleep"};
+        char stamp[96]; runtime_trace_stamp(stamp,sizeof(stamp));
+        printf("Wait trace: %s%s blocked_ms=%.6f sites=%#llx,%#llx,%#llx\n",
+               stamp,kinds[kind&3],ns/1e6,(unsigned long long)sites[0],
+               (unsigned long long)sites[1],(unsigned long long)sites[2]);
+    }
     const uint64_t key=((sites[0]<<20)^(sites[1]*0x9E3779B1ull)^(sites[2]<<7)^((uint64_t)wait_tid<<4)^(uint64_t)kind)|1;
     for (uint64_t i=0,slot=(key*0x9E3779B97F4A7C15ull)>>55;i<512;++i) {
         WaitSite *w=&wait_sites[(slot+i)%512];
@@ -481,10 +496,14 @@ void runtime_wait_note(int kind, uint64_t ns) {
             return;
         }
     }
+    atomic_fetch_add(&wait_sites_dropped, 1);
 }
 void runtime_wait_report(double frames) {
     sample_start();
     sample_report();
+    const uint64_t dropped=atomic_exchange(&wait_sites_dropped, 0);
+    if (dropped) printf("Guest wait profile incomplete: %llu waits omitted (512 call-site slots full)\n",
+                        (unsigned long long)dropped);
     static const char *kinds[]={"cond","mutex","sema","sleep"};
     struct { WaitSite *w; uint64_t ns, count; } rows[512]; int n=0;
     for (int i=0;i<512;++i) {

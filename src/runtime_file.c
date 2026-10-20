@@ -55,13 +55,14 @@ static int file_trace(void) {
     if (trace<0) { const char *t=getenv("BB_FILE_TRACE"); trace=t && (t[0]=='1' || t[0]=='2') ? t[0]-'0' : 0; }
     return trace;
 }
-static void trace_stamp(char *out,size_t size) {
+void runtime_trace_stamp(char *out,size_t size) {
     char name[32]; platform_thread_get_name(name,sizeof(name));
-    snprintf(out,size,"[%.3f %s] ",(platform_monotonic_ns()-trace_base)/1e9,name);
+    snprintf(out,size,"[%.6f %s tid=%llu] ",(platform_monotonic_ns()-trace_base)/1e9,name,
+             (unsigned long long)platform_thread_id());
 }
 static void trace_read(int fd,const char *op,uint64_t size,int64_t offset,ssize_t n,uint64_t start) {
     if (file_trace()<2) return;
-    char stamp[64]; trace_stamp(stamp,sizeof(stamp));
+    char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
     File *f= fd>=3 && fd<MAX_FILES && files[fd].used ? &files[fd] : NULL;
     printf("File trace: %s%s %s %llu @%lld -> %lld in %.2f ms\n",stamp,op,f ? f->path : "?",(unsigned long long)size,
            (long long)offset,(long long)n,(platform_monotonic_ns()-start)/1e6);
@@ -184,7 +185,7 @@ static int translate(const char *guest,char *out,size_t size) {
             }
         }
     }
-    if (file_trace()) { char stamp[64]; trace_stamp(stamp,sizeof(stamp)); printf("File trace: %s%s -> %s\n",stamp,guest,result ? "(no mount)" : out); }
+    if (file_trace()) { char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp)); printf("File trace: %s%s -> %s\n",stamp,guest,result ? "(no mount)" : out); }
     return result;
 }
 /* The PS4's file system ignores case, and the game asks for lower-case names
