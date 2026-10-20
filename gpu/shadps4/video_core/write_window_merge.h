@@ -22,8 +22,19 @@ namespace VideoCore::WindowMerge {
 
 /// Ownership goes by aligned 8-byte granules: a store that changed some bytes of a pointer may
 /// leave others as they were (the stale guest copy can match), and those are the CPU's too.
-/// GPU bytes the game keeps beside its CPU data are further away (DecideWriteStep: 16 bytes).
+/// DecideWriteStep must reject windows whose covered granules include GPU bytes, even
+/// when the decoded store itself misses them (CoverStore).
 constexpr std::uint64_t Granule = 8;
+
+struct StoreRange {
+    std::uint64_t begin, end;
+};
+
+/// The ownership units a decoded store can hand to VRAM when its window closes. The
+/// overlap decision must include unchanged neighbours in those units too (UFC-61).
+constexpr StoreRange CoverStore(std::uint64_t begin, std::uint64_t end) {
+    return {begin / Granule * Granule, (end + Granule - 1) / Granule * Granule};
+}
 
 /// The changed granules of a page between two copies, as runs: run(offset, length). Offsets are
 /// page-relative (page-aligned memory): lengths are multiples of 4 (vkCmdUpdateBuffer).

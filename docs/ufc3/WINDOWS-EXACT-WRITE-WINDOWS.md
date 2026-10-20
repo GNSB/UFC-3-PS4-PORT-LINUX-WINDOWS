@@ -75,3 +75,53 @@ Second fights loaded without a crash with `BB_WRITE_WINDOW=2` on the earlier bas
 - Built and measured with the Windows (llvm-mingw) toolchain only; the Linux build was not run.
   The Python test suite was run on Windows; its failures there are in Linux-only tests (overlay,
   symlinks, packaged Vulkan) and are unrelated.
+
+## UFC-61: mode 2 ownership overlap fix
+
+Static review found that decoded guest stores in mode 2 tested GPU overlap rounded out to
+4 bytes, whereas `WindowMerge::ForEachChangedRun` closes windows in aligned **8-byte** ownership
+units. For example, a CPU store to `[0x104, 0x108)` could open a window beside GPU data at
+`[0x100, 0x104)`. Closing it uploaded `[0x100, 0x108)`, removed the GPU's ownership of the first
+word and replaced it with stale guest bytes. Barring the site afterwards did not repair that
+first upload. Mode 1's 16-byte margin avoided this initial adjacency case.
+
+Mode 2 now checks the full ownership units that closing the window can upload. Such adjacency
+forces the existing readback path; stores outside those units (including aligned SIMD stores)
+keep the window optimization. Host-copy rounding remains 16 bytes; the existing store path
+without windows retains 4-byte rounding. Mode 1 and the default value are unchanged. The regression in
+`tests/test_write_window_merge.cpp` reproduces corruption on either side of a GPU word and
+checks the covered range, readback preservation, a byte store, a page crossing and a SIMD store.
+
+This is a demonstrated coherence defect, **not yet a confirmed explanation of the reported
+blood/sweat symptom**. Later stores on an already open page still bypass decoding, as described
+above. Unsupported instructions do not supply an exact range; expanding the decoder without
+evidence is not part of this fix.
+
+Manual acceptance (do not run as part of automated checks):
+
+1. After building, run `BB_PREBUILT=1 BB_WRITE_WINDOW=1 BB_SAVE_LOG=1 bash run.sh`. Start a quick
+   fight and land many strikes to the face; keep the blood/sweat appearance and frame stats
+   as the baseline. Exit before starting the next run.
+2. Repeat the same fight/settings with
+   `BB_PREBUILT=1 BB_WRITE_WINDOW=2 BB_SAVE_LOG=1 bash run.sh`. Blood and sweat must match mode 1
+   and the FPS gain must remain. Compare the saved `logs/*.frames.csv` as well as appearance.
+3. If it still fails, reproduce once with
+   `BB_PREBUILT=1 BB_WRITE_WINDOW=2 BB_SAVE_LOG=1 BB_WRITE_STORE_DIAG=1 BB_WRITE_WINDOW_DIAG=1 bash run.sh`
+   and return the saved log and frame stats. `Write store fallback` reports unsupported guest
+   sites once each (up to 256 sites), with guest offset, fault address and instruction bytes.
+   It means no exact range was available, not that the instruction was skipped. The existing
+   window audit reports ownership/readback hazards; it is bounded by `BB_WRITE_WINDOW_DIAG_MAX`
+   (default 64 per event kind). Disable diagnostics for FPS comparison.
+
+On Windows set the same environment variables before opening the usual launcher. Leave
+`BB_PREUPLOAD` and all other settings identical between runs. No game was run for static review.
+For serialized Windows compilation, `ufc3-build --windows-runtime` forwards to
+`scripts/build-windows.sh --runtime` under the same build lock as Linux builds.
+
+Automated validation (2026-10-19): `ufc3-build --test` compiled Linux and passed the window
+regression, pad/runtime/semaphore/FP/content/event flag/network/time checks and 42 Python server
+tests. The overall exit was 134 from the pre-existing `file-mods-test` assertion at line 54
+(`rmdir`); the harness now runs the remaining checks before returning that failure.
+`ufc3-build --windows-runtime` also passed with LTO ON, producing all three Windows executables
+via `scripts/build-windows.sh --runtime`. Visual correctness and retained FPS are pending the
+manual acceptance above; neither build launches the game.

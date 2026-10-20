@@ -131,6 +131,37 @@ void ChangedRuns() {
     assert((runs == Runs{{0, 16}, {96, 8}}));
 }
 
+// UFC-61: the decoded 4-byte store misses the GPU's adjacent word, but closing its
+// window uploads both words. The overlap decision must force a readback first.
+void StoreBesideGpuWord() {
+    for (const auto cpu : {0x100u, 0x104u}) {
+        const auto gpu = cpu ^ 4u;
+        Model m;
+        m.GpuWrites(gpu, 4, 0x7f);
+        m.OpenWindow();
+        m.CpuWrite32(cpu, 1);
+        assert(m.CloseWindow(true) == 4);
+        assert(m.GpuRead32(gpu) == 0); // opening without a readback corrupts the GPU word
+
+        const auto covered = CoverStore(cpu, cpu + 4);
+        assert(covered.begin <= gpu && covered.end >= gpu + 4);
+
+        Model safe;
+        safe.GpuWrites(gpu, 4, 0x7f);
+        safe.FinishReadback(safe.BeginReadback(), true);
+        safe.OpenWindow();
+        safe.CpuWrite32(cpu, 1);
+        safe.CloseWindow(true);
+        assert(safe.GpuRead32(gpu) == 0x7f7f7f7f);
+    }
+    const auto byte = CoverStore(0x107, 0x108);
+    assert(byte.begin == 0x100 && byte.end == 0x108);
+    const auto crossing = CoverStore(Page - 3, Page + 13);
+    assert(crossing.begin == Page - 8 && crossing.end == Page + 16);
+    const auto vector = CoverStore(0x110, 0x130);
+    assert(vector.begin == 0x110 && vector.end == 0x130); // retains safe SIMD windows
+}
+
 void WritableRuns() {
     // 20 bytes at 0x...1004: granules [0,4) [4,12) [12,20) of the range.
     std::uint8_t current[20], start[20], window[20];
@@ -245,6 +276,7 @@ void BarredSites() {
 
 int main() {
     ChangedRuns();
+    StoreBesideGpuWord();
     WritableRuns();
     LinkSurvivesClose(false);
     LinkSurvivesClose(true);

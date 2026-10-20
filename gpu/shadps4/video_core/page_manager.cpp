@@ -553,6 +553,32 @@ void DecodeGuestStore(void* context, u64 rip, VAddr fault) {
     store_end = address + bytes;
 }
 
+// UFC-61: bounded, opt-in reports of stores whose destination we cannot establish.
+// Unknown stores already take the conservative path; this identifies sites to investigate
+// if fixing the window's ownership granularity does not resolve blood/sweat on hardware.
+void ReportUnknownGuestStore(u64 rip, VAddr fault) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_WRITE_STORE_DIAG");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || store_begin < store_end || !PageManager::WriteWindowsExactOnly()) {
+        return;
+    }
+    static std::mutex mutex;
+    static WindowSites::Barred<256> reported;
+    std::scoped_lock lk{mutex};
+    if (!reported.Add({rip, 0})) {
+        return;
+    }
+    std::fprintf(stderr, "Write store fallback: guest +%#llx at %#llx; no exact range; bytes",
+                 (unsigned long long)(rip - GuestImage), (unsigned long long)fault);
+    const auto* code = reinterpret_cast<const u8*>(rip);
+    for (u64 i = 0; i < std::min<u64>(15, GuestImageEnd - rip); ++i) {
+        std::fprintf(stderr, " %02x", unsigned(code[i]));
+    }
+    std::fprintf(stderr, " (BB_WRITE_STORE_DIAG, once per site, max 256 sites)\n");
+}
+
 // UFC-48: BB_WRITE_WINDOW_DIAG_MAX=<n> reports per event kind (default 64).
 u32 WindowAuditMax() {
     static const u32 max = [] {
@@ -1068,6 +1094,7 @@ struct PageManager::Impl {
             // bbport (ufc3): retain only this fault's decoded guest destination.
             if (guest_store) {
                 DecodeGuestStore(context, rip, addr);
+                ReportUnknownGuestStore(rip, addr);
             } else {
                 store_begin = store_end = 0;
             }
