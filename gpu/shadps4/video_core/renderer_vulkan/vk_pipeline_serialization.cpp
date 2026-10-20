@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
@@ -13,9 +14,13 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 11u; // ufc3: DB_ALPHA_TO_MASK discard (10: UFC-4 recompiler backports, NaN handling; 9: subgroup fences around LDS stores; 8: sacredfire GS ring slot fold, 1D images as 2D)
+static constexpr u32 ShaderBinaryVersion = 12u; // ufc3: loop guard, PORTHEON 44edf33 (11: DB_ALPHA_TO_MASK discard; 10: UFC-4 recompiler backports, NaN handling; 9: subgroup fences around LDS stores; 8: sacredfire GS ring slot fold, 1D images as 2D)
 static constexpr u32 ShaderMetaVersion = 10u; // ufc3: HwFragmentRuntimeInfo::alpha_to_mask (9: RuntimeInfo::Properties bit-packed with dx10_clamp, #5257)
 static constexpr u32 PipelineKeyVersion = 7u; // ufc3: alpha_to_coverage bit (6: sacredfire GS permutations re-indexed)
+// The loop guard changes the SPIR-V; BB_SHADER_LOOP_GUARD=0 keeps its shaders apart in the cache.
+static u32 ShaderBinaryVersionInUse() {
+    return ShaderBinaryVersion | (Shader::Backend::SPIRV::LoopGuardEnabled() ? 0u : 0x80000000u);
+}
 } // namespace Serialization
 
 namespace Vulkan {
@@ -70,7 +75,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(Serialization::ShaderBinaryVersionInUse());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -105,7 +110,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion) {
+    if (binary_version != Serialization::ShaderBinaryVersionInUse()) {
         return false;
     }
 
