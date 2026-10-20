@@ -779,7 +779,9 @@ void Toast(std::chrono::steady_clock::time_point now) {
                      ImGuiWindowFlags_NoFocusOnAppearing);
     if (icon) {
         const float side = 64.0f * base_scale;
-        ImGui::Image(ImTextureRef(icon), ImVec2(side, side));
+        // GetTexRef, not ImTextureRef(icon): that one is the legacy void* constructor, which took the
+        // ImTextureData pointer for a VkDescriptorSet and crashed the driver (UFC-86).
+        ImGui::Image(icon->GetTexRef(), ImVec2(side, side));
         ImGui::SameLine();
     }
     ImGui::BeginGroup();
@@ -873,6 +875,26 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     }
     initialized = true;
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+
+    // UFC-86: BB_TROPHY_TEST=1 queues two toasts with icons back to back at startup, to check the
+    // toast path without unlocking anything (trophies.json is not touched).
+    if (const char* test = std::getenv("BB_TROPHY_TEST"); test && *test && *test != '0') {
+        for (const int id : {1000, 1001}) {
+            constexpr int side = 240;
+            std::vector<u8> rgba(size_t(side) * side * 4);
+            for (int y = 0; y < side; ++y) {
+                for (int x = 0; x < side; ++x) {
+                    u8* p = &rgba[(size_t(y) * side + x) * 4];
+                    p[0] = u8(id == 1000 ? x : 255 - x);
+                    p[1] = u8(y);
+                    p[2] = u8(id == 1000 ? 255 - y : x);
+                    p[3] = 255;
+                }
+            }
+            ShowTrophy(id, "BB_TROPHY_TEST", std::move(rgba), side, side);
+        }
+        std::printf("Overlay: BB_TROPHY_TEST: two trophy toasts queued\n");
+    }
 }
 
 void UpdateTextInput(SDL_Window* window) {
