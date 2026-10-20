@@ -250,14 +250,8 @@ static ABI int32_t mutex_timedlock(GuestMutex **mutex, uint32_t usec) {
 typedef struct { NativeCond native; _Atomic int traced; } GuestCond;
 /* UFC-83: opt-in, per-call queue handoff trace. Track condition objects, so signals from
  * other threads are visible too. No global trace lock is held across a guest wait. */
-static pthread_once_t cond_trace_once = PTHREAD_ONCE_INIT;
-static const char *cond_trace_thread;
-static void cond_trace_configure(void) { cond_trace_thread = getenv("BB_WAIT_THREAD_TRACE"); }
 static void cond_trace_select(GuestCond *c) {
-    pthread_once(&cond_trace_once, cond_trace_configure);
-    if (!cond_trace_thread || !*cond_trace_thread) return;
-    char name[32]; platform_thread_get_name(name, sizeof(name));
-    if (!strcmp(name, cond_trace_thread)) atomic_store(&c->traced, 1);
+    if (runtime_wait_trace_selected()) atomic_store(&c->traced, 1);
 }
 static void cond_trace(GuestCond *c, const char *op, uint64_t deadline, int result) {
     if (!atomic_load(&c->traced)) return;

@@ -12,8 +12,33 @@ void runtime_restart(void) { abort(); }
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 
 typedef int (ABI *Register)(GuestCallback);
+#ifdef __linux__
+/* Opt-in smoke for the signal sampler: no guest image or GPU execution. */
+static void sample_trace_smoke(void) {
+    char path[]="/tmp/ufc83-sample-XXXXXX";
+    int fd=mkstemp(path); assert(fd>=0); close(fd);
+    platform_thread_set_name("sample-smoke");
+    assert(!setenv("BB_SAMPLE_THREAD","sample-smoke",1));
+    assert(!setenv("BB_SAMPLE_LOG",path,1));
+    runtime_wait_report(1);
+    errno=EDOM;
+    uint64_t deadline=platform_monotonic_ns()+200000000;
+    while (platform_monotonic_ns()<deadline) { /* signals interrupt a running thread */ }
+    assert(errno==EDOM);
+    FILE *f=fopen(path,"r"); assert(f);
+    char line[4096]; int anchor=0, sample=0;
+    while (fgets(line,sizeof(line),f)) {
+        anchor|=!strncmp(line,"anchor ",7);
+        sample|=!strncmp(line,"sample mono_ns=",15) && strstr(line," rbp-chain:") && strstr(line," stack-candidates:");
+    }
+    fclose(f); unlink(path);
+    assert(anchor && sample);
+    puts("PASS: timestamped signal samples, host frame output, interrupted errno preserved");
+}
+#endif
 typedef int (ABI *RegisterCxa)(void (ABI *)(void *), void *, void *);
 typedef int (ABI *Acquire)(uint64_t *);
 typedef void (ABI *Guard)(uint64_t *);
@@ -480,6 +505,9 @@ static void appearance_backpressure(void) {
 int main(int argc,char **argv) {
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
+#ifdef __linux__
+    if (argc>1 && !strcmp(argv[1],"--sample-trace-smoke")) { sample_trace_smoke(); return 0; }
+#endif
     assert(runtime_resolve("bzQExy189ZI#wrong#module",0)==0);
     assert(runtime_resolve("unknown",0)==0);
     assert(runtime_resolve("8zTFvBIAIN8#libc",1)==0);

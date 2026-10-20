@@ -465,6 +465,20 @@ static void guest_call_sites(uint64_t out[3]) {
     out[0]=out[1]=out[2]=0;
     for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
 }
+int runtime_wait_trace_selected(void) {
+    static _Thread_local int selected=-1;
+    if (selected<0) {
+        selected=0;
+        const char *p=getenv("BB_WAIT_THREAD_TRACE");
+        char name[32]; platform_thread_get_name(name,sizeof(name));
+        for (;p && *p;) {
+            size_t n=strcspn(p,",");
+            if (n==strlen(name) && !strncmp(p,name,n)) selected=1;
+            p+=n; if (*p) ++p;
+        }
+    }
+    return selected;
+}
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
     if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL || getenv("BB_WAIT_THREAD_TRACE")!=NULL;
@@ -473,13 +487,7 @@ void runtime_wait_note(int kind, uint64_t ns) {
     uint64_t sites[3];
     guest_call_sites(sites);
     /* Per-call records bypass the bounded aggregate table (which can fill before the menu). */
-    static _Thread_local int trace_thread=-1;
-    if (trace_thread<0) {
-        const char *selected=getenv("BB_WAIT_THREAD_TRACE");
-        char name[32]; platform_thread_get_name(name,sizeof(name));
-        trace_thread=selected && *selected && !strcmp(selected,name);
-    }
-    if (trace_thread) {
+    if (runtime_wait_trace_selected()) {
         static const char *kinds[]={"cond","mutex","sema","sleep"};
         char stamp[96]; runtime_trace_stamp(stamp,sizeof(stamp));
         printf("Wait trace: %s%s blocked_ms=%.6f sites=%#llx,%#llx,%#llx\n",
@@ -537,9 +545,74 @@ void runtime_wait_report(double frames) {
 static _Atomic uint64_t sample_keys[1024], sample_counts[1024];
 static uint64_t sample_rips[1024], sample_callers[1024];
 static _Atomic uint64_t samples_total;
+/* Optional timestamped host stacks. Single SIGPROF producer, sampler-thread consumer;
+ * never symbolize or write stdio from a signal handler. rbp chains can skip frames in
+ * libraries built without frame pointers; stack words are candidates, not backtraces. */
+typedef struct {
+    uint64_t ns, rip, regs[5], frames[16], stack[16];
+    unsigned depth, words;
+} SampleDetail;
+static SampleDetail sample_details[64];
+static _Atomic unsigned sample_detail_write, sample_detail_read, sample_detail_dropped;
+static _Atomic int sample_detail_enabled;
+static void sample_detail_capture(const ucontext_t *uc) {
+    static unsigned stride;
+    if (!sample_detail_enabled || (++stride & 15)) return;
+    const unsigned w=atomic_load_explicit(&sample_detail_write,memory_order_relaxed);
+    if (w-atomic_load_explicit(&sample_detail_read,memory_order_acquire)>=64) {
+        atomic_fetch_add(&sample_detail_dropped,1); return;
+    }
+    SampleDetail *d=&sample_details[w%64];
+    d->ns=platform_monotonic_ns(); d->rip=uc->uc_mcontext.gregs[REG_RIP];
+    const int ids[]={REG_RAX,REG_RDI,REG_RSI,REG_RDX,REG_R10};
+    for (unsigned i=0;i<5;++i) d->regs[i]=uc->uc_mcontext.gregs[ids[i]];
+    d->depth=0; d->words=0;
+    uint64_t rbp=uc->uc_mcontext.gregs[REG_RBP], rsp=uc->uc_mcontext.gregs[REG_RSP];
+    struct iovec local={d->stack,sizeof(d->stack)}, remote={(void *)rsp,sizeof(d->stack)};
+    ssize_t got=process_vm_readv(getpid(),&local,1,&remote,1,0);
+    if (got>0) d->words=(unsigned)got/8;
+    while (d->depth<16 && rbp>=rsp && rbp-rsp<16*1024*1024 && !(rbp&7)) {
+        uint64_t frame[2];
+        local=(struct iovec){frame,sizeof(frame)}; remote=(struct iovec){(void *)rbp,sizeof(frame)};
+        if (process_vm_readv(getpid(),&local,1,&remote,1,0)!=sizeof(frame)) break;
+        d->frames[d->depth++]=frame[1];
+        if (frame[0]<=rbp) break;
+        rbp=frame[0];
+    }
+    atomic_store_explicit(&sample_detail_write,w+1,memory_order_release);
+}
+static void sample_detail_address(FILE *f,uint64_t address) {
+    Dl_info dl={0};
+    if (dladdr((void *)address,&dl)) {
+        const char *name=strrchr(dl.dli_fname,'/');
+        fprintf(f," %s:%s+%#lx",name ? name+1 : dl.dli_fname,dl.dli_sname ? dl.dli_sname : "?",
+                (unsigned long)(address-(uint64_t)(dl.dli_sname ? dl.dli_saddr : dl.dli_fbase)));
+    } else fprintf(f," %#lx",(unsigned long)address);
+}
+static void sample_detail_drain(FILE *f) {
+    unsigned r=atomic_load_explicit(&sample_detail_read,memory_order_relaxed);
+    const unsigned w=atomic_load_explicit(&sample_detail_write,memory_order_acquire);
+    for (;r!=w;++r) {
+        const SampleDetail *d=&sample_details[r%64];
+        fprintf(f,"sample mono_ns=%llu rax=%#llx rdi=%#llx rsi=%#llx rdx=%#llx r10=%#llx rip:",
+                (unsigned long long)d->ns,(unsigned long long)d->regs[0],(unsigned long long)d->regs[1],
+                (unsigned long long)d->regs[2],(unsigned long long)d->regs[3],(unsigned long long)d->regs[4]);
+        sample_detail_address(f,d->rip);
+        fputs(" rbp-chain:",f);
+        for (unsigned i=0;i<d->depth;++i) sample_detail_address(f,d->frames[i]);
+        fputs(" stack-candidates:",f);
+        for (unsigned i=0;i<d->words;++i) sample_detail_address(f,d->stack[i]);
+        fputc('\n',f);
+    }
+    atomic_store_explicit(&sample_detail_read,r,memory_order_release);
+    unsigned dropped=atomic_exchange(&sample_detail_dropped,0);
+    if (dropped) fprintf(f,"dropped %u samples\n",dropped);
+}
 static void sample_handler(int sig, siginfo_t *info, void *context) {
     (void)sig; (void)info;
+    const int saved_errno=errno;
     const ucontext_t *uc=(const ucontext_t *)context;
+    sample_detail_capture(uc);
     uint64_t rip=(uint64_t)uc->uc_mcontext.gregs[REG_RIP];
     const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
     /* Host code: keyed with its guest caller, the first return address into the game on the stack. */
@@ -558,9 +631,11 @@ static void sample_handler(int sig, siginfo_t *info, void *context) {
         if (atomic_load(k)==key || atomic_compare_exchange_strong(k,&expected,key)) {
             sample_rips[(slot+i)%1024]=rip; sample_callers[(slot+i)%1024]=caller;
             atomic_fetch_add(&sample_counts[(slot+i)%1024],1);
+            errno=saved_errno;
             return;
         }
     }
+    errno=saved_errno;
 }
 static void *sampler_main(void *arg) {
     const char *name=(const char *)arg;
@@ -580,11 +655,25 @@ static void *sampler_main(void *arg) {
         if (!tid) sleep(1);
     }
     printf("Runtime: sampling thread %s (%d)\n",name,(int)tid);
+    FILE *detail=NULL;
+    const char *path=getenv("BB_SAMPLE_LOG");
+    if (path && *path) {
+        detail=fopen(path,"w");
+        if (!detail) perror("BB_SAMPLE_LOG");
+        else {
+            char stamp[64]; runtime_trace_stamp(stamp,sizeof(stamp));
+            fprintf(detail,"anchor %smono_ns=%llu thread=%s tid=%d guest_base=0x800000000; samples every ~9 ms; rbp-chain may skip frames; stack-candidates are NOT return addresses\n",
+                    stamp,(unsigned long long)platform_monotonic_ns(),name,(int)tid);
+            sample_detail_enabled=1;
+        }
+    }
     for (;;) {
         if (syscall(SYS_tgkill,getpid(),tid,SIGPROF)) break;
         struct timespec t={0,500000};
         nanosleep(&t,NULL);
+        if (detail) { sample_detail_drain(detail); fflush(detail); }
     }
+    if (detail) { sample_detail_drain(detail); fclose(detail); }
     return NULL;
 }
 static void sample_start(void) {
