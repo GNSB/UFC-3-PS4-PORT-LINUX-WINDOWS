@@ -11,6 +11,7 @@ library is not shipped with the game and exposes the same functions.
 Output: out/boot-linked.bin (format BBPROBE5) and out/link.json.
 """
 import collections
+import os
 import hashlib
 import json
 from pathlib import Path
@@ -111,13 +112,14 @@ def link(game, out, module_names=DEFAULT_MODULES):
     main_libraries = {identity: key for key, identity in main['libraries'].items()}
     main_modules = {identity: key for key, identity in main['modules'].items()}
 
-    def imported(sym):
-        name = sym['name']
-        key = sym['identity']
-        if key and (key[1] not in main_libraries or key[2] not in main_modules):
-            raise ValueError(f'{sym}: library or module of imported symbol is unknown to the eboot')
-        key = (key[0], main_libraries[key[1]], main_modules[key[2]]) if key else None
+    def imported(symbol):
+        key = symbol['identity']
         if key not in identities:
+            n, lib, mod = key
+            # Main-program spelling when the identity matches (existing host
+            # tables use it); otherwise NID#library for new libraries.
+            name = (f'{n}#{main_libraries[lib]}#{main_modules[mod]}'
+                    if lib in main_libraries and mod in main_modules else f'{n}#{lib[0]}')
             identities[key] = len(names)
             names.append(name)
         return identities[key]
@@ -224,7 +226,33 @@ def link(game, out, module_names=DEFAULT_MODULES):
     image, segments, cpu_compat = patch_image(image, segments, main, table, relocs)
     FLAG_LEGACY_CPU_TRANSLATED = 2
     if cpu_compat.get('enabled') and cpu_compat.get('complete'):
-        flags |= FLAG_LEGACY_CPU_TRANSLATED
+        runtime_supports_flag = False
+        if os.environ.get('BB_PROBE_LEGACY_FLAG') == '1':
+            runtime_supports_flag = True
+        else:
+            scripts_dir = Path(__file__).resolve().parent
+            candidates = [
+                scripts_dir.parent / 'bin' / 'sacredfire-game.exe',
+                scripts_dir.parent / 'bin' / 'sacredfire-game'
+            ]
+            found = False
+            for candidate in candidates:
+                if candidate.exists():
+                    found = True
+                    try:
+                        bin_data = candidate.read_bytes()
+                        # Release v0.1.11 binary checks: cmp r15, 2; jb ... unknown runtime capabilities
+                        # and fails if capabilities & ~1 != 0.
+                        if b'\x49\x83\xff\x02\x72' not in bin_data:
+                            runtime_supports_flag = True
+                    except Exception:
+                        pass
+                    break
+            if not found:
+                # Running in source tree / CI tests without existing binary
+                runtime_supports_flag = True
+        if runtime_supports_flag:
+            flags |= FLAG_LEGACY_CPU_TRANSLATED
     with (out / 'boot-linked.bin').open('wb') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
