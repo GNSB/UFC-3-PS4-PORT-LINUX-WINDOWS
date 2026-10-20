@@ -72,7 +72,9 @@ static SDL_Gamepad *gamepad;
 /* SacredFire: ports 2..4 for split screen: the gamepad named in bbport.ini (port.N=), opened while
  * connected; the game sees user N logged in while the port has its gamepad. Port 1 is `gamepad`. */
 #define PORTS 4
-typedef struct { char want[64]; SDL_Gamepad *pad; int opened, present; } Port;
+/* away: when a logged-in auto port lost its pad (0: it has one); path: its pad's device path
+ * (UFC-72, see home_of). */
+typedef struct { char want[64]; SDL_Gamepad *pad; int opened, present; uint64_t away; char path[128]; } Port;
 static Port ports[PORTS]; /* ports[0].want overrides BB_GAMEPAD for port 1 */
 static unsigned pad_rescan_attempts; /* misses in a row looking for a bound controller (current_gamepad) */
 /* Gamepads open besides the active one (current_gamepad: the one used last takes over). */
@@ -105,19 +107,51 @@ static uint64_t rescan_after; static unsigned pad_reinits;
 #define PAD_RESCAN_INTERVAL_US 5000000u
 #define PAD_RESCAN_AFTER_LOSS_US 15000000u
 static struct timespec config_mtime; static uint64_t config_checked;
+/* UFC-72 (ported from PORTHEON, XAndromedaXR/UFC-4-PS4-PORT 373a633): one player per controller.
+ * Every gamepad beyond Player 1's takes the next free port 2..4 by itself, in the order the pads
+ * connected, and that player logs in: plug in a second pad and it is Player 2 in fighter select.
+ * Pads are told apart by their SDL instance id, so two identical pads (one GUID) or Parsec's
+ * virtual pads work. Before, ports 2..4 only took a gamepad bound to them in the in-game menu (by
+ * GUID) and every other pad drove Player 1. bbport.ini local_multiplayer (the in-game menu;
+ * default 1), BB_LOCAL_MULTIPLAYER overrides; 0 is the old behavior (bound ports only, an unbound
+ * pad used while Player 1's is idle takes Player 1 over). Offline only: with BB_ONLINE_SERVER the
+ * game keeps seeing one local user (the bound ports stay as they were). */
+static int auto_setting=1;
+static int auto_ports(void) {
+    static int env=-2;
+    if (env==-2) {
+        const char *online=getenv("BB_ONLINE_SERVER"), *v=getenv("BB_LOCAL_MULTIPLAYER");
+        env=online && *online ? 0 : v && *v ? v[0]!='0' : -1;
+        if (online && *online) printf("Runtime: one player per controller off: online (one local user)\n");
+    }
+    return env>=0 ? env : auto_setting;
+}
+/* BB_GAMEPAD=keyboard with one player per controller: Player 1 plays on the keyboard and every
+ * gamepad is Player 2..4 (the host on the keyboard, a friend's pad through Parsec). */
+static int keyboard_player1(void) {
+    static int value=-1;
+    if (value<0) { const char *v=getenv("BB_GAMEPAD"); value=v && !SDL_strcasecmp(v,"keyboard"); }
+    return value && auto_ports();
+}
 static void load_ports(void) {
     const char *path=getenv("BB_CONFIG");
     FILE *f=path ? fopen(path,"r") : NULL;
     char fresh[PORTS][64]; memset(fresh,0,sizeof fresh);
+    int fresh_auto=1;
     if (f) {
         char line[512];
         while (fgets(line,sizeof line,f)) {
+            if (!strncmp(line,"local_multiplayer=",18)) { fresh_auto=atoi(line+18)!=0; continue; }
             if (strncmp(line,"port.",5) || line[5]<'1' || line[5]>'4' || line[6]!='=') continue;
             char *v=line+7; v[strcspn(v,"\r\n")]=0;
             while (*v==' ' || *v=='\t') ++v;
             snprintf(fresh[line[5]-'1'],sizeof fresh[0],"%.63s",v);
         }
         fclose(f);
+    }
+    if (fresh_auto!=auto_setting) {
+        auto_setting=fresh_auto;
+        printf("Runtime: one player per controller %s (bbport.ini local_multiplayer)\n",fresh_auto ? "on" : "off");
     }
     for (int p=0;p<PORTS;++p) {
         if (strcmp(fresh[p],ports[p].want)) {
@@ -140,10 +174,48 @@ static void refresh_ports(uint64_t now) {
     config_mtime=st.mtim;
     load_ports();
 }
-/* 1 when the gamepad id is claimed by a port other than `except` (ports 2..4 with a name). */
 static int is_preferred(SDL_JoystickID id, const char *want);
-static int claimed_by_other_port(SDL_JoystickID id, int except) {
-    for (int p=1;p<PORTS;++p) if (p!=except && ports[p].want[0] && is_preferred(id,ports[p].want)) return 1;
+/* The SDL id of the gamepad port p holds (0: Player 1's `gamepad`), 0 for none; the port holding
+ * gamepad `id`, -1 for none. Ports own devices by id: identical pads share a GUID and a name. */
+static SDL_JoystickID held_id(int p) {
+    SDL_Gamepad *g=p ? ports[p].pad : gamepad;
+    return g ? SDL_GetGamepadID(g) : 0;
+}
+static int held_by(SDL_JoystickID id) {
+    for (int p=0;p<PORTS;++p) if (id && held_id(p)==id) return p;
+    return -1;
+}
+/* An unbound port 2..4, which takes its gamepad by itself (one player per controller). */
+static int auto_port(int p) { return p>0 && !ports[p].want[0]; }
+/* UFC-72: a port remembers its pad's device path, and a free pad on that path goes back to it
+ * (after "Rescan controllers" or a re-enumeration, which drop every handle, or a reconnect on the
+ * same path), even with an identical pad next to it. SDL has no path for virtual pads: "". */
+static const char *id_path(SDL_JoystickID id) { const char *v=SDL_GetGamepadPathForID(id); return v ? v : ""; }
+static int home_of(SDL_JoystickID id, int p) { return ports[p].path[0] && !strcmp(ports[p].path,id_path(id)); }
+/* Port p waits for its own pad: Player 1 without one, or an auto port still logged in. */
+static int waiting(int p) {
+    if (!p) return !gamepad && !keyboard_player1();
+    return auto_port(p) && ports[p].present && !ports[p].pad;
+}
+/* 1 when gamepad `id` belongs to a port other than `except`: that port holds it (a port taking a
+ * pad over from an auto port passes steal_auto), it is the pad a waiting port had (one player per
+ * controller), or a port bound to this kind of pad is still waiting and no other free pad of that
+ * kind is connected. A binding by GUID takes one of two identical pads, not both: before, it held
+ * every matching pad back from Player 1. */
+static int claimed(SDL_JoystickID id, int except, int steal_auto) {
+    const int q=held_by(id);
+    if (q>=0 && q!=except && !(steal_auto && auto_port(q))) return 1;
+    if (q<0 && auto_ports() && !home_of(id,except))
+        for (int b=0;b<PORTS;++b) if (b!=except && waiting(b) && home_of(id,b)) return 1;
+    for (int b=1;b<PORTS;++b) {
+        if (b==except || !ports[b].want[0] || ports[b].pad || !is_preferred(id,ports[b].want)) continue;
+        int count=0, others=0;
+        SDL_JoystickID *ids=SDL_GetGamepads(&count);
+        for (int i=0; ids && i<count; ++i)
+            if (ids[i]!=id && held_by(ids[i])<0 && is_preferred(ids[i],ports[b].want)) ++others;
+        SDL_free(ids);
+        if (!others) return 1;
+    }
     return 0;
 }
 /* Per-port stick calibration (the functions follow the axis helpers below). */
@@ -163,21 +235,59 @@ static void pad_lost(int p, SDL_Gamepad **g) {
     if (p>=0) link_note(p,NULL);
     rescan_after=now_us()+PAD_RESCAN_AFTER_LOSS_US;
 }
-/* The gamepad of port p (1..3), opened when its named controller is connected; NULL otherwise. */
+/* Port p (0: Player 1) gets gamepad `id`: from the auto port holding it, which gets this port's
+ * old pad in exchange (and so stays logged in), or opened. */
+static SDL_Gamepad *take_device(int p, SDL_JoystickID id) {
+    SDL_Gamepad **slot=p ? &ports[p].pad : &gamepad;
+    const int q=held_by(id);
+    if (q==p) return *slot;
+    SDL_Gamepad *taken;
+    if (q>0) {
+        taken=ports[q].pad;
+        ports[q].pad=*slot;
+        snprintf(ports[q].path,sizeof ports[q].path,"%s",*slot ? id_path(SDL_GetGamepadID(*slot)) : "");
+        cal_reset(&cals[q]);
+        printf("Runtime: %s goes from Player %d to Player %d%s\n",pad_name(taken),q+1,p+1,
+               ports[q].pad ? " (the two pads swapped)" : "");
+    } else {
+        taken=SDL_OpenGamepad(id);
+        if (!taken) return NULL;
+        if (*slot) SDL_CloseGamepad(*slot);
+    }
+    *slot=taken;
+    snprintf(ports[p].path,sizeof ports[p].path,"%s",id_path(id));
+    cal_reset(&cals[p]); /* a new pad has its own neutral */
+    return taken;
+}
+/* The gamepad of port p (1..3): the one bound to it in the in-game menu while it is connected,
+ * else (one player per controller) its own pad back, or the next free connected pad once Player 1
+ * and the lower ports have one; NULL otherwise. */
 static SDL_Gamepad *port_gamepad(int p) {
     Port *port=&ports[p];
-    if (!port->want[0]) { if (port->pad) { SDL_CloseGamepad(port->pad); port->pad=NULL; } return NULL; }
     if (port->pad && !SDL_GamepadConnected(port->pad)) pad_lost(p,&port->pad);
+    if (!port->want[0]) {
+        if (!auto_ports()) { if (port->pad) { SDL_CloseGamepad(port->pad); port->pad=NULL; } return NULL; }
+        if (port->pad) return port->pad;
+        int turn=gamepad || keyboard_player1();
+        for (int q=1;q<p;++q) if (auto_port(q) && !ports[q].pad) turn=0;
+        int count=0;
+        SDL_JoystickID *ids=SDL_GetGamepads(&count);
+        for (int i=0; ids && i<count && !port->pad; ++i)
+            if (home_of(ids[i],p) && !claimed(ids[i],p,0)) take_device(p,ids[i]);
+        for (int i=0; ids && turn && i<count && !port->pad; ++i)
+            if (!claimed(ids[i],p,0)) take_device(p,ids[i]);
+        SDL_free(ids);
+        if (port->pad) printf("Runtime: Player %d: %s (one player per controller)\n",p+1,pad_name(port->pad));
+        link_note(p,port->pad);
+        return port->pad;
+    }
     if (port->pad) return port->pad;
     int count=0;
     SDL_JoystickID *ids=SDL_GetGamepads(&count);
     for (int i=0; ids && i<count && !port->pad; ++i) {
         if (!is_preferred(ids[i],port->want)) continue;
-        if (gamepad && SDL_GetGamepadID(gamepad)==ids[i]) continue; /* port 1 has it */
-        if (claimed_by_other_port(ids[i],p)) continue;
-        port->pad=SDL_OpenGamepad(ids[i]);
-        if (port->pad) cal_reset(&cals[p]);
-        if (port->pad) printf("Runtime: controller port %d: %s connected\n",p+1,pad_name(port->pad));
+        if (claimed(ids[i],p,1)) continue; /* Player 1's or another bound port's; an auto port's is taken */
+        if (take_device(p,ids[i])) printf("Runtime: controller port %d: %s connected\n",p+1,pad_name(port->pad));
         link_note(p,port->pad);
     }
     SDL_free(ids);
@@ -186,9 +296,20 @@ static SDL_Gamepad *port_gamepad(int p) {
 /* Logins/logouts of users 2..4 follow their port's gamepad; called under lock once a second. */
 /* Weak: tests/test_pad.c links this module without runtime_services.c. */
 __attribute__((weak)) void runtime_services_user_change(int user, int login);
+/* UFC-72: an auto port whose pad went away stays logged in this long (a Bluetooth or Parsec
+ * hiccup, a pad turned off and on: as on a PS4 its user is not logged out); a pad coming back
+ * meanwhile goes to it (home_of, else the lowest free port). After that the user logs out. */
+#define PORT_AWAY_US 30000000u
 static void update_port_presence(void) {
+    const uint64_t now=now_us();
     for (int p=1;p<PORTS;++p) {
-        const int present=port_gamepad(p)!=NULL;
+        int present=port_gamepad(p)!=NULL;
+        if (present) ports[p].away=0;
+        else if (ports[p].present && auto_port(p) && auto_ports()) {
+            if (!ports[p].away) ports[p].away=now;
+            present=now-ports[p].away<PORT_AWAY_US;
+        }
+        if (!present) { ports[p].away=0; if (auto_port(p)) ports[p].path[0]=0; }
         if (present!=ports[p].present) { ports[p].present=present; if (runtime_services_user_change) runtime_services_user_change(p+1,present); }
     }
 }
@@ -199,6 +320,20 @@ int runtime_pad_user_present(int user) {
     const int present=ports[user-1].present;
     pthread_mutex_unlock(&lock);
     return present;
+}
+/* UFC-72 (the in-game menu): the name of the gamepad Player `user` (1..4) has now; "keyboard" for
+ * Player 1 without one, the last pad's name and "(disconnected)" for a player waiting for theirs,
+ * "" for a player without one. */
+void runtime_pad_player_name(int user, char *out, size_t size) {
+    if (!out || !size) return;
+    out[0]=0;
+    if (user<1 || user>PORTS) return;
+    pthread_mutex_lock(&lock);
+    SDL_Gamepad *g=user==1 ? gamepad : ports[user-1].pad;
+    if (g) snprintf(out,size,"%s",pad_name(g));
+    else if (user==1) snprintf(out,size,"keyboard");
+    else if (ports[user-1].present) snprintf(out,size,"%s (disconnected)",links[user-1].name[0] ? links[user-1].name : "gamepad");
+    pthread_mutex_unlock(&lock);
 }
 static size_t reads;
 static uint8_t connected_count;
@@ -339,6 +474,8 @@ static int gamepad_active(SDL_Gamepad *g) {
 }
 /* The chosen gamepad, else the first while it is not connected (checked again every second, it
  * is taken as soon as it connects); the controller used last takes over (below); called under lock. */
+/* When users 2..4 were last checked against their pads (update_port_presence, once a second). */
+static uint64_t last_presence;
 static SDL_Gamepad *current_gamepad(void) {
     static int on_preferred; static uint64_t last_scan;
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
@@ -346,6 +483,14 @@ static SDL_Gamepad *current_gamepad(void) {
     if (gamepad && !SDL_GamepadConnected(gamepad)) pad_lost(0,&gamepad);
     const uint64_t now=now_us();
     refresh_ports(now);
+    /* UFC-72: "keyboard" with one player per controller: no gamepad for Player 1, every pad is
+     * Player 2..4. */
+    if (keyboard_player1()) {
+        if (gamepad) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
+        link_note(0,gamepad);
+        if (now-last_presence>1000000) { last_presence=now; update_port_presence(); }
+        return NULL;
+    }
     const char *want=preferred_gamepad();
     /* SacredFire: in a container SDL gets no hot-plug notification (no udev), and the Steam Deck
      * sometimes shows a controller connected after launch only to a fresh enumeration. While the
@@ -370,7 +515,7 @@ static SDL_Gamepad *current_gamepad(void) {
         last_scan=now;
         int count=0, pick=-1;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
-        for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want) && !claimed_by_other_port(ids[i],0)) pick=i;
+        for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want) && !claimed(ids[i],0,1)) pick=i;
         if (requested || (((want ? pick<0 : count==0) || port_missing) && rescan_due)) { /* the plain scan found nothing usable */
             rescan_after=now+PAD_RESCAN_INTERVAL_US;
             SDL_free(ids); ids=NULL;
@@ -391,7 +536,7 @@ static SDL_Gamepad *current_gamepad(void) {
             ids=SDL_GetGamepads(&count);
             if (requested) printf("Runtime: controllers re-enumerated on request: %d found\n",count);
             else if (reinits++<3) printf("Runtime: %s; devices re-enumerated: %d found\n",want && pick<0 ? "chosen gamepad not seen" : "no gamepad or a port's controller missing",count);
-            for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want)) pick=i;
+            for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want) && !claimed(ids[i],0,1)) pick=i;
             /* Found what was missing: attempts start over; else one more miss, the last one reported. */
             int still_missing=(want ? pick<0 : count==0);
             for (int p=1;p<PORTS && !still_missing;++p) if (ports[p].want[0] && !ports[p].pad) {
@@ -402,13 +547,14 @@ static SDL_Gamepad *current_gamepad(void) {
             else if (++attempts==PAD_RESCAN_ATTEMPTS)
                 printf("Runtime: a bound controller was not found in %d rescans: treated as disconnected (the in-game menu's Rescan controllers tries again)\n",PAD_RESCAN_ATTEMPTS);
         }
-        if (pick<0 && !gamepad && ids) for (int i=0;i<count && pick<0;++i) if (!claimed_by_other_port(ids[i],0)) pick=i;
+        /* UFC-72: with one player per controller Player 1's own pad (same path) comes first. */
+        if (pick<0 && !gamepad && ids && auto_ports()) for (int i=0;i<count && pick<0;++i) if (home_of(ids[i],0) && !claimed(ids[i],0,0)) pick=i;
+        if (pick<0 && !gamepad && ids) for (int i=0;i<count && pick<0;++i) if (!claimed(ids[i],0,0)) pick=i;
         if (pick>=0 && (!gamepad || SDL_GetGamepadID(gamepad)!=ids[pick])) {
-            if (gamepad) SDL_CloseGamepad(gamepad);
-            gamepad=SDL_OpenGamepad(ids[pick]);
-            cal_reset(&cals[0]); /* a new pad has its own neutral */
-            on_preferred=want && gamepad && is_preferred(ids[pick],want);
-            if (gamepad) {
+            /* take_device: a new pad has its own neutral (cal_reset); from an auto port, that port
+             * gets Player 1's pad in exchange. */
+            if (take_device(0,ids[pick])) {
+                on_preferred=want && is_preferred(ids[pick],want);
                 ++connected_count;
                 printf("Runtime: gamepad connected: %s%s\n",pad_name(gamepad),
                        !want ? "" : on_preferred ? " (the chosen one)" : " (the chosen one is not connected)");
@@ -421,16 +567,17 @@ static SDL_Gamepad *current_gamepad(void) {
     }
     /* SacredFire: the controller touched last is the active one. Every other connected gamepad is
      * kept open and polled ten times a second; one that produces input while the active one is idle
-     * takes over (and ends the search for the BB_GAMEPAD choice). Pick up any pad and press a button. */
+     * takes over (and ends the search for the BB_GAMEPAD choice). Pick up any pad and press a button.
+     * UFC-72: not with one player per controller, where every other pad is a player of its own. */
     static uint64_t last_switch_scan;
-    if (now-last_switch_scan>100000) {
+    if (!auto_ports() && now-last_switch_scan>100000) {
         last_switch_scan=now;
         int count=0;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
         for (int i=0;i<other_count;++i) if (others[i] && !SDL_GamepadConnected(others[i])) pad_lost(-1,&others[i]);
         for (int i=0; ids && i<count; ++i) {
             if (gamepad && SDL_GetGamepadID(gamepad)==ids[i]) continue;
-            if (claimed_by_other_port(ids[i],0)) continue;
+            if (claimed(ids[i],0,0)) continue;
             int known=0;
             for (int j=0;j<other_count;++j) if (others[j] && SDL_GetGamepadID(others[j])==ids[i]) known=1;
             if (!known) {
@@ -452,7 +599,6 @@ static SDL_Gamepad *current_gamepad(void) {
         }
     }
     link_note(0,gamepad);
-    static uint64_t last_presence;
     if (now-last_presence>1000000) { last_presence=now; update_port_presence(); }
     return gamepad;
 }
@@ -639,10 +785,14 @@ static void sample_host(PadData *d) {
     SDL_Gamepad *g=current_gamepad();
     sample_host_from(d,g,1,&cals[0]);
 }
-/* Ports 2..4: their own gamepad only, no keyboard, no scripted input. */
+/* Ports 2..4: their own gamepad only, no keyboard, no scripted input. UFC-72: an auto port
+ * without one (its pad away, the player about to log out) is disconnected, as the console reports
+ * a controller turned off. */
 static void sample_port(PadData *d, int p) {
     current_gamepad(); /* keeps the port table fresh */
-    sample_host_from(d,port_gamepad(p),0,&cals[p]);
+    SDL_Gamepad *g=port_gamepad(p);
+    sample_host_from(d,g,0,&cals[p]);
+    if (!g && auto_port(p)) d->connected=0;
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
@@ -803,12 +953,20 @@ static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const voi
     if (index) return ERR_INVALID_ARG;
     pthread_mutex_lock(&lock);
     int already, assigned=1;
+    char what[96];
+    snprintf(what,sizeof what,"%.63s",user==1 ? (keyboard_player1() ? "keyboard" : "SDL gamepad or keyboard") : ports[user-1].want);
     if (user==1) { already=opened; opened=1; }
-    else { assigned=ports[user-1].want[0]!=0; already=ports[user-1].opened; if (assigned) ports[user-1].opened=1; }
+    else {
+        /* UFC-72: an auto port (one player per controller) opens as a bound one does. */
+        assigned=ports[user-1].want[0]!=0 || auto_ports();
+        already=ports[user-1].opened;
+        if (assigned) ports[user-1].opened=1;
+        if (!what[0]) snprintf(what,sizeof what,"%.80s",ports[user-1].pad ? pad_name(ports[user-1].pad) : "its gamepad, once connected");
+    }
     pthread_mutex_unlock(&lock);
     if (!assigned) return ERR_INVALID_ARG;
     if (already) return ERR_ALREADY_OPENED;
-    printf("Runtime: pad opened for user %d (%s)\n",user,user==1 ? "SDL gamepad or keyboard" : ports[user-1].want);
+    printf("Runtime: pad opened for user %d (%s)\n",user,what);
     return user;
 }
 static ABI int32_t pad_close(int32_t handle) {
@@ -841,6 +999,7 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     info->connection_type=0; info->connected=1; info->device_class=0;
     pthread_mutex_lock(&lock);
     current_gamepad();
+    if (handle!=PAD_HANDLE && auto_port(handle-1) && !port_gamepad(handle-1)) info->connected=0; /* UFC-72: see sample_port */
     info->connected_count=connected_count ? connected_count : 1;
     pthread_mutex_unlock(&lock);
     return 0;

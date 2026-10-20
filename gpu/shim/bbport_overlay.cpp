@@ -19,6 +19,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
+// UFC-72 (runtime_pad.c): the gamepad a player has now.
+extern "C" void runtime_pad_player_name(int user, char* out, std::size_t size);
+
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
 // sacredfire: COFF has no .hidden/.previous and names the read-only data section .rdata.
@@ -532,8 +535,29 @@ void Menu() {
 
     // SacredFire: controller ports for split screen. Each port takes one connected gamepad; the
     // runtime logs the matching user in and reads that pad for it. Port 1 is the player.
-    ImGui::SeparatorText(BbSettings::MenuText("Controllers (split screen)", "Контроллеры (разделённый экран)"));
+    ImGui::SeparatorText(BbSettings::MenuText("Controllers (local multiplayer)", "Контроллеры (локальная игра)"));
     {
+        // UFC-72 (from PORTHEON): one player per controller (runtime_pad.c), and which pad each
+        // player has now. Offline only: online the game keeps one local user.
+        bool auto_players = s.local_multiplayer.load();
+        if (ImGui::Checkbox(BbSettings::MenuText("One player per controller", "Один игрок на контроллер"),
+                            &auto_players)) {
+            s.local_multiplayer = auto_players;
+            BbSettings::Save();
+        }
+        Hint(BbSettings::MenuText(
+            "Every gamepad beyond Player 1's is Player 2, 3 and 4, in the order they were connected "
+            "(two identical pads and Parsec's pads too). Off: only the ports bound below, and any "
+            "other pad drives Player 1. Offline only: online, Player 1 alone.",
+            "Каждый геймпад после первого становится игроком 2, 3 и 4 в порядке подключения. "
+            "Выключено: только назначенные ниже порты, остальные геймпады управляют игроком 1. "
+            "Только офлайн: в сети играет один игрок."));
+        for (int player = 1; player <= BbSettings::ControllerPorts; ++player) {
+            char name[128];
+            runtime_pad_player_name(player, name, sizeof name);
+            ImGui::TextDisabled("%s %d: %s", BbSettings::MenuText("Player", "Игрок"), player,
+                                name[0] ? name : BbSettings::MenuText("(none)", "(нет)"));
+        }
         int count = 0;
         SDL_JoystickID* ids = SDL_GetGamepads(&count);
         std::vector<std::pair<std::string, std::string>> pads; // guid, label
