@@ -17,7 +17,7 @@ from pathlib import Path
 import struct
 from prepare import parse_self, span, unpack
 from link_libc import encode_id
-from cpu_compat import atomic_output, patch_image, patch_libc
+from cpu_compat import atomic_output, patch_image, patch_libc, enabled
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
@@ -111,14 +111,13 @@ def link(game, out, module_names=DEFAULT_MODULES):
     main_libraries = {identity: key for key, identity in main['libraries'].items()}
     main_modules = {identity: key for key, identity in main['modules'].items()}
 
-    def imported(symbol):
-        key = symbol['identity']
+    def imported(sym):
+        name = sym['name']
+        key = sym['identity']
+        if key and (key[1] not in main_libraries or key[2] not in main_modules):
+            raise ValueError(f'{sym}: library or module of imported symbol is unknown to the eboot')
+        key = (key[0], main_libraries[key[1]], main_modules[key[2]]) if key else None
         if key not in identities:
-            n, lib, mod = key
-            # Main-program spelling when the identity matches (existing host
-            # tables use it); otherwise NID#library for new libraries.
-            name = (f'{n}#{main_libraries[lib]}#{main_modules[mod]}'
-                    if lib in main_libraries and mod in main_modules else f'{n}#{lib[0]}')
             identities[key] = len(names)
             names.append(name)
         return identities[key]
@@ -130,8 +129,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
     tls_module = 2
     for filename in module_names:
         m = module(game / 'sce_module' / filename)
-        if filename == 'libc.prx':
-            libc_changes = patch_libc(m)
+        if filename == 'libc.prx' and enabled():
+            patch_libc(m, m['elf'])
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
         modsize = max(p['vaddr'] + p['memsz'] for p in loads)
         if base + modsize > 512 * 1024 * 1024:
@@ -223,8 +222,10 @@ def link(game, out, module_names=DEFAULT_MODULES):
         raise ValueError('unsupported eboot TLS layout')
     procparam = next(p for p in main['ph'] if p['type'] == 0x61000001)
     image, segments, cpu_compat = patch_image(image, segments, main, table, relocs)
-    cpu_compat['libc'] = libc_changes
-    with atomic_output(out / 'boot-linked.bin') as f:
+    FLAG_LEGACY_CPU_TRANSLATED = 2
+    if cpu_compat.get('enabled') and cpu_compat.get('complete'):
+        flags |= FLAG_LEGACY_CPU_TRANSLATED
+    with (out / 'boot-linked.bin').open('wb') as f:
         f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
         f.write(struct.pack('<4Q', *main_tls_values))
@@ -248,10 +249,10 @@ def link(game, out, module_names=DEFAULT_MODULES):
                   bindings=len(bindings), imports=len(names), fs_loads_patched=fs_patched,
                   main_tls=dict(zip(('vaddr', 'filesz', 'memsz', 'align'), main_tls_values)),
                   unresolved_imports=unresolved, cpu_compat=cpu_compat)
-    with atomic_output(out / 'link.json') as f:
-        f.write((json.dumps(report, indent=2) + '\n').encode('utf-8'))
+    (out / 'link.json').write_text(json.dumps(report, indent=2) + '\n')
     if cpu_compat.get('enabled'):
-        print(f"CPU compatibility: translated {cpu_compat['patched_sites']} instruction sites for Ivy Bridge; trampolines={cpu_compat['trampoline_bytes']} bytes")
+        status = "complete" if cpu_compat.get('complete') else "partial"
+        print(f"CPU compatibility ({status}): translated {cpu_compat['patched_sites']} instruction sites for legacy CPU; trampolines={cpu_compat['trampoline_bytes']} bytes")
     summary = ', '.join(f"{t['file']}@{t['base']:#x}" for t in table)
     print(f'Linked modules: {summary}; {len(bindings)} native bindings, {len(unresolved)} imports left to the host runtime, '
           f'fs->gs patched={fs_patched}')
