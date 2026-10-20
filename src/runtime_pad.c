@@ -75,6 +75,35 @@ static SDL_Gamepad *gamepad;
 typedef struct { char want[64]; SDL_Gamepad *pad; int opened, present; } Port;
 static Port ports[PORTS]; /* ports[0].want overrides BB_GAMEPAD for port 1 */
 static unsigned pad_rescan_attempts; /* misses in a row looking for a bound controller (current_gamepad) */
+/* Gamepads open besides the active one (current_gamepad: the one used last takes over). */
+static SDL_Gamepad *others[8]; static int other_count;
+/* UFC-62: a gamepad unplugged or turned off, and plugged back. The game's pad handle stays valid
+ * throughout, as on a PS4, and port 1 keeps reporting connected (the keyboard still drives it);
+ * the host side only drops the pad it lost and opens the one that comes back (often with a new
+ * SDL instance id, or another device on the Steam Deck). One log line each way per port. */
+typedef struct { int ever, present; char name[64]; } PadLink;
+enum { LINK_SAME, LINK_FIRST, LINK_LOST, LINK_BACK };
+static PadLink links[PORTS];
+static int link_update(PadLink *l, int present, const char *name) {
+    if (present && name) snprintf(l->name,sizeof l->name,"%.63s",name);
+    if (present==l->present) return LINK_SAME;
+    l->present=present;
+    if (!present) return LINK_LOST;
+    const int again=l->ever; l->ever=1;
+    return again ? LINK_BACK : LINK_FIRST;
+}
+static const char *pad_name(SDL_Gamepad *g) { const char *n=g ? SDL_GetGamepadName(g) : NULL; return n ? n : "gamepad"; }
+static void link_note(int p, SDL_Gamepad *g) {
+    PadLink *l=&links[p];
+    const int change=link_update(l,g!=NULL,g ? pad_name(g) : NULL);
+    if (change==LINK_LOST) printf("Pad: disconnected: port %d (%s)\n",p+1,l->name);
+    else if (change==LINK_BACK) printf("Pad: reconnected: port %d (%s)\n",p+1,l->name);
+}
+/* Automatic re-enumerations (current_gamepad) wait until this time; a pad SDL saw go away puts
+ * them off, so its own hot-plug can bring it back first. */
+static uint64_t rescan_after; static unsigned pad_reinits;
+#define PAD_RESCAN_INTERVAL_US 5000000u
+#define PAD_RESCAN_AFTER_LOSS_US 15000000u
 static struct timespec config_mtime; static uint64_t config_checked;
 static void load_ports(void) {
     const char *path=getenv("BB_CONFIG");
@@ -95,6 +124,7 @@ static void load_ports(void) {
             pad_rescan_attempts=0; /* a new binding is looked for afresh */
             snprintf(ports[p].want,sizeof ports[p].want,"%.63s",fresh[p]);
             if (p && ports[p].pad) { SDL_CloseGamepad(ports[p].pad); ports[p].pad=NULL; }
+            if (p) memset(&links[p],0,sizeof links[p]); /* a new binding: no reconnect to report */
             if (p) printf("Runtime: controller port %d -> %s\n",p+1,fresh[p][0] ? fresh[p] : "(none)");
         }
     }
@@ -126,11 +156,18 @@ typedef struct PadCal {
 } PadCal;
 static PadCal cals[PORTS];             /* cals[0]: port 1 (`gamepad`), cals[p]: ports[p].pad */
 static void cal_reset(PadCal *c);
+static uint64_t now_us(void);
+/* A gamepad SDL reports gone: closed (never used again), logged, re-enumerations put off. */
+static void pad_lost(int p, SDL_Gamepad **g) {
+    SDL_CloseGamepad(*g); *g=NULL;
+    if (p>=0) link_note(p,NULL);
+    rescan_after=now_us()+PAD_RESCAN_AFTER_LOSS_US;
+}
 /* The gamepad of port p (1..3), opened when its named controller is connected; NULL otherwise. */
 static SDL_Gamepad *port_gamepad(int p) {
     Port *port=&ports[p];
     if (!port->want[0]) { if (port->pad) { SDL_CloseGamepad(port->pad); port->pad=NULL; } return NULL; }
-    if (port->pad && !SDL_GamepadConnected(port->pad)) { SDL_CloseGamepad(port->pad); port->pad=NULL; }
+    if (port->pad && !SDL_GamepadConnected(port->pad)) pad_lost(p,&port->pad);
     if (port->pad) return port->pad;
     int count=0;
     SDL_JoystickID *ids=SDL_GetGamepads(&count);
@@ -140,7 +177,8 @@ static SDL_Gamepad *port_gamepad(int p) {
         if (claimed_by_other_port(ids[i],p)) continue;
         port->pad=SDL_OpenGamepad(ids[i]);
         if (port->pad) cal_reset(&cals[p]);
-        if (port->pad) printf("Runtime: controller port %d: %s connected\n",p+1,SDL_GetGamepadName(port->pad));
+        if (port->pad) printf("Runtime: controller port %d: %s connected\n",p+1,pad_name(port->pad));
+        link_note(p,port->pad);
     }
     SDL_free(ids);
     return port->pad;
@@ -305,7 +343,7 @@ static SDL_Gamepad *current_gamepad(void) {
     static int on_preferred; static uint64_t last_scan;
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
-    if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
+    if (gamepad && !SDL_GamepadConnected(gamepad)) pad_lost(0,&gamepad);
     const uint64_t now=now_us();
     refresh_ports(now);
     const char *want=preferred_gamepad();
@@ -314,8 +352,9 @@ static SDL_Gamepad *current_gamepad(void) {
      * chosen gamepad is missing, port 1 has no pad at all or a named port 2..4 is unfulfilled, the
      * gamepad subsystem is restarted every 5 s, which enumerates devices afresh (open handles are
      * dropped and reopened by the scans below); the in-game menu's "Rescan controllers" button does
-     * it at once. */
-    static uint64_t last_reinit; static unsigned reinits;
+     * it at once. A pad SDL reported gone puts this off for 15 s (UFC-62): hot-plug evidently works
+     * and brings it back by itself. */
+    static unsigned reinits;
 #define attempts pad_rescan_attempts
     /* Only ports with a controller bound to them are looked for (ports 2..4 without one are not
      * in use); port 1 always is, so it is looked for while it has no pad at all. After
@@ -326,18 +365,29 @@ static SDL_Gamepad *current_gamepad(void) {
     for (int p=1;p<PORTS;++p) if (ports[p].want[0] && !ports[p].pad) port_missing=1;
     const int requested=bbgpu_pad_rescan_take();
     if (requested) attempts=0;
-    const int rescan_due=now-last_reinit>5000000 && attempts<PAD_RESCAN_ATTEMPTS;
+    const int rescan_due=now>=rescan_after && attempts<PAD_RESCAN_ATTEMPTS;
     if (!gamepad || requested || (port_missing && rescan_due) || (want && !on_preferred && now-last_scan>1000000)) {
         last_scan=now;
         int count=0, pick=-1;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
         for (int i=0; want && ids && i<count && pick<0; ++i) if (is_preferred(ids[i],want) && !claimed_by_other_port(ids[i],0)) pick=i;
         if (requested || (((want ? pick<0 : count==0) || port_missing) && rescan_due)) { /* the plain scan found nothing usable */
-            last_reinit=now;
+            rescan_after=now+PAD_RESCAN_INTERVAL_US;
             SDL_free(ids); ids=NULL;
+            /* UFC-62: this runs on a game thread while the window thread pumps SDL events, which
+             * updates the joysticks. SDL's joystick lock is held across the restart (SDL supports
+             * that: the lock outlives it), else the pump ran driver code on a subsystem being torn
+             * down (its lock destroyed), the Steam Deck's HIDAPI devices included. Every gamepad
+             * held here is closed first: the restart frees them all, no pointer may outlive it. */
+            SDL_LockJoysticks();
             if (gamepad) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
+            for (int i=0;i<other_count;++i) if (others[i]) { SDL_CloseGamepad(others[i]); others[i]=NULL; }
+            for (int p=1;p<PORTS;++p) if (ports[p].pad) { SDL_CloseGamepad(ports[p].pad); ports[p].pad=NULL; }
             SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
-            if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) { sdl_ready=-1; return NULL; }
+            const bool reinit_ok=SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+            SDL_UnlockJoysticks();
+            ++pad_reinits;
+            if (!reinit_ok) { sdl_ready=-1; return NULL; }
             ids=SDL_GetGamepads(&count);
             if (requested) printf("Runtime: controllers re-enumerated on request: %d found\n",count);
             else if (reinits++<3) printf("Runtime: %s; devices re-enumerated: %d found\n",want && pick<0 ? "chosen gamepad not seen" : "no gamepad or a port's controller missing",count);
@@ -360,8 +410,11 @@ static SDL_Gamepad *current_gamepad(void) {
             on_preferred=want && gamepad && is_preferred(ids[pick],want);
             if (gamepad) {
                 ++connected_count;
-                printf("Runtime: gamepad connected: %s%s\n",SDL_GetGamepadName(gamepad),
+                printf("Runtime: gamepad connected: %s%s\n",pad_name(gamepad),
                        !want ? "" : on_preferred ? " (the chosen one)" : " (the chosen one is not connected)");
+                /* Opened twice (it was an idle "other"): SDL hands back the same object, counted. */
+                for (int j=0;j<other_count;++j)
+                    if (others[j] && SDL_GetGamepadID(others[j])==ids[pick]) { SDL_CloseGamepad(others[j]); others[j]=NULL; }
             }
         }
         SDL_free(ids);
@@ -372,10 +425,9 @@ static SDL_Gamepad *current_gamepad(void) {
     static uint64_t last_switch_scan;
     if (now-last_switch_scan>100000) {
         last_switch_scan=now;
-        static SDL_Gamepad *others[8]; static int other_count;
         int count=0;
         SDL_JoystickID *ids=SDL_GetGamepads(&count);
-        for (int i=0;i<other_count;++i) if (others[i] && !SDL_GamepadConnected(others[i])) { others[i]=NULL; }
+        for (int i=0;i<other_count;++i) if (others[i] && !SDL_GamepadConnected(others[i])) pad_lost(-1,&others[i]);
         for (int i=0; ids && i<count; ++i) {
             if (gamepad && SDL_GetGamepadID(gamepad)==ids[i]) continue;
             if (claimed_by_other_port(ids[i],0)) continue;
@@ -394,11 +446,12 @@ static SDL_Gamepad *current_gamepad(void) {
                 if (!others[j] || !gamepad_active(others[j])) continue;
                 SDL_Gamepad *previous=gamepad;
                 gamepad=others[j]; others[j]=previous; on_preferred=1;
-                printf("Runtime: gamepad switched to %s (it was used)\n",SDL_GetGamepadName(gamepad));
+                printf("Runtime: gamepad switched to %s (it was used)\n",pad_name(gamepad));
                 break;
             }
         }
     }
+    link_note(0,gamepad);
     static uint64_t last_presence;
     if (now-last_presence>1000000) { last_presence=now; update_port_presence(); }
     return gamepad;
@@ -816,4 +869,4 @@ static const RuntimeExport exports[]={
     {"scePadSetLightBar",pad_set_light_bar}, {"scePadResetLightBar",pad_ok_handle},
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }
+void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? pad_name(gamepad) : "none"); }
