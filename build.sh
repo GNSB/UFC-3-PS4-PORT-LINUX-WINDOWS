@@ -2,6 +2,10 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
+# Keep Windows runtime builds under ufc3-build's machine-wide build lock too.
+if [[ ${1:-} == --windows-runtime ]]; then
+    exec bash scripts/build-windows.sh --runtime
+fi
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then
@@ -86,12 +90,17 @@ echo "Version: $version (out/VERSION)"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
+    ninja -C out/gpu write-window-merge-test
+    out/gpu/write-window-merge-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c src/platform/platform_posix.c "${libraries[@]}" -o out/pad-test
     out/pad-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     out/runtime-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c src/platform/platform_posix.c -o out/file-mods-test
-    out/file-mods-test
+    # Keep running the remaining checks after the known file-mods failure, but retain
+    # its exit status so --test still reports the failure.
+    file_mods_status=0
+    out/file-mods-test || file_mods_status=$?
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm -lZydis "${gpu[@]}" "${libraries[@]}" -o out/sema-test
     out/sema-test
     # ufc3 online (UFC-25): the deterministic rcp/rsqrt patch against its rule (--all: every pattern).
@@ -107,4 +116,5 @@ if [[ ${1:-} == --test ]]; then
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc -Wl,--gc-sections -ffunction-sections tests/test_time_conversion.c -o out/time-conversion-test
     out/time-conversion-test
     python3 -m unittest discover -s tests -p test_online_server.py
+    exit "$file_mods_status"
 fi

@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/wait_watch.h"
+#include "video_core/write_window_merge.h"
 
 #include <mutex>
 #include <pthread.h>
@@ -699,8 +700,8 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
     // bytes reads back even when it faults far from them: a same-value write would escape the
     // window diff). BB_WRITE_WINDOW: a guest memcpy/memset's whole destination, rounded out to 16
     // bytes. A guest instruction decoded as one plain store (PageManager::GuestStoreRange), in
-    // 4-byte words: GPU bytes just below it, as at the end of a buffer the GPU wrote before the
-    // one the game fills (guest 0x4219b8), cannot be touched by it.
+    // 4-byte words when stepped, but 8-byte ownership granules when windowed: closing a window
+    // uploads even unchanged neighbours in a changed granule (UFC-61).
     VAddr exact_begin = 0, exact_end = 0;
     bool copy = false;
     if (windows && !from_guest && runtime_guest_copy_range(&exact_begin, &exact_end) &&
@@ -712,8 +713,14 @@ bool BufferCache::DecideWriteStep(VAddr device_addr, u64 size, bool assume_locks
                PageManager::GuestStoreRange(&exact_begin, &exact_end) &&
                exact_begin <= device_addr && device_addr < exact_end) {
         // ufc3: BB_WRITE_WINDOW=1 keeps the upstream margin for guest instructions.
-        exact_begin = std::max(page, Common::AlignDown(exact_begin, 4));
-        exact_end = std::min(page + TRACKER_BYTES_PER_PAGE, Common::AlignUp(exact_end, 4));
+        if (windows) {
+            const auto covered = WindowMerge::CoverStore(exact_begin, exact_end);
+            exact_begin = std::max(page, covered.begin);
+            exact_end = std::min(page + TRACKER_BYTES_PER_PAGE, covered.end);
+        } else {
+            exact_begin = std::max(page, Common::AlignDown(exact_begin, 4));
+            exact_end = std::min(page + TRACKER_BYTES_PER_PAGE, Common::AlignUp(exact_end, 4));
+        }
     } else {
         exact_begin = exact_end = 0;
     }
