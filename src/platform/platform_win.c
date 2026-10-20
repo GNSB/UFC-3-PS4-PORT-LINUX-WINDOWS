@@ -13,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include "platform.h"
+#include "../build_version.h"
 #include <windows.h>
 #include <mmsystem.h>
 #include <bcrypt.h>
@@ -691,12 +692,12 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     platform_thread_get_name(thread, sizeof(thread));
     describe_rip(where, sizeof(where), (uintptr_t)c->Rip);
     if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
-        fprintf(stderr, "%s fault: %s access to %p at %s (thread %lu %s)\n",
+        fprintf(stderr, "%s fault: game " BB_BUILD_VERSION ": %s access to %p at %s (thread %lu %s)\n",
                 guest_image && c->Rip - (uintptr_t)guest_image < guest_image_size ? "Guest" : "Host",
                 record->ExceptionInformation[0] == 1 ? "write" : record->ExceptionInformation[0] == 8 ? "execute" : "read",
                 (void *)record->ExceptionInformation[1], where, GetCurrentThreadId(), thread);
     else
-        fprintf(stderr, "Fault: exception 0x%08lx at %s (thread %lu %s)\n", record->ExceptionCode, where, GetCurrentThreadId(), thread);
+        fprintf(stderr, "Fault: game " BB_BUILD_VERSION ": exception 0x%08lx at %s (thread %lu %s)\n", record->ExceptionCode, where, GetCurrentThreadId(), thread);
     fprintf(stderr, "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
     fprintf(stderr, "  r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",

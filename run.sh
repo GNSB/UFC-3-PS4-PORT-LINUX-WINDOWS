@@ -229,6 +229,14 @@ else
     version=$(cat out/VERSION 2>/dev/null || true)
 fi
 echo "SacredFire ${version:-unknown version}"
+# Query the binary itself, even when BB_PROBE wraps the game in a debugger.
+version_exe=${BB_VERSION_EXE:-out/sacredfire}
+if [[ -n ${BB_PREBUILT:-} ]]; then version_exe=${BB_VERSION_EXE:-bin/sacredfire}; fi
+game_version=$("$version_exe" --version 2>/dev/null) || game_version=unknown
+echo "Version: VERSION file ${version:-unknown}, game $game_version (Linux)"
+if [[ -z $version || $game_version == unknown || $version != "$game_version" ]]; then
+    echo "VERSION MISMATCH: components differ or are unknown — extract the release zip into a new, empty folder"
+fi
 # The user directory (saves, shader cache) must exist and be named to the GPU library before the
 # game starts: its path table is built when the library loads (before the port hands it the
 # directory), and a missing directory makes it fall back to ~/.local/share/shadPS4, which the

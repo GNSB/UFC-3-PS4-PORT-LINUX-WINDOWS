@@ -31,10 +31,12 @@ if [[ $stage == all || $stage == --runtime || $stage == --tests ]]; then
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
         fi
     done
+    version=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
+    if ! git diff --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null; then version="$version-dirty"; fi
     cmake -S gpu -B "$root/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/windows-x86_64-llvm-mingw.cmake" \
         -DLLVM_MINGW_ROOT="$LLVM_MINGW_ROOT" -DWINDOWS_TARGET_ROOT="$WINDOWS_TARGET_ROOT" \
-        -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_AVPLAYER=OFF > "$root/configure.log" 2>&1 || { cat "$root/configure.log" >&2; exit 1; }
+        -DBB_BUILD_VERSION="$version" -DBB_PGO=off -DBB_LTO="${BB_LTO:-ON}" -DBB_AVPLAYER=OFF > "$root/configure.log" 2>&1 || { cat "$root/configure.log" >&2; exit 1; }
     echo "build-windows: configured (LTO ${BB_LTO:-ON}, no AvPlayer/FFmpeg)"
     if [[ $stage == --tests ]]; then
         ninja -C "$root/build" -j "${BB_JOBS:-$(nproc)}" windows-tests > "$root/tests-build.log" 2>&1 || { grep -v '^\[' "$root/tests-build.log" | tail -40 >&2; echo "build-windows: test build failed (log: $root/tests-build.log)" >&2; exit 1; }
@@ -53,9 +55,14 @@ if [[ $stage == all || $stage == --runtime || $stage == --tests ]]; then
     for exe in "$root"/bin/*.exe; do
         "$LLVM_MINGW_ROOT/bin/llvm-readobj" --file-headers "$exe" | grep -q 'IMAGE_FILE_MACHINE_AMD64' || { echo "build-windows: $exe is not an AMD64 PE" >&2; exit 1; }
     done
-    version=$(git describe --tags --match 'ufc3-v*' --always 2>/dev/null || echo unknown)
-    git update-index -q --refresh 2>/dev/null || true
-    git diff-index --quiet --ignore-submodules=dirty HEAD -- 2>/dev/null || version="$version-dirty"
+    # Verify the marker survives LTO and the launcher carries the same identity.
+    python3 - "$root/bin" "$version" <<'PYTEST'
+import pathlib, sys
+root, version = pathlib.Path(sys.argv[1]), sys.argv[2].encode() + b"\0"
+game = (root / "sacredfire-game.exe").read_bytes()
+assert b"BB_GAME_BUILD_VERSION=" + version in game, "Missing game identity marker"
+assert version in (root / "SacredFire.exe").read_bytes(), "Missing launcher version"
+PYTEST
     printf '%s\n' "$version" > "$root/bin/VERSION"
     echo "build-windows: $root/bin/{sacredfire-game.exe,SacredFire.exe,bb-gpu-capabilities.exe} ($version)"
 fi

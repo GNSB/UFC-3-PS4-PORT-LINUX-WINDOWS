@@ -6,6 +6,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+const char *bbgpu_version(void);
 typedef struct {
     const char *title;          /* window title */
     const char *serial;         /* CUSA id, names the pipeline cache */

@@ -46,4 +46,6 @@ while IFS= read -r line || [[ -n $line ]]; do
 done < "$data/ufc3.conf"
 export BB_PREBUILT=1 BB_DATA_DIR="$data" BB_GAME_DIR="$game" BB_SAVE_LOG=${BB_SAVE_LOG:-1}
 export LD_LIBRARY_PATH="$here/bin/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# run.sh compares the release VERSION with this binary and writes both into the run log.
+export BB_VERSION_EXE="$here/bin/sacredfire"
 exec "$here/run.sh" "$@"

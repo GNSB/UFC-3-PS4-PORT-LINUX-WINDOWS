@@ -25,6 +25,9 @@
 #include <vector>
 #include <SDL3/SDL.h>
 #include "../bbgpu.h"
+#include "../../src/build_version.h"
+
+extern "C" const char *bbgpu_version(void) { return BB_BUILD_VERSION; }
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
