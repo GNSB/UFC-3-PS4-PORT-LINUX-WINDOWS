@@ -34,12 +34,13 @@ int main(void) {
     assert(fd>=0);
     close(fd);
     setenv("BB_PAD_FILE",path,1);
-    /* bbport.ini controls: buttons moved, a trigger as a button and a button as a trigger. */
+    /* bbport.ini controls: buttons moved, a trigger as a button and a button as a trigger. One
+     * player per controller off (as before UFC-72) until its own test below. */
     char config[]="/tmp/bbport-pad-config-XXXXXX";
     int config_fd=mkstemp(config);
     assert(config_fd>=0);
     const char controls[]="upscaler=fsr3\npad.cross=b\npad.circle=a\npad.r2=rightshoulder\n"
-                          "pad.r1=righttrigger\nkey.cross=X, Space\npad.bogus=a\n";
+                          "pad.r1=righttrigger\nkey.cross=X, Space\npad.bogus=a\nlocal_multiplayer=0\n";
     assert(write(config_fd,controls,sizeof(controls)-1)==(ssize_t)(sizeof(controls)-1));
     close(config_fd);
     setenv("BB_CONFIG",config,1);
@@ -156,6 +157,85 @@ int main(void) {
         }
         pumping=0;
         pthread_join(thread,NULL);
+        /* The restarts dropped the virtual pads too: none is left for the test below. */
+        int left=0; SDL_free(SDL_GetGamepads(&left));
+        assert(left==0 && pad_read_state(1,&data)==0 && !gamepad);
+    }
+    /* UFC-72 (from PORTHEON 373a633): one player per controller. Two identical pads (one GUID, as
+     * two Xbox pads or Parsec's) are Player 1 and Player 2, each read on its own; user 2 logs in
+     * with the second pad, stays logged in while it is briefly away (connected 0), gets it back
+     * when it returns, and logs out once it stays away. */
+    {
+        assert(pad_open(2,0,0,NULL)==(int32_t)ERR_INVALID_ARG); /* off: an unbound port is not in use */
+        auto_setting=1;
+        SDL_VirtualJoystickDesc pad_desc;
+        SDL_INIT_INTERFACE(&pad_desc);
+        pad_desc.type=SDL_JOYSTICK_TYPE_GAMEPAD;
+        pad_desc.naxes=SDL_GAMEPAD_AXIS_COUNT;
+        pad_desc.nbuttons=SDL_GAMEPAD_BUTTON_COUNT;
+        pad_desc.button_mask=(1u<<SDL_GAMEPAD_BUTTON_COUNT)-1;
+        pad_desc.axis_mask=(1u<<SDL_GAMEPAD_AXIS_COUNT)-1;
+        pad_desc.name="bbport test controller";
+        pad_desc.vendor_id=0x1d50;
+        pad_desc.product_id=0x6189;
+        SDL_JoystickID first=SDL_AttachVirtualJoystick(&pad_desc);
+        SDL_JoystickID second=SDL_AttachVirtualJoystick(&pad_desc);
+        assert(first && second);
+        SDL_Joystick *one=SDL_OpenJoystick(first), *two=SDL_OpenJoystick(second);
+        assert(one && two);
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        PadData p1, p2;
+        assert(pad_read_state(1,&p1)==0);
+        assert(gamepad && SDL_GetGamepadID(gamepad)==first);
+        last_presence=0; /* presence is updated once a second: now */
+        assert(pad_read_state(1,&p1)==0);
+        assert(runtime_pad_user_present(2)==1 && runtime_pad_user_present(3)==0);
+        assert(ports[1].pad && SDL_GetGamepadID(ports[1].pad)==second);
+        assert(pad_open(2,0,0,NULL)==2);
+        /* Player 2 presses its button (cross is "b" in the test controls): Player 1 sees nothing. */
+        assert(SDL_SetJoystickVirtualButton(two,SDL_GAMEPAD_BUTTON_EAST,true));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        assert(pad_read_state(2,&p2)==0 && (p2.buttons & BTN_CROSS) && p2.connected);
+        assert(pad_read_state(1,&p1)==0 && !(p1.buttons & BTN_CROSS));
+        assert(SDL_SetJoystickVirtualButton(two,SDL_GAMEPAD_BUTTON_EAST,false));
+        assert(SDL_SetJoystickVirtualButton(one,SDL_GAMEPAD_BUTTON_EAST,true));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        assert(pad_read_state(1,&p1)==0 && (p1.buttons & BTN_CROSS));
+        assert(pad_read_state(2,&p2)==0 && !(p2.buttons & BTN_CROSS));
+        assert(SDL_SetJoystickVirtualButton(one,SDL_GAMEPAD_BUTTON_EAST,false));
+        /* The second pad goes and comes back (a new SDL id): user 2 stays logged in meanwhile,
+         * disconnected, and gets it back; Player 1 keeps the first. */
+        SDL_CloseJoystick(two);
+        assert(SDL_DetachVirtualJoystick(second));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        assert(pad_read_state(2,&p2)==0 && !p2.connected);
+        last_presence=0;
+        assert(pad_read_state(1,&p1)==0 && runtime_pad_user_present(2)==1);
+        second=SDL_AttachVirtualJoystick(&pad_desc);
+        assert(second && (two=SDL_OpenJoystick(second)));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        assert(pad_read_state(2,&p2)==0 && p2.connected);
+        assert(ports[1].pad && SDL_GetGamepadID(ports[1].pad)==second && SDL_GetGamepadID(gamepad)==first);
+        /* Gone for good: logged out once the grace time is over. */
+        SDL_CloseJoystick(two);
+        assert(SDL_DetachVirtualJoystick(second));
+        SDL_UpdateJoysticks();
+        SDL_UpdateGamepads();
+        last_presence=0;
+        assert(pad_read_state(1,&p1)==0 && runtime_pad_user_present(2)==1 && ports[1].away);
+        ports[1].away=now_us()-PORT_AWAY_US-1;
+        last_presence=0;
+        assert(pad_read_state(1,&p1)==0 && runtime_pad_user_present(2)==0);
+        assert(pad_close(2)==0);
+        SDL_CloseJoystick(one);
+        if (gamepad) SDL_CloseGamepad(gamepad);
+        gamepad=NULL;
+        assert(SDL_DetachVirtualJoystick(first));
     }
     SDL_Quit();
     unlink(path);
@@ -181,5 +261,5 @@ int main(void) {
         assert(clone.have_center && clone.center[0]==16380 && clone.base[0]==16380);
         assert(stick_axis(&clone,0,16380)==128 && stick_axis(&clone,0,32760)==255 && stick_axis(&clone,0,0)==0);
     }
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, controls, stick calibration, disconnect/reconnect");
+    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, controls, stick calibration, disconnect/reconnect, one player per controller");
 }

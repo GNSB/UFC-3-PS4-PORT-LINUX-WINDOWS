@@ -32,6 +32,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         std::lock_guard lk{PortsMutex()};
         auto& slot = v.ports[size_t(key[5] - '1')];
         std::snprintf(slot.data(), slot.size(), "%s", value.c_str());
+    } else if (key == "local_multiplayer") {
+        v.local_multiplayer = i != 0;
     } else if (key == "menu_language") {
         if (value == "en") v.menu_language = MenuLanguage::English;
         else if (value == "ru") v.menu_language = MenuLanguage::Russian;
@@ -239,6 +241,7 @@ void Save() {
             put(("port." + std::to_string(p + 1)).c_str(), std::string(v.ports[size_t(p)].data()));
         }
     }
+    put("local_multiplayer", flag(v.local_multiplayer));
     put("menu_language", v.menu_language == MenuLanguage::Russian ? "ru" : "en");
     put("upscaler", UpscalerName(v.upscaler));
     put("preset", std::to_string(v.preset.load()));
