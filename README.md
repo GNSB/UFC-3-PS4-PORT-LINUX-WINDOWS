@@ -19,11 +19,13 @@ the native Bloodborne port. All code is GPL-2.0-or-later.
 
 ## Status
 
-**Current release: [0.1.8](../../releases)** ([notes](docs/ufc3/releases/0.1.8.md)). What's new
+**Current release: [0.1.9](../../releases)** ([notes](docs/ufc3/releases/0.1.9.md)). What's new
 since 0.1.6:
 
+- **0.1.9:** the real fix for the slow Career menu after the 2nd belt (PR #41 by @nomadsdad), a
+  clean exit on Windows (PR #42), and a version check in every log (`VERSION MISMATCH` when an
+  install mixes versions).
 - **0.1.8:**
-  - the Career menu no longer drops to 10–30 FPS after winning the 2nd belt;
   - a controller can disconnect and reconnect without crashing the game;
   - blood and sweat are fixed with `BB_WRITE_WINDOW=2`;
   - old cached textures are freed, so FPS should no longer go down over long sessions.
@@ -299,7 +301,8 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 - **@SinLeeke** — exact write windows (`BB_WRITE_WINDOW=2`) and the guest frame limit (PR #13).
 - Players whose reports and logs led to the 0.1.7–0.1.8 fixes: **@DieYoung0800**,
   **@Cheburechek02**, **@nomadsdad**, **@ThallesCosta-dev**, **@VHXXIII**, **@waghrudraksh**,
-  **@bigozerkibigozerki-jpg**, **@paulkresnik**, **@Beiudo** and **@SercanDmr**.
+  **@bigozerkibigozerki-jpg**, **@paulkresnik**, **@Beiudo**, **@DavidSouzaLD** and **@SercanDmr**.
+- **@nomadsdad** — the Career menu lag fix (PR #41) and the Windows exit fix (PR #42).
 - **[Flawlessix](https://www.reddit.com/user/Flawlessix/)** (Reddit) — testing on AMD.
 
 - [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9), [minimp3](https://github.com/lieff/minimp3),
@@ -307,8 +310,8 @@ and [`docs/ufc3/PERF_240_PLAN.md`](docs/ufc3/PERF_240_PLAN.md).
 
 Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md),
 [`0.1.4`](docs/ufc3/releases/0.1.4.md), [`0.1.5`](docs/ufc3/releases/0.1.5.md),
-[`0.1.6`](docs/ufc3/releases/0.1.6.md), [`0.1.7`](docs/ufc3/releases/0.1.7.md) and
-[`0.1.8`](docs/ufc3/releases/0.1.8.md).
+[`0.1.6`](docs/ufc3/releases/0.1.6.md), [`0.1.7`](docs/ufc3/releases/0.1.7.md),
+[`0.1.8`](docs/ufc3/releases/0.1.8.md) and [`0.1.9`](docs/ufc3/releases/0.1.9.md).
 
 ## License
 
