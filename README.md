@@ -154,6 +154,37 @@ Host) that needs Python PyGObject and GTK 4: `python3 launcher/ufc3_launcher.py`
 or `./ufc3.sh` with no arguments in the Linux package (`./ufc3.sh --play /path/to/CUSA06534`
 plays from the command line). Logs go to `~/.local/share/UFC3Native/logs/`.
 
+### Linux AppImage
+
+Download the Linux AppImage from [Releases](../../releases), then:
+
+```bash
+chmod +x UFC3Native-x86_64.AppImage
+./UFC3Native-x86_64.AppImage             # GTK launcher; close it without Play to test
+./UFC3Native-x86_64.AppImage --play      # saved settings, same arguments as ufc3.sh
+```
+
+Release assets include the version in the filename; substitute that name above.
+Like the tar.gz, this requires glibc 2.38+, system Python 3 and, for the launcher,
+PyGObject + GTK 4 (`python-gobject gtk4` on Arch; `python3-gi gir1.2-gtk-4.0` on
+Debian/Ubuntu). Python runs the bundled preparation scripts and private online server;
+Python and GTK are not bundled. Vulkan and the window system also come from the host.
+Normal AppImage mounting needs FUSE 2 (`libfuse2t64` on Ubuntu 24.04), or use
+`./UFC3Native-x86_64.AppImage --appimage-extract-and-run` without FUSE.
+The mounted image is read-only: settings, prepared files, saves and logs remain in
+`~/.local/share/UFC3Native` (respecting `XDG_DATA_HOME` and `BB_DATA_DIR`, plus
+`BB_LOG_DIR` for logs). Keep your game dump/update outside the image; merging the
+update creates a sibling `CUSA06534-merged` directory as with the tar.gz.
+
+To package, build with `ufc3-build`, run `bash scripts/package-linux.sh`, then
+`bash scripts/package-appimage.sh`. The latter wraps the existing tar.gz unchanged and
+writes `dist/UFC3Native-x86_64.AppImage` and its `.sha256`. Install `appimagetool` on
+`PATH`, or set `APPIMAGETOOL=/absolute/path/to/appimagetool`; an executable x86_64
+appimagetool AppImage works too, without FUSE on the build machine. No tool is downloaded
+automatically; a missing tool produces an installation hint. Use `BB_ALLOW_DIRTY=1`
+when making the tar.gz from an uncommitted local test build. Releases publish all three
+packages with SHA-256 checksums.
+
 ## Online (experimental)
 
 Private hosting between friends: one player runs the server on their own PC, with no public

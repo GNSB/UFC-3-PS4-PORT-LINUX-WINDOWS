@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # UFC 3: tag, build, package and publish a GitHub release of the Windows build.
-# Usage: scripts/release.sh <version>   (e.g. 0.1.0 -> tag ufc3-v0.1.0); Windows zip + Linux tar.gz
+# Usage: scripts/release.sh <version>   (e.g. 0.1.0 -> tag ufc3-v0.1.0); Windows zip + Linux tar.gz/AppImage
 # The release notes come from docs/ufc3/releases/<version>.md; the checkout must be committed.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
@@ -19,9 +19,11 @@ bash scripts/build-windows.sh
 bash scripts/package-windows.sh
 bash build.sh
 bash scripts/package-linux.sh
+bash scripts/package-appimage.sh
 assets=()
 for pair in "UFC3Native-windows-x86_64.zip:UFC3Native-$tag-windows-x86_64.zip" \
-            "UFC3Native-linux-x86_64.tar.gz:UFC3Native-$tag-linux-x86_64.tar.gz"; do
+            "UFC3Native-linux-x86_64.tar.gz:UFC3Native-$tag-linux-x86_64.tar.gz" \
+            "UFC3Native-x86_64.AppImage:UFC3Native-$tag-x86_64.AppImage"; do
     from=dist/${pair%%:*} to=dist/${pair##*:}
     cp "$from" "$to"
     (cd dist && sha256sum "$(basename "$to")" > "$(basename "$to").sha256")
