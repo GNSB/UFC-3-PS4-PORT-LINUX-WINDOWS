@@ -83,6 +83,12 @@ public:
     /// UFC-48: GPU bytes left GPU-owned, since the last call, on pages where a window's CPU writes
     /// took over others (the bytes a window cannot tell were rewritten unchanged).
     static u64 TakeWindowAmbiguousBytes();
+    /// ufc4: whether the write fault being handled on this thread is inside the libc copy
+    /// (guest_memcpy, guest_memset, guest_memmove) running on it: a window then knows which
+    /// bytes the CPU wrote, and the site's barring does not apply to them.
+    static bool FaultInHostCopy(VAddr addr);
+    /// ufc4: windows that knew a host copy's bytes, and those bytes, since the last call.
+    static void TakeHostCopyStats(u64* windows, u64* bytes);
 
     /// ufc3 (UFC-48): what a buffer readback beginning now may write over: the guest bytes, and
     /// on a page open in a write window the bytes as the window opened (the CPU's since are kept

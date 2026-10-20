@@ -79,6 +79,11 @@
 extern "C" void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch);
 
 extern "C" void runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
+// ufc4 (runtime_memory.c): the libc copy running on this thread (guest_memcpy and friends), and
+// the hook a finished copy calls while write windows are open.
+extern "C" int runtime_memory_host_copy_extent(uintptr_t* begin, uintptr_t* end);
+extern "C" void runtime_memory_set_host_copy_hook(void (*hook)(uintptr_t, uint64_t),
+                                                  const uint32_t* open_windows);
 
 namespace VideoCore {
 
@@ -399,7 +404,26 @@ struct WriteWindow {
     std::array<u8, TRACKER_BYTES_PER_PAGE> before;
     u64 audit_id = 0;
     WindowSites::Site site; ///< UFC-48: the write that opened it
+    /// ufc4: granules a libc copy (guest_memcpy, guest_memset, guest_memmove) wrote while the
+    /// window was open: the CPU's whatever their value (its extent is known, no diff needed).
+    std::bitset<TRACKER_BYTES_PER_PAGE / WindowMerge::Granule> known{};
 };
+// ufc4: windows that knew a host copy's bytes, and those bytes (frame stats).
+std::atomic<u64> host_copy_windows{0}, host_copy_known_bytes{0};
+// ufc4: the whole granules of [begin, end) on the window's page were written by a host copy.
+void MarkKnown(WriteWindow& window, VAddr begin, VAddr end) {
+    begin = std::max(begin, window.page);
+    end = std::min<VAddr>(end, window.page + TRACKER_BYTES_PER_PAGE);
+    const VAddr first = Common::AlignUp(begin, WindowMerge::Granule);
+    const VAddr last = Common::AlignDown(end, WindowMerge::Granule);
+    u64 added = 0;
+    for (VAddr at = first; at < last; at += WindowMerge::Granule) {
+        const auto g = (at - window.page) / WindowMerge::Granule;
+        added += !window.known[g] ? WindowMerge::Granule : 0;
+        window.known.set(g);
+    }
+    host_copy_known_bytes.fetch_add(added, std::memory_order_relaxed);
+}
 WaitWatch::Mutex windows_mutex{"windows_mutex"};
 std::vector<std::unique_ptr<WriteWindow>> open_windows;
 // UFC-48: faults on a page already open in a window (it had been protected again meanwhile).
@@ -1206,6 +1230,31 @@ struct PageManager::Impl {
         return true;
     }
 
+    // ufc4: a write fault inside a libc copy (guest_memcpy...) on this thread: the window knows
+    // the copy's bytes on its page.
+    static void NoteFaultingHostCopy(WriteWindow& window, VAddr addr) {
+        uintptr_t begin = 0, end = 0;
+        if (fault_from_guest || !runtime_memory_host_copy_extent(&begin, &end) || addr < begin ||
+            addr >= end) {
+            return;
+        }
+        MarkKnown(window, begin, end);
+    }
+
+    // ufc4: a libc copy finished while windows were open: those over its pages know its bytes
+    // (it wrote pages opened earlier without faulting).
+    static void NoteHostCopy(uintptr_t addr, uint64_t size) {
+        if (open_window_count.load(std::memory_order_acquire) == 0 || size == 0) {
+            return;
+        }
+        std::scoped_lock wl{windows_mutex};
+        for (const auto& window : open_windows) {
+            if (window->page < addr + size && addr < window->page + PM_PAGE_SIZE) {
+                MarkKnown(*window, addr, addr + size);
+            }
+        }
+    }
+
     static bool OpenWindow(VAddr addr) {
         if (!self) {
             return false;
@@ -1219,6 +1268,7 @@ struct PageManager::Impl {
                 // written binding set again. UFC-48: the write was retried with the page still
                 // protected and faulted here forever (a freeze, Career's fighter editor).
                 // windows_mutex, then the page's lock: as CloseWindows.
+                NoteFaultingHostCopy(*window, addr);
                 const size_t page_index = page >> PM_PAGE_BITS;
                 std::scoped_lock lk{self->locks[page_index / PAGES_PER_LOCK]};
                 self->Protect(page, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
@@ -1232,6 +1282,10 @@ struct PageManager::Impl {
         auto window = std::make_unique<WriteWindow>();
         window->page = page;
         window->site = {current_fault_rip, current_fault_caller};
+        if (PageManager::FaultInHostCopy(addr)) {
+            host_copy_windows.fetch_add(1, std::memory_order_relaxed);
+        }
+        NoteFaultingHostCopy(*window, addr);
         runtime_memory_read_backing(page, window->before.data(), PM_PAGE_SIZE);
         window->audit_id = AuditWindowOpen(*window, StepTid());
         open_windows.push_back(std::move(window));
@@ -1265,13 +1319,45 @@ struct PageManager::Impl {
             }
             runtime_memory_read_backing(page, after.data(), PM_PAGE_SIZE);
             // The CPU's words win over GPU bytes they touch (WindowMerge, from_window).
-            u64 taken = 0;
+            // ufc4: the granules a libc copy wrote are the CPU's whatever their value (their
+            // extent is known); the diff decides the rest, and only what the diff takes over can
+            // bar the site (a copy that rewrote a stale guest value over GPU bytes is not
+            // ambiguous).
+            const auto& known = window->known;
+            constexpr u64 G = WindowMerge::Granule;
+            u64 taken = 0, taken_unknown = 0;
+            for (u64 g = 0; g < known.size();) {
+                if (!known[g]) {
+                    ++g;
+                    continue;
+                }
+                u64 e = g + 1;
+                while (e < known.size() && known[e]) {
+                    ++e;
+                }
+                taken += rasterizer->NoteSteppedWrite(
+                    page + g * G,
+                    std::vector<u8>(after.data() + g * G, after.data() + e * G), true);
+                g = e;
+            }
             WindowMerge::ForEachChangedRun(
                 window->before.data(), after.data(), PM_PAGE_SIZE, [&](u64 at, u64 size) {
-                    taken += rasterizer->NoteSteppedWrite(
-                        page + at, std::vector<u8>(after.data() + at, after.data() + at + size),
-                        true);
+                    for (u64 x = at; x < at + size;) {
+                        if (known[x / G]) {
+                            x += G;
+                            continue;
+                        }
+                        u64 y = x + G;
+                        while (y < at + size && !known[y / G]) {
+                            y += G;
+                        }
+                        y = std::min(y, at + size);
+                        taken_unknown += rasterizer->NoteSteppedWrite(
+                            page + x, std::vector<u8>(after.data() + x, after.data() + y), true);
+                        x = y;
+                    }
                 });
+            taken += taken_unknown;
             // UFC-48: what is still GPU-owned was not changed in the guest. Where the window took
             // over GPU bytes (the site writes over GPU data) the CPU may have rewritten some of
             // these with their stale guest value: no diff can tell, VRAM's value stays. Such a
@@ -1287,9 +1373,9 @@ struct PageManager::Impl {
                         ambiguous[at - page] = true;
                     }
                 }
-                if (taken != 0) {
+                if (taken_unknown != 0) {
                     window_ambiguous_bytes.fetch_add(left, std::memory_order_relaxed);
-                    BarWindowSite(window->site, page, taken, left);
+                    BarWindowSite(window->site, page, taken_unknown, left);
                 }
             }
             AuditWindowPhase(window->audit_id, after.data(), window->before.data(), &ambiguous,
@@ -1379,8 +1465,12 @@ struct PageManager::Impl {
             std::array<u8, TRACKER_BYTES_PER_PAGE> current;
             runtime_memory_read_backing(at, current.data(), bytes);
             u8* before = window ? window->before.data() + (at - page) : nullptr;
-            kept += WindowMerge::ForEachWritableRun(
+            kept += WindowMerge::ForEachWritableRunKeeping(
                 at, current.data(), at_start ? at_start + offset : nullptr, before, bytes,
+                [&](VAddr granule) {
+                    // ufc4: bytes a libc copy wrote in the window are the CPU's.
+                    return window && window->known[(granule - page) / WindowMerge::Granule];
+                },
                 [&](u64 from, u64 run) {
                     write(context, at + from, payload + offset + from, run);
                     if (before) {
@@ -1824,6 +1914,17 @@ u64 PageManager::TakeWindowAmbiguousBytes() {
     return window_ambiguous_bytes.exchange(0, std::memory_order_relaxed);
 }
 
+bool PageManager::FaultInHostCopy(VAddr addr) {
+    uintptr_t begin = 0, end = 0;
+    return !fault_from_guest && runtime_memory_host_copy_extent(&begin, &end) && addr >= begin &&
+           addr < end;
+}
+
+void PageManager::TakeHostCopyStats(u64* windows, u64* bytes) {
+    *windows = host_copy_windows.exchange(0, std::memory_order_relaxed);
+    *bytes = host_copy_known_bytes.exchange(0, std::memory_order_relaxed);
+}
+
 void PageManager::ReadbackSnapshot(VAddr addr, u8* out, u64 size) {
     Impl::ReadbackSnapshot(addr, out, size);
 }
@@ -1835,6 +1936,10 @@ u64 PageManager::WriteReadback(VAddr addr, const u8* payload, const u8* at_start
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     WaitWatch::Start();
+    // ufc4: finished libc copies tell the open write windows which bytes they wrote.
+    static_assert(sizeof(open_window_count) == sizeof(uint32_t));
+    runtime_memory_set_host_copy_hook([](uintptr_t addr, uint64_t size) { Impl::NoteHostCopy(addr, size); },
+                                      reinterpret_cast<const uint32_t*>(&open_window_count));
 #ifdef __linux__
     // bbport: dma-buf guest memory (BB_GUEST_GPU_MEMORY=1) cannot be write-protected by userfaultfd
     // (anonymous and shmem only): its registration would fail and writes go unseen.

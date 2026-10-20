@@ -830,6 +830,40 @@ void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch)
         else atomic_fetch_and_explicit(&write_watch[word],~mask,memory_order_release);
     }
 }
+/* ufc4: the libc copy running on this thread (guest_memcpy, guest_memset, guest_memmove): its
+ * destination extent while it runs, 0..0 otherwise. A write fault inside it (the GPU side's
+ * fault handler runs on the faulting thread) reads it with runtime_memory_host_copy_extent; once
+ * the copy is done, write windows still open over its pages hear of it (hook_host_copy), as the
+ * copy may have written pages one of them opened without faulting. BB_HOST_COPY_EXTENTS=0 turns
+ * this off (the windows diff those pages, and a site found writing over GPU bytes reads back). */
+static _Thread_local uintptr_t host_copy_begin, host_copy_end;
+static GpuRange hook_host_copy;
+static const uint32_t *host_copy_open_windows;
+static int host_copy_extents_enabled(void) {
+    static int value=-1;
+    if (value<0) { const char *v=getenv("BB_HOST_COPY_EXTENTS"); value=!(v && v[0]=='0'); }
+    return value;
+}
+void runtime_memory_set_host_copy_hook(GpuRange hook, const uint32_t *open_windows) {
+    if (!host_copy_extents_enabled()) { puts("Runtime: host copy extents off (BB_HOST_COPY_EXTENTS=0)"); return; }
+    host_copy_open_windows=open_windows;
+    hook_host_copy=hook;
+}
+void runtime_memory_host_copy_begin(uintptr_t address, uint64_t size) {
+    host_copy_begin=address; host_copy_end=size <= UINTPTR_MAX-address ? address+size : address;
+    atomic_signal_fence(memory_order_seq_cst);
+}
+void runtime_memory_host_copy_end(uintptr_t address, uint64_t size) {
+    atomic_signal_fence(memory_order_seq_cst);
+    host_copy_begin=host_copy_end=0;
+    if (hook_host_copy && size && size <= UINTPTR_MAX-address && host_copy_open_windows && __atomic_load_n(host_copy_open_windows,__ATOMIC_ACQUIRE))
+        hook_host_copy(address,size);
+}
+int runtime_memory_host_copy_extent(uintptr_t *begin, uintptr_t *end) {
+    if (!hook_host_copy || host_copy_begin>=host_copy_end) return 0;
+    *begin=host_copy_begin; *end=host_copy_end;
+    return 1;
+}
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size) {
     if (!write_watch || !size || address>=WATCH_LIMIT || address+size>WATCH_LIMIT) return;
     const uint64_t first=address>>12, last=(address+size-1)>>12;

@@ -232,6 +232,42 @@ static void direct_memory(void) {
     assert(*(uint64_t *)x==0); /* released allocation does not leak previous data */
     assert(release(a,length)==0); /* release also unmaps owned mapping */
 }
+/* UFC-69: the extent is per thread and cleared before completion callbacks. */
+extern void runtime_memory_set_host_copy_hook(void (*hook)(uintptr_t, uint64_t), const uint32_t *);
+extern int runtime_memory_host_copy_extent(uintptr_t *, uintptr_t *);
+static unsigned host_copy_callbacks;
+static void host_copy_finished(uintptr_t address, uint64_t size) {
+    uintptr_t begin=0,end=0;
+    assert(!runtime_memory_host_copy_extent(&begin,&end));
+    assert(address && size);
+    ++host_copy_callbacks;
+}
+static void *host_copy_other_thread(void *unused) {
+    (void)unused;
+    uintptr_t begin=0,end=0;
+    assert(!runtime_memory_host_copy_extent(&begin,&end));
+    return NULL;
+}
+static void host_copy_scope(void) {
+    static const uint32_t open_windows=1;
+    const char *env=getenv("BB_HOST_COPY_EXTENTS");
+    const int enabled=!(env && env[0]=='0');
+    runtime_memory_set_host_copy_hook(host_copy_finished,&open_windows);
+    uintptr_t begin=0,end=0;
+    assert(!runtime_memory_host_copy_extent(&begin,&end));
+    runtime_memory_host_copy_begin(0x1000,32);
+    assert(runtime_memory_host_copy_extent(&begin,&end)==enabled);
+    if (enabled) assert(begin==0x1000 && end==0x1020);
+    pthread_t thread;
+    assert(pthread_create(&thread,NULL,host_copy_other_thread,NULL)==0);
+    assert(pthread_join(thread,NULL)==0);
+    runtime_memory_host_copy_end(0x1000,32);
+    assert(host_copy_callbacks==(unsigned)enabled);
+    assert(!runtime_memory_host_copy_extent(&begin,&end));
+    runtime_memory_host_copy_begin(0x1000,0);
+    assert(!runtime_memory_host_copy_extent(&begin,&end));
+    runtime_memory_host_copy_end(0x1000,0);
+}
 static void memory_primitives(void) {
     typedef void *(ABI *Set)(void *,int,size_t);
     typedef void *(ABI *Copy)(void *,const void *,size_t);
@@ -474,7 +510,9 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
+    libc_support(); posix_mutexes(); wall_time(); localtime_conversion_abi(); exit_handlers(); guards(); mutexes(); direct_memory(); host_copy_scope(); memory_primitives();
+    assert(host_copy_callbacks==((getenv("BB_HOST_COPY_EXTENTS") && getenv("BB_HOST_COPY_EXTENTS")[0]=='0') ? 0u : 4u));
+    runtime_memory_set_host_copy_hook(NULL,NULL);
     rw_lifecycle(); rw_concurrency(); rw_timeouts(); ui_backpressure(); appearance_backpressure();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope, UI back-pressure, appearance back-pressure");
     return 0;
