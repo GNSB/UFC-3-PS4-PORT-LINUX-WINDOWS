@@ -143,6 +143,16 @@ public:
         return vk12_features.shaderInt8;
     }
 
+    /// ufc3 (UFC-89): VK_KHR_shader_maximal_reconvergence enabled (BB_BP_RECONV=1 and supported).
+    bool IsMaximalReconvergenceSupported() const {
+        return maximal_reconvergence;
+    }
+
+    /// ufc3 (UFC-89): VK_KHR_maintenance5 (vkCmdBindIndexBuffer2 with a size).
+    bool IsMaintenance5Supported() const {
+        return maintenance_5;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
@@ -642,6 +652,7 @@ private:
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool cooperative_matrix{};      // bbport: VK_KHR_cooperative_matrix (FSR 4.1.1 FP8 variant)
     bool shader_float8{};           // bbport: VK_EXT_shader_float8 with FP8 matrices (RDNA4)
+    bool maximal_reconvergence{};   // ufc3 (UFC-89): VK_KHR_shader_maximal_reconvergence, opt-in
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};

@@ -18,6 +18,7 @@
 #include "bbport_timeline.h"
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 #include <cstdio>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -857,6 +858,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
+            // ufc3 (UFC-89, upstream #5406): ce - de, guarded against unsigned underflow;
+            // BB_BP5406=0 keeps de - ce.
+            if (BbBackport::On(BbBackport::CeDeWaits5406)) {
+                while (cblock.ce_count >= cblock.de_count &&
+                       (cblock.ce_count - cblock.de_count) >= diff) {
+                    YIELD_CE();
+                }
+                break;
+            }
             while ((cblock.de_count - cblock.ce_count) >= diff) {
                 YIELD_CE();
             }
@@ -871,6 +881,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
+            }
+            // ufc3 (UFC-89, upstream #5258): the finished frame was leaked (BB_BP5258=0 keeps it).
+            if (BbBackport::On(BbBackport::IbFrameFree5258)) {
+                task.handle.destroy();
             }
             break;
         }
@@ -1881,6 +1895,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // ufc3 (UFC-89, upstream #5258): the finished frame was leaked (BB_BP5258=0 keeps it).
+                if (BbBackport::On(BbBackport::IbFrameFree5258)) {
+                    task.handle.destroy();
+                }
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1888,7 +1906,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                // ufc3 (UFC-89, upstream #5406): with no CE task there is nothing to wait for.
+                const bool no_ce_task =
+                    !ce_task.handle && BbBackport::On(BbBackport::CeDeWaits5406);
+                while (!no_ce_task && cblock.ce_count <= cblock.de_count &&
+                       !ce_task.handle.done()) {
                     RESUME_GFX(ce_task);
                 }
                 break;
@@ -2043,6 +2065,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
+            }
+            // ufc3 (UFC-89, upstream #5258): the finished frame was leaked (BB_BP5258=0 keeps it).
+            if (BbBackport::On(BbBackport::IbFrameFree5258)) {
+                task.handle.destroy();
             }
             break;
         }

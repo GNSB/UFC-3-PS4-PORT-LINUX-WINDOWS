@@ -74,6 +74,7 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+    bool is_indirect; ///< ufc3 (UFC-89, upstream #5348)
 };
 
 } // namespace Vulkan

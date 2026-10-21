@@ -452,6 +452,13 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
                                  workgroup_size[1], workgroup_size[2]);
         }
+        // ufc3 (UFC-89, BP06): GCN waves run in lockstep; with maximal reconvergence the host
+        // keeps the invocations of a subgroup together after divergent branches, as the guest
+        // code expects for its cross-lane operations. Opt-in (BB_BP_RECONV=1).
+        if (ctx.profile.supports_maximal_reconvergence) {
+            ctx.AddExtension("SPV_KHR_maximal_reconvergence");
+            ctx.AddExecutionMode(main, spv::ExecutionMode::MaximallyReconvergesKHR);
+        }
         break;
     }
     case SwStage::Vertex:
@@ -485,6 +492,13 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
+        }
+        // ufc3 (UFC-89, upstream #5264): DEPTH_BEFORE_SHADER is authoritative for early depth
+        // testing (radeonsi; Z_ORDER is a hint). Upstream asserts on a depth-exporting shader;
+        // here such a shader keeps late tests. Off by default (BB_BP5264=1).
+        if (ctx.runtime_info.hw.fs.depth_before_shader &&
+            !info.stores.GetAny(IR::Attribute::Depth)) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
         }
         break;
     case SwStage::Geometry:

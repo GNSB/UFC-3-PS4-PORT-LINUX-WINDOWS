@@ -21,6 +21,7 @@
 #include "bbport_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 #include "bbport_wait_trace.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -962,10 +963,16 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
+    // ufc3 (UFC-89, upstream #5231): every wait covers all stages. The presenter's second wait
+    // (the game's frame) held only colour output, yet the frame is read before it, by the blit
+    // (transfer) and the layout transitions; and a third or fourth wait read past this array.
+    // BB_BP5231=0 keeps colour output for the second wait.
+    std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
+        wait_stage_masks;
+    wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
+    if (!BbBackport::On(BbBackport::SubmitWaits5231)) {
+        wait_stage_masks[1] = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    }
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
@@ -1043,12 +1050,21 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         }
         recorded_segments.fetch_add(num_cmdbufs, std::memory_order_relaxed);
         recorded_submissions.fetch_add(1, std::memory_order_relaxed);
-        static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
+        // ufc3 (UFC-89, upstream #5231): every wait covers all stages (see SubmitExecution).
+        static constexpr std::array<vk::PipelineStageFlags, 4> all_stage_masks = {
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eAllCommands,
+        };
+        static constexpr std::array<vk::PipelineStageFlags, 4> old_stage_masks = {
             vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eColorAttachmentOutput,
             vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eAllCommands,
         };
+        const auto& wait_stage_masks =
+            BbBackport::On(BbBackport::SubmitWaits5231) ? all_stage_masks : old_stage_masks;
         const vk::TimelineSemaphoreSubmitInfo timeline_si = {
             .waitSemaphoreValueCount = info.num_wait_semas,
             .pWaitSemaphoreValues = info.wait_ticks.data(),

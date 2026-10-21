@@ -73,6 +73,8 @@ struct SwVertexRuntimeInfo {
     u32 step_rate_1;
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
+    /// ufc3 (UFC-89, upstream #5348): an indirect draw (set only with BB_BP5348 on).
+    bool is_indirect{};
     bool tess_emulated_primitive{};
 
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
@@ -240,6 +242,9 @@ struct HwFragmentRuntimeInfo {
     bool motion_vectors{false};
     /// DB_ALPHA_TO_MASK (enable, dither offsets, rounding) when alpha to coverage is emulated.
     u32 alpha_to_mask{};
+    /// ufc3 (UFC-89, upstream #5264): DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER (set only with
+    /// BB_BP5264 on).
+    bool depth_before_shader{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -250,6 +255,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                motion_vectors == other.motion_vectors && alpha_to_mask == other.alpha_to_mask &&
+               depth_before_shader == other.depth_before_shader &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

@@ -98,3 +98,40 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   created fighter's skin among them, were not read through memory: dithered, the layer shows the
   skin under it. Default now: no rule (=all is the same); BB_ALPHA_TO_MASK=colourmap brings the
   UFC-7 rule back. Cache versions unchanged.
+
+Backported for UFC-89 (shadPS4 upstream fixes already adapted by other ports of this family: CTR
+Nitro-Fueled "bbport (upstream #N)", the iss_pc catalog BP01-BP12 as a list only). One switch per
+fix (gpu/shim/bbport_backports.h): BB_BP<n>=0/1, BB_BACKPORTS=0 turns all of them off; "Backports:"
+line at start-up; shader-changing ones are bits 21..23 of the shader binary version.
+  e6c79a5f (Marcin Mitura) CE/DE counter waits: ce - de without underflow, no wait without a CE
+    task (#5406, BB_BP5406, on).
+  12c5978f (Lucas-blip-png) the frames of nested indirect buffer tasks (graphics,
+    constant, compute) are destroyed once they finish (#5258, BB_BP5258, on).
+  23c41333 (Marcin Mitura) + e9f2c54c (junminlee2004) null or unmapped index buffers: only the
+    mapped part is bound (vkCmdBindIndexBuffer2 with its size where VK_KHR_maintenance5 is), a
+    16-byte zero buffer when nothing is; adapted as in CTR (no max_index_size here) (#5358,
+    #5327, BB_BP5358, on).
+  1a0f5be8 (nikmparis217-ux) S# with undefined fields (anisotropy > 16x, filter mode, mip filter,
+    custom border with no table): as in CTR they are clamped to the nearest defined value rather
+    than replaced by a default sampler (#5137, BB_BP5137, on).
+  43e4c470 (Chris Chreece) the scheduler part only, as in CTR: every submit wait covers all
+    stages (the second one held only colour output; a third or fourth read past the array).
+    Not taken: the presenter barrier change (ufc3's presenter differs) (#5231, BB_BP5231, on).
+  145932bf (Lucas Daniel Duarte Cabral) FindImageFromRange looks only at the images of the
+    address's first page (ForEachImageWithAddress; here the page lists hold plain ImageIds, so
+    the address is compared) (#5240, BB_BP5240, on).
+  c09fa46a (raphaelthegreat) vertex, index and indirect (args, count) buffers are tracked like
+    shader buffers, so a later write to them waits for the read; bound_buffers keeps the source
+    access and becomes a vector. Not taken: the db_desc rename and GDS in bound_buffers (ufc3
+    never tracked GDS there) (#5262, BB_BP5262, on).
+  643c7997 (junminlee2004) vertex and instance ids unbiased in every indirect draw whose fetch
+    shader does not add the base (SwVertexRuntimeInfo::is_indirect, set only with the switch on);
+    shader binary version bit 21, ShaderMetaVersion 11 (#5348, BB_BP5348, on).
+  7d28d279 (TheTurtle) EarlyFragmentTests when DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER is set
+    (HwFragmentRuntimeInfo::depth_before_shader, set only with the switch on; no bit-packing of
+    the runtime info; a depth-exporting shader keeps late tests instead of the upstream assert);
+    shader binary version bit 23 (#5264, BB_BP5264, off: experimental in iss_pc).
+  BP06 of the iss_pc catalog (SotC 8d84cf7, not in SotC's public history, so written here from
+    the Vulkan/SPIR-V specifications): VK_KHR_shader_maximal_reconvergence enabled when the
+    device has the feature, compute shaders get SPV_KHR_maximal_reconvergence and the
+    MaximallyReconvergesKHR execution mode; shader binary version bit 22 (BB_BP_RECONV, off).

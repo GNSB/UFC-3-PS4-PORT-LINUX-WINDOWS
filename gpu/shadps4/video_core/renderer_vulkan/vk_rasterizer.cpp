@@ -18,6 +18,7 @@
 #include "bbport_sections.h"
 #include "bbport_ce_stats.h"
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "bbport_clobber.h"
@@ -1777,6 +1778,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
+        .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params, nullptr, true);
     if (!pipeline) {
@@ -1824,12 +1826,14 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    NoteInputBuffer(buffer, base, stride * max_count, vk::AccessFlagBits2::eIndirectCommandRead);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        NoteInputBuffer(count_buffer, count_offset, 4, vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
     if (needs_barrier) {
@@ -2016,6 +2020,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    NoteInputBuffer(buffer, base, size, vk::AccessFlagBits2::eIndirectCommandRead);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
@@ -2500,6 +2505,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        NoteInputBuffer(range.buffer, range.offset, size, vk::AccessFlagBits2::eVertexAttributeRead);
     }
 
     // Bind vertex buffers
@@ -2538,8 +2544,14 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
 void Rasterizer::EmitIndexBuffer() {
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
-                      type = index_bind.type](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindIndexBuffer(handle, offset, type);
+                      type = index_bind.type, size = index_bind.size,
+                      sized = index_bind.size != 0 &&
+                              instance.IsMaintenance5Supported()](vk::CommandBuffer cmdbuf) {
+        if (sized) {
+            cmdbuf.bindIndexBuffer2KHR(handle, offset, size, type);
+        } else {
+            cmdbuf.bindIndexBuffer(handle, offset, type);
+        }
     });
 }
 
@@ -2551,28 +2563,63 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
     const vk::IndexType index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
     const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
-    const VAddr index_address =
-        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    const VAddr base_address = regs.index_base_address.Address<VAddr>();
 
+    // ufc3 (UFC-89, upstream #5358, #5327): only the mapped part of the index range is bound;
+    // with no base or nothing mapped, 16 zero bytes (index 0). A garbage base or count read
+    // unmapped guest memory. BB_BP5358=0 binds the requested range as before.
+    if (BbBackport::On(BbBackport::IndexBuffer5358)) {
+        const VAddr index_address = base_address + u64(index_offset) * index_size;
+        const u64 requested_size = u64(regs.num_indices) * index_size;
+        const u64 mapped_size = base_address != 0 && requested_size != 0
+                                    ? memory->ClampRangeSize(index_address, requested_size)
+                                    : 0;
+        const u32 index_buffer_size = static_cast<u32>(
+            std::min<u64>(Common::AlignDown(mapped_size, index_size), 0xFFFFFFFFu & ~3u));
+        if (index_buffer_size == 0) {
+            static std::atomic<u32> noted{0};
+            if (requested_size != 0 && noted.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Backports: unmapped index buffer at %#llx (%u indices), zero "
+                            "indices bound (#5358)\n",
+                            static_cast<unsigned long long>(index_address), regs.num_indices);
+            }
+            const auto* null_buffer = buffer_cache.GetNullIndexBuffer();
+            index_bind = {null_buffer->Handle(), 0, index_type, null_buffer->SizeBytes()};
+            return;
+        }
+        const auto [buffer, offset] =
+            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        NoteInputBuffer(buffer, offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead);
+        index_bind = {buffer->Handle(), offset, index_type, index_buffer_size};
+        return;
+    }
+
+    const VAddr index_address = base_address + index_offset * index_size;
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
-    index_bind = {buffer->Handle(), offset, index_type};
+    NoteInputBuffer(buffer, offset, index_buffer_size, vk::AccessFlagBits2::eIndexRead);
+    index_bind = {buffer->Handle(), offset, index_type, 0};
+}
+
+void Rasterizer::NoteInputBuffer(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                                 vk::AccessFlags2 access) {
+    if (size != 0 && BbBackport::On(BbBackport::InputBarriers5262)) {
+        bound_buffers.emplace_back(buffer, offset, static_cast<u32>(size), access);
+    }
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
-    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+    for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
-        const auto write_flag =
-            is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
-        runtime.AccessBuffer(buffer, offset, size, dst_stage,
-                             vk::AccessFlagBits2::eShaderRead | write_flag);
+        runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
     }
     bound_images.clear();
     bound_buffers.clear();
@@ -2893,7 +2940,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
-                bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                bound_buffers.emplace_back(
+                    buffer, offset, size,
+                    vk::AccessFlagBits2::eShaderRead | (desc.is_written
+                                                            ? vk::AccessFlagBits2::eShaderWrite
+                                                            : vk::AccessFlagBits2::eNone));
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
@@ -3622,6 +3673,36 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
+        // ufc3 (UFC-89, after upstream #5137, as in CTR): undefined field values (a garbage S#
+        // from a reused command buffer) are clamped to the nearest defined one, and a custom
+        // border colour with no border colour table becomes transparent black, so no Vulkan
+        // sampler is made from values the hardware lacks. BB_BP5137=0 passes them through.
+        if (BbBackport::On(BbBackport::SamplerClamp5137) &&
+            (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                 Regs().ta_bc_base.Address() == 0))) {
+            static std::atomic<u32> clamped{0};
+            if (clamped.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::printf("Backports: S# with undefined fields (aniso %u, filter mode %u, mip "
+                            "filter %u, border %u) clamped (#5137)\n",
+                            static_cast<u32>(ssharp.max_aniso.Value()),
+                            static_cast<u32>(ssharp.filter_mode.Value()),
+                            static_cast<u32>(ssharp.mip_filter.Value()),
+                            static_cast<u32>(ssharp.border_color_type.Value()));
+            }
+            if (ssharp.max_aniso.Value() > AmdGpu::AnisoRatio::Sixteen) {
+                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::Sixteen);
+            }
+            if (ssharp.filter_mode.Value() > AmdGpu::FilterMode::Max) {
+                ssharp.filter_mode.Assign(AmdGpu::FilterMode{});
+            }
+            if (ssharp.mip_filter.Value() > AmdGpu::MipFilter::Linear) {
+                ssharp.mip_filter.Assign(AmdGpu::MipFilter::Linear);
+            }
+            if (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                Regs().ta_bc_base.Address() == 0) {
+                ssharp.border_color_type.Assign(AmdGpu::BorderColor{});
+            }
+        }
         ForceAnisotropy(ssharp, sampler.is_depth);
         const auto vk_sampler = texture_cache.GetSampler(
             ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);

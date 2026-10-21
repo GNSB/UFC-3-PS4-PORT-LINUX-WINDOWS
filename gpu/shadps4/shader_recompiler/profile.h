@@ -44,6 +44,8 @@ struct Profile {
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
     bool supports_shader_subgroup_clock{};
+    /// ufc3 (UFC-89): compute shaders get MaximallyReconvergesKHR (BB_BP_RECONV=1).
+    bool supports_maximal_reconvergence{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
