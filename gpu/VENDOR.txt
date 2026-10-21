@@ -131,3 +131,7 @@ line at start-up; shader-changing ones are bits 21..23 of the shader binary vers
     (HwFragmentRuntimeInfo::depth_before_shader, set only with the switch on; no bit-packing of
     the runtime info; a depth-exporting shader keeps late tests instead of the upstream assert);
     shader binary version bit 23 (#5264, BB_BP5264, off: experimental in iss_pc).
+  BP06 of the iss_pc catalog (SotC 8d84cf7, not in SotC's public history, so written here from
+    the Vulkan/SPIR-V specifications): VK_KHR_shader_maximal_reconvergence enabled when the
+    device has the feature, compute shaders get SPV_KHR_maximal_reconvergence and the
+    MaximallyReconvergesKHR execution mode; shader binary version bit 22 (BB_BP_RECONV, off).

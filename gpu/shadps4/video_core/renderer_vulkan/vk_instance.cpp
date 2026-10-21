@@ -13,6 +13,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -396,6 +397,27 @@ bool Instance::CreateDevice() {
         compute_shader_derivatives_features =
             feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
     }
+    // ufc3 (UFC-89, BP06 of the iss_pc catalog, from SotC): maximal reconvergence for compute
+    // shaders written for GCN's lockstep waves. Only asked for with BB_BP_RECONV=1, and only
+    // enabled when the device has the feature.
+    maximal_reconvergence = false;
+    if (BbBackport::On(BbBackport::MaxReconvergence) &&
+        std::find(available_extensions.begin(), available_extensions.end(),
+                  std::string{VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME}) !=
+            available_extensions.end()) {
+        const auto reconvergence_chain =
+            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+        if (reconvergence_chain.get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
+                .shaderMaximalReconvergence) {
+            maximal_reconvergence =
+                add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+        }
+    }
+    if (BbBackport::On(BbBackport::MaxReconvergence)) {
+        std::printf("Backports: maximal reconvergence %s\n",
+                    maximal_reconvergence ? "enabled" : "requested, not supported by the device");
+    }
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -628,6 +650,9 @@ bool Instance::CreateDevice() {
             .shaderFloat8 = true,
             .shaderFloat8CooperativeMatrix = true,
         },
+        vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
+            .shaderMaximalReconvergence = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -690,6 +715,9 @@ bool Instance::CreateDevice() {
     }
     if (!shader_float8) {
         device_chain.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+    }
+    if (!maximal_reconvergence) {
+        device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
