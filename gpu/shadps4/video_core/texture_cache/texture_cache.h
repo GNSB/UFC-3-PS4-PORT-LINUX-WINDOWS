@@ -9,6 +9,7 @@
 #include "bbport_toggles.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -20,6 +21,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -119,6 +121,13 @@ public:
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+
+    /// ufc3 (UFC-91, BB_DEFERRED_READBACK): a CPU access to [address, +size) on pages pending
+    /// image readbacks guard. A write, or a read without BB_STALE_READBACK, waits only for the
+    /// GPU copies covering those pages (on this thread) and publishes them to guest memory; a
+    /// stale read drops their read guard and sees what guest memory holds. Returns whether a
+    /// guard was dropped (the access may run again).
+    bool ResolveReadbacks(VAddr address, u64 size, bool write);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -428,6 +437,9 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        // ufc3 (UFC-91): a pending readback of this memory lands before the image goes.
+        const auto& image = slot_images[image_id];
+        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true);
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -491,6 +503,43 @@ private:
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     std::atomic<bool> downloads_queued{false}; ///< download_images may be non-empty (checked without the lock)
+
+    /// ufc3 (UFC-91): BB_DEFERRED_READBACK=1: an image readback at a fence is copied and
+    /// submitted without waiting for the GPU; its pages stay guarded until it lands in guest
+    /// memory (at a later fence, or when the CPU touches them: then only that thread waits).
+    const bool deferred_readbacks;
+    /// BB_STALE_READBACK=1 (needs the above; off with deterministic FP, i.e. online): CPU reads
+    /// of a pending readback see the guest memory as it was (the previous copy) instead of
+    /// waiting. Writes still wait, so no byte is lost.
+    const bool stale_readbacks;
+    struct PendingReadback {
+        VAddr address;
+        u64 size;
+        u64 tick;
+        Vulkan::StagingBufferRef staging;
+        std::vector<u8> at_start; ///< ImageReadbackStart (write windows)
+        bool read_guard;
+    };
+    /// Whether this fence's readbacks are deferred (also needs page protection, i.e. write
+    /// tracking, and the host path: BB_GUEST_IN_PLACE copies in stream order already).
+    bool DeferringReadbacks() const;
+    /// Records the copy of one GPU-modified image of `size` bytes (GPU thread).
+    void RecordDeferredDownload(ImageId image_id, u64 size, std::vector<PendingReadback>& recorded);
+    /// Publishes the readbacks the GPU has finished, in order (readback_mutex held).
+    void RetireReadbacks();
+    void ReportReadbacks();
+    static constexpr u64 MaxPendingReadbacks = 64;
+    static constexpr u64 MaxPendingReadbackBytes = 64ull << 20;
+    std::mutex readback_mutex;
+    std::deque<PendingReadback> pending_readbacks;            ///< by tick
+    std::vector<Vulkan::StagingBufferRef> readback_staging_free; ///< freed on the GPU thread
+    u64 pending_readback_bytes = 0;
+    std::atomic<bool> has_pending_readbacks{false};
+    std::atomic<bool> has_staging_to_free{false};
+    /// BB_FRAME_STATS counters (reported every 5 s).
+    std::atomic<u64> rb_deferred{0}, rb_published{0}, rb_stale_reads{0}, rb_reads_waited{0},
+        rb_writes_waited{0}, rb_ready{0}, rb_budget_waits{0}, rb_wait_ns{0}, rb_peak_bytes{0};
+    std::chrono::steady_clock::time_point rb_report{};
     struct MetaDataInfo {
         MetaType type;
         s32 clear_mask = -1;

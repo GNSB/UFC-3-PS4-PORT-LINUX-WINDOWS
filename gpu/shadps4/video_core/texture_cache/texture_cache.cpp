@@ -28,9 +28,17 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+extern "C" int runtime_fp_deterministic(void);
+
 namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
+
+// ufc3 (UFC-91): BB_DEFERRED_READBACK / BB_STALE_READBACK, off unless "1".
+static bool ReadbackSwitch(const char* name) {
+    const char* env = std::getenv(name);
+    return env && env[0] == '1';
+}
 static constexpr u64 NumFramesBeforeRemoval = 32;
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -39,7 +47,21 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      deferred_readbacks{ReadbackSwitch("BB_DEFERRED_READBACK")},
+      stale_readbacks{deferred_readbacks && ReadbackSwitch("BB_STALE_READBACK") &&
+                      !runtime_fp_deterministic()} {
+    if (deferred_readbacks) {
+        std::printf("GPU: deferred image readbacks (BB_DEFERRED_READBACK=1): only the thread "
+                    "that touches a pending one waits%s\n",
+                    stale_readbacks ? "; CPU reads see the previous copy (BB_STALE_READBACK=1)"
+                                    : "");
+    }
+    if (ReadbackSwitch("BB_STALE_READBACK") && !stale_readbacks) {
+        std::printf("GPU: BB_STALE_READBACK ignored: %s\n",
+                    deferred_readbacks ? "online (deterministic FP) reads wait for the GPU"
+                                       : "it needs BB_DEFERRED_READBACK=1");
+    }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -401,22 +423,239 @@ static void NoteLinearReadback(const ImageInfo& info, bool target) {
 }
 
 void TextureCache::ProcessDownloadImages() {
+    if (deferred_readbacks) {
+        if (has_pending_readbacks.load(std::memory_order_acquire) ||
+            has_staging_to_free.load(std::memory_order_acquire)) {
+            std::scoped_lock rl{readback_mutex};
+            RetireReadbacks();
+            // Here, on the GPU thread: the staging pool is its own.
+            for (const auto& staging : readback_staging_free) {
+                runtime.GetStagingPool().FreeDeferred(staging);
+            }
+            readback_staging_free.clear();
+            has_staging_to_free.store(false, std::memory_order_relaxed);
+        }
+        if (BbStats::enabled) {
+            ReportReadbacks();
+        }
+    }
     // bbport: called for every fence (~450 a frame): the lock only when something is queued.
     if (!downloads_queued.load(std::memory_order_acquire)) {
         return;
     }
     std::unique_lock lk{download_images_mutex};
     downloads_queued.store(false, std::memory_order_relaxed);
+    if (DeferringReadbacks()) {
+        // readback_mutex is never held while this thread waits for the host copies (Flush,
+        // Finish): a copy thread faulting on a guarded page takes it.
+        std::vector<PendingReadback> recorded;
+        u64 recorded_bytes = 0;
+        const auto guard = [&](u64 tick) {
+            // Set first: a fault on a page guarded below must find its readback.
+            if (!recorded.empty()) {
+                has_pending_readbacks.store(true, std::memory_order_release);
+            }
+            for (auto& readback : recorded) {
+                tracker.WatchReadback(readback.address, readback.size, 1, 1);
+                readback.tick = tick;
+                pending_readback_bytes += readback.size;
+                pending_readbacks.push_back(std::move(readback));
+            }
+            recorded.clear();
+            recorded_bytes = 0;
+        };
+        for (const ImageId image_id : download_images) {
+            const Image& image = slot_images[image_id];
+            if (False(image.flags & ImageFlagBits::GpuModified)) {
+                continue;
+            }
+            const u64 size = u64{image.info.pitch} * image.info.size.height *
+                             image.info.size.depth * image.info.resources.layers *
+                             (image.info.num_bits / 8);
+            bool over;
+            {
+                std::scoped_lock rl{readback_mutex};
+                over = pending_readbacks.size() + recorded.size() >= MaxPendingReadbacks ||
+                       pending_readback_bytes + recorded_bytes + size > MaxPendingReadbackBytes;
+            }
+            if (over) {
+                // Over budget: the GPU is waited for once, and every copy so far is published.
+                rb_budget_waits.fetch_add(1, std::memory_order_relaxed);
+                scheduler.Finish();
+                std::scoped_lock rl{readback_mutex};
+                guard(0); // done: Finish waited for them
+                RetireReadbacks();
+            }
+            if (size > MaxPendingReadbackBytes) {
+                DownloadImageMemory(image_id, true); // larger than the budget alone
+                continue;
+            }
+            // Copies the copy threads still make from these pages end before they are guarded.
+            scheduler.WaitHostCopiesFor(image.info.guest_address, size);
+            RecordDeferredDownload(image_id, size, recorded);
+            recorded_bytes += size;
+        }
+        download_images.clear();
+        if (recorded.empty()) {
+            return;
+        }
+        // Submitted now (SubmitExecution submits before it returns): a thread that touches the
+        // pages waits for this tick on the timeline semaphore alone, never for the GPU thread.
+        // Guarded after the copies are recorded: CPU writes before that are overwritten by the
+        // readback, as when it waited here.
+        const u64 tick = scheduler.CurrentTick();
+        const u64 count = recorded.size();
+        scheduler.Flush();
+        std::scoped_lock rl{readback_mutex};
+        guard(tick);
+        rb_deferred.fetch_add(count, std::memory_order_relaxed);
+        if (pending_readback_bytes > rb_peak_bytes.load(std::memory_order_relaxed)) {
+            rb_peak_bytes.store(pending_readback_bytes, std::memory_order_relaxed);
+        }
+        return;
+    }
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
     }
     download_images.clear();
 }
 
+bool TextureCache::DeferringReadbacks() const {
+    return deferred_readbacks && WriteTracking() && !GuestInPlace();
+}
+
+void TextureCache::RecordDeferredDownload(ImageId image_id, u64 size,
+                                          std::vector<PendingReadback>& recorded) {
+    Image& image = slot_images[image_id];
+    const VAddr address = image.info.guest_address;
+    ASSERT(size <= image.info.guest_size);
+    const auto staging =
+        runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16, true);
+    auto at_start = ImageReadbackStart(address, size);
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = staging.offset,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImage(&image, staging.buffer, std::span{&image_download, 1});
+    LogT4Image(image, "download-deferred", scheduler.CurrentTick(), readback_linear_images);
+    recorded.push_back({address, size, 0, staging, std::move(at_start), true});
+}
+
+void TextureCache::RetireReadbacks() {
+    while (!pending_readbacks.empty() && scheduler.IsFree(pending_readbacks.front().tick)) {
+        auto& readback = pending_readbacks.front();
+        readback.staging.Invalidate();
+        BbFreeCheck::Check(readback.address, readback.size, readback.staging.mapped,
+                           BbFreeCheck::ImageDownload);
+        BbClobber::NoteWrite(readback.address, 0, u32(readback.size), BbClobber::ImageDownload);
+        WriteImageReadback(readback.address, readback.staging.mapped, readback.size,
+                           readback.at_start);
+        // In guest memory before the pages open.
+        tracker.WatchReadback(readback.address, readback.size, -1, readback.read_guard ? -1 : 0);
+        readback_staging_free.push_back(readback.staging);
+        has_staging_to_free.store(true, std::memory_order_release);
+        pending_readback_bytes -= readback.size;
+        pending_readbacks.pop_front();
+        rb_published.fetch_add(1, std::memory_order_relaxed);
+    }
+    has_pending_readbacks.store(!pending_readbacks.empty(), std::memory_order_release);
+}
+
+bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool write) {
+    if (!deferred_readbacks || !has_pending_readbacks.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const VAddr begin = address & ~VAddr{4095};
+    const VAddr end = (address + std::max<u64>(size, 1) + 4095) & ~VAddr{4095};
+    u64 tick = 0;
+    {
+        std::scoped_lock rl{readback_mutex};
+        bool dropped = false;
+        for (auto& readback : pending_readbacks) {
+            const VAddr rb_begin = readback.address & ~VAddr{4095};
+            const VAddr rb_end = (readback.address + readback.size + 4095) & ~VAddr{4095};
+            if (end <= rb_begin || rb_end <= begin) {
+                continue;
+            }
+            if (!write && stale_readbacks) {
+                // The CPU reads what guest memory holds: the copy published before this one.
+                if (readback.read_guard) {
+                    tracker.WatchReadback(readback.address, readback.size, 0, -1);
+                    readback.read_guard = false;
+                    rb_stale_reads.fetch_add(1, std::memory_order_relaxed);
+                    dropped = true;
+                }
+                continue;
+            }
+            tick = std::max(tick, readback.tick);
+        }
+        if (tick == 0) {
+            return dropped;
+        }
+        if (scheduler.IsFree(tick)) {
+            rb_ready.fetch_add(1, std::memory_order_relaxed);
+            RetireReadbacks();
+            return true;
+        }
+    }
+    // Submitted when it was queued: this thread waits for that tick alone.
+    (write ? rb_writes_waited : rb_reads_waited).fetch_add(1, std::memory_order_relaxed);
+    const auto start = std::chrono::steady_clock::now();
+    scheduler.GetWorkSemaphore()->Wait(tick);
+    rb_wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count(),
+                         std::memory_order_relaxed);
+    std::scoped_lock rl{readback_mutex};
+    RetireReadbacks();
+    return true;
+}
+
+// BB_FRAME_STATS: what the deferred readbacks did over the last 5 s.
+void TextureCache::ReportReadbacks() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - rb_report < std::chrono::seconds(5)) {
+        return;
+    }
+    const bool first = rb_report == std::chrono::steady_clock::time_point{};
+    rb_report = now;
+    if (first) {
+        return;
+    }
+    const auto take = [](std::atomic<u64>& counter) {
+        return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed));
+    };
+    const unsigned long long deferred = take(rb_deferred), published = take(rb_published),
+                             stale = take(rb_stale_reads), reads = take(rb_reads_waited),
+                             writes = take(rb_writes_waited), ready = take(rb_ready),
+                             budget = take(rb_budget_waits), wait_ns = take(rb_wait_ns),
+                             peak = take(rb_peak_bytes);
+    std::printf("[RB-DEFER] 5 s: %llu deferred, %llu published, %llu stale reads served, "
+                "%llu reads and %llu writes waited (%.2f ms), %llu found ready, %llu budget "
+                "waits, peak %.1f KiB pending%s\n",
+                deferred, published, stale, reads, writes, wait_ns / 1e6, ready, budget,
+                peak / 1024.0, stale_readbacks ? " (stale)" : "");
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
+    }
+    if (sync) {
+        // ufc3 (UFC-91): an older deferred readback of this memory lands first.
+        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true);
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
