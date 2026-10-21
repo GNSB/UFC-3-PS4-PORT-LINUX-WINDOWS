@@ -175,10 +175,13 @@ def try_inplace_movbe(mnem, op, insn_size):
     return None
 
 def collect_branch_targets(mod, seg, fns, md):
-    """Collect branch targets from direct jumps, calls, RIP-relative references, and relocations."""
+    """Collect branch targets from direct jumps, calls, RIP-relative references, function entries, and relocations."""
     targets = set()
+    # 1. Direct branches and RIP-relative memory references
     for start, size in fns:
         if seg['vaddr'] <= start < seg['vaddr'] + seg['filesz']:
+            # Protect function/FDE entry addresses
+            targets.add(start)
             off = seg['offset'] + start - seg['vaddr']
             for addr, insn_size, mnem, op in md.disasm_lite(bytes(mod['elf'][off:off+size]), start):
                 if (mnem.startswith('j') or mnem == 'call') and op.startswith('0x'):
@@ -194,10 +197,35 @@ def collect_branch_targets(mod, seg, fns, md):
                         target_addr = addr + insn_size + disp
                         if seg['vaddr'] <= target_addr < seg['vaddr'] + seg['filesz']:
                             targets.add(target_addr)
+
+    # 2. Protect symbol entry points in the code segment
+    for s in mod.get('symbols', []):
+        val = s.get('value', 0)
+        if seg['vaddr'] <= val < seg['vaddr'] + seg['filesz']:
+            targets.add(val)
+
+    # 3. Relocations: relocated destination pointer values and in-code write targets
     for r in mod.get('relocs', []):
-        target = r[0] if isinstance(r, (tuple, list)) else r.get('target', 0)
-        if seg['vaddr'] <= target < seg['vaddr'] + seg['filesz']:
-            targets.add(target)
+        if isinstance(r, (tuple, list)) and len(r) >= 4:
+            rtarget, kind, symid, addend = r[:4]
+            # Write address (e.g., text relocation)
+            if seg['vaddr'] <= rtarget < seg['vaddr'] + seg['filesz']:
+                targets.add(rtarget)
+            # Relocated pointer value
+            if kind == 8:  # R_X86_64_RELATIVE
+                if seg['vaddr'] <= addend < seg['vaddr'] + seg['filesz']:
+                    targets.add(addend)
+            elif kind in (1, 6, 7):  # R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT
+                if 0 <= symid < len(mod['symbols']):
+                    sym = mod['symbols'][symid]
+                    if sym.get('section'):
+                        dest = sym['value'] + addend
+                        if seg['vaddr'] <= dest < seg['vaddr'] + seg['filesz']:
+                            targets.add(dest)
+        elif isinstance(r, dict):
+            target = r.get('target', 0)
+            if seg['vaddr'] <= target < seg['vaddr'] + seg['filesz']:
+                targets.add(target)
     return targets
 
 def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_range=None):
@@ -220,6 +248,7 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
 
             at = seg['offset'] + addr - seg['vaddr']
 
+            # Guard against RIP-relative operands in the instruction
             if 'rip' in op:
                 plan['unhandled'].append({
                     'module': mod_name,
@@ -229,6 +258,7 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
                 })
                 continue
 
+            # 1. Try generalized in-place movbe patch
             inplace = try_inplace_movbe(mnem, op, insn_size)
             if inplace:
                 plan['sites'].append({
@@ -243,6 +273,7 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
                 seen_addrs.add(addr)
                 continue
 
+            # 2. Standard >= 5 bytes trampoline
             if insn_size >= 5:
                 try:
                     rep = body(mnem, op)
@@ -264,12 +295,15 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
                     })
                 continue
 
+            # 3. Short instruction (< 5 bytes): Spanning
             next_insn = fn_insns[idx+1] if idx+1 < len(fn_insns) else None
             prev_insn = fn_insns[idx-1] if idx > 0 else None
             spanned = False
 
+            # Forward spanning
             if next_insn:
                 n_addr, n_size, n_mnem, n_op = next_insn
+                # Guards: neighbor cannot be branch/call, rip-relative, loop*, xbegin, or branch target
                 if (insn_size + n_size >= 5 and n_addr not in targets and
                         not (n_mnem.startswith('j') or n_mnem == 'call') and
                         not (n_mnem.startswith('loop') or n_mnem == 'xbegin') and
@@ -277,22 +311,30 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
                     try:
                         rep1 = body(mnem, op)
                         if n_mnem in SUPPORTED:
+                            # Both instructions need translation!
                             rep2 = body(n_mnem, n_op)
                             combined_body = rep1 + rep2
                             combined_instr = f'{mnem} {op} [+ {n_mnem} {n_op}]'
                             counts[n_mnem] += 1
+                            plan['sites'].append({
+                                'module': mod_name,
+                                'address': addr,
+                                'length': insn_size + n_size,
+                                'body': combined_body.hex(),
+                                'instruction': combined_instr
+                            })
                         else:
-                            next_bytes = bytes(mod['elf'][at + insn_size : at + insn_size + n_size])
-                            combined_body = rep1 + next_bytes
+                            # Neighbor is normal instruction; DO NOT embed its original bytes in the plan!
+                            # Store spanning metadata so neighbor bytes are loaded dynamically at link time.
                             combined_instr = f'{mnem} {op} [+ {n_mnem} {n_op}]'
-
-                        plan['sites'].append({
-                            'module': mod_name,
-                            'address': addr,
-                            'length': insn_size + n_size,
-                            'body': combined_body.hex(),
-                            'instruction': combined_instr
-                        })
+                            plan['sites'].append({
+                                'module': mod_name,
+                                'address': addr,
+                                'length': insn_size + n_size,
+                                'body': rep1.hex(),
+                                'span': {'pos': 'after', 'len': n_size},
+                                'instruction': combined_instr
+                            })
                         counts[mnem] += 1
                         seen_addrs.add(addr)
                         seen_addrs.add(n_addr)
@@ -300,6 +342,7 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
                     except Exception:
                         pass
 
+            # Backward spanning
             if not spanned and prev_insn:
                 p_addr, p_size, p_mnem, p_op = prev_insn
                 if (insn_size + p_size >= 5 and p_addr not in targets and addr not in targets and
@@ -308,13 +351,12 @@ def scan_module_functions(mod_name, mod, seg, fns, md, plan, counts, strlen_rang
                         'rip' not in p_op and p_addr not in seen_addrs and p_mnem not in SUPPORTED):
                     try:
                         rep = body(mnem, op)
-                        p_at = seg['offset'] + p_addr - seg['vaddr']
-                        prev_bytes = bytes(mod['elf'][p_at : p_at + p_size])
                         plan['sites'].append({
                             'module': mod_name,
                             'address': p_addr,
                             'length': p_size + insn_size,
-                            'body': (prev_bytes + rep).hex(),
+                            'body': rep.hex(),
+                            'span': {'pos': 'before', 'len': p_size},
                             'instruction': f'{mnem} {op} [- {p_mnem} {p_op}]'
                         })
                         counts[mnem] += 1
@@ -342,6 +384,7 @@ def main():
     plan = {'version': 3, 'modules': {}, 'sites': [], 'unhandled': []}
     counts = collections.Counter()
 
+    # 1. PRX Modules (libc.prx and libSceFios2.prx) scanned with function ranges
     for name, rel_path in [('libc.prx', 'sce_module/libc.prx'),
                            ('libSceFios2.prx', 'sce_module/libSceFios2.prx')]:
         path = args.game / rel_path
@@ -361,6 +404,7 @@ def main():
 
         scan_module_functions(name, mod, seg, fns, md, plan, counts, strlen_range=strlen_range)
 
+    # 2. Main Executable (eboot.bin)
     eboot_path = args.game / 'eboot.bin'
     if eboot_path.exists():
         eboot_mod = module(eboot_path)
@@ -379,25 +423,42 @@ def main():
     except Exception:
         pass
 
-    xz_data = lzma.compress(serialized)
+    # Also write legacy_plan_p1.py, p2.py, p3.py and legacy_plan_data.py (Base64 + LZMA embedded compressed plan)
+    xz_data = lzma.compress(serialized, preset=9)
     b64_data = base64.b64encode(xz_data).decode('ascii')
-    chunks = [f'    "{b64_data[i:i+100]}"' for i in range(0, len(b64_data), 100)]
-    py_content = (
+    n = len(b64_data)
+    c1 = n // 3
+    c2 = 2 * n // 3
+    parts = [b64_data[:c1], b64_data[c1:c2], b64_data[c2:]]
+
+    for idx, part in enumerate(parts, 1):
+        pchunks = [f'    "{part[i:i+100]}"' for i in range(0, len(part), 100)]
+        content = (
+            "# SPDX-License-Identifier: GPL-2.0-only\n"
+            f'"""Legacy CPU plan chunk {idx} of 3 for UFC 3 PS4 Port."""\n\n'
+            f"PART{idx} = (\n" + "\n".join(pchunks) + "\n)\n"
+        )
+        with atomic_output(args.out.with_name(f"legacy_plan_p{idx}.py")) as s:
+            s.write(content.encode('utf-8'))
+
+    driver = (
         '# SPDX-License-Identifier: GPL-2.0-only\n'
         '"""Pre-compiled Ivy Bridge compatibility translation plan for UFC 3 PS4 Port (CUSA06534).\n'
-        f'Generated for {len(plan["sites"])} translated sites, {len(plan["unhandled"])} unhandled.\n'
-        'Compressed using standard library LZMA + Base64 (zero external dependencies required).\n'
+        'Zero external dependencies (uses standard library LZMA + Base64).\n'
         '"""\n'
         'import base64\n'
         'import json\n'
-        'import lzma\n\n'
-        '_PLAN_DATA = (\n' + '\n'.join(chunks) + '\n)\n\n'
+        'import lzma\n'
+        'from legacy_plan_p1 import PART1\n'
+        'from legacy_plan_p2 import PART2\n'
+        'from legacy_plan_p3 import PART3\n\n'
         'def get_plan():\n'
         '    """Returns the decompressed compatibility plan dictionary."""\n'
-        '    return json.loads(lzma.decompress(base64.b64decode(_PLAN_DATA.encode("ascii"))))\n'
+        '    combined = PART1 + PART2 + PART3\n'
+        '    return json.loads(lzma.decompress(base64.b64decode(combined.encode("ascii"))))\n'
     )
     with atomic_output(args.out.with_name('legacy_plan_data.py')) as s:
-        s.write(py_content.encode('utf-8'))
+        s.write(driver.encode('utf-8'))
 
     print(f"Legacy CPU Plan created: {len(plan['sites'])} sites translated, {len(plan['unhandled'])} unhandled.")
     print("Breakdown by instruction:", dict(counts))
