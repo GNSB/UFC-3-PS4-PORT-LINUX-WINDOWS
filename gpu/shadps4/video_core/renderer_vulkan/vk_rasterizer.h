@@ -539,6 +539,7 @@ private:
         vk::Buffer handle;
         u64 offset;
         vk::IndexType type;
+        u64 size; ///< ufc3 (UFC-89, #5358): bound size, 0 = to the end of the buffer
     } index_bind{};
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
     struct DrawInputs {

@@ -103,7 +103,11 @@ Backported for UFC-89 (shadPS4 upstream fixes already adapted by other ports of 
 Nitro-Fueled "bbport (upstream #N)", the iss_pc catalog BP01-BP12 as a list only). One switch per
 fix (gpu/shim/bbport_backports.h): BB_BP<n>=0/1, BB_BACKPORTS=0 turns all of them off; "Backports:"
 line at start-up; shader-changing ones are bits 21..23 of the shader binary version.
-  0d4d829b (Marcin Mitura) CE/DE counter waits: ce - de without underflow, no wait without a CE
+  e6c79a5f (Marcin Mitura) CE/DE counter waits: ce - de without underflow, no wait without a CE
     task (#5406, BB_BP5406, on).
-  c9f8bb22 + 6ac75d02 (Lucas-blip-png) the frames of nested indirect buffer tasks (graphics,
+  12c5978f (Lucas-blip-png) the frames of nested indirect buffer tasks (graphics,
     constant, compute) are destroyed once they finish (#5258, BB_BP5258, on).
+  23c41333 (Marcin Mitura) + e9f2c54c (junminlee2004) null or unmapped index buffers: only the
+    mapped part is bound (vkCmdBindIndexBuffer2 with its size where VK_KHR_maintenance5 is), a
+    16-byte zero buffer when nothing is; adapted as in CTR (no max_index_size here) (#5358,
+    #5327, BB_BP5358, on).

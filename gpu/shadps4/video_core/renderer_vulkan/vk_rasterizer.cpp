@@ -18,6 +18,7 @@
 #include "bbport_sections.h"
 #include "bbport_ce_stats.h"
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "bbport_clobber.h"
@@ -2538,8 +2539,14 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
 void Rasterizer::EmitIndexBuffer() {
     scheduler.Record([handle = index_bind.handle, offset = index_bind.offset,
-                      type = index_bind.type](vk::CommandBuffer cmdbuf) {
-        cmdbuf.bindIndexBuffer(handle, offset, type);
+                      type = index_bind.type, size = index_bind.size,
+                      sized = index_bind.size != 0 &&
+                              instance.IsMaintenance5Supported()](vk::CommandBuffer cmdbuf) {
+        if (sized) {
+            cmdbuf.bindIndexBuffer2KHR(handle, offset, size, type);
+        } else {
+            cmdbuf.bindIndexBuffer(handle, offset, type);
+        }
     });
 }
 
@@ -2551,15 +2558,44 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
     const vk::IndexType index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
     const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
-    const VAddr index_address =
-        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+    const VAddr base_address = regs.index_base_address.Address<VAddr>();
 
+    // ufc3 (UFC-89, upstream #5358, #5327): only the mapped part of the index range is bound;
+    // with no base or nothing mapped, 16 zero bytes (index 0). A garbage base or count read
+    // unmapped guest memory. BB_BP5358=0 binds the requested range as before.
+    if (BbBackport::On(BbBackport::IndexBuffer5358)) {
+        const VAddr index_address = base_address + u64(index_offset) * index_size;
+        const u64 requested_size = u64(regs.num_indices) * index_size;
+        const u64 mapped_size = base_address != 0 && requested_size != 0
+                                    ? memory->ClampRangeSize(index_address, requested_size)
+                                    : 0;
+        const u32 index_buffer_size = static_cast<u32>(
+            std::min<u64>(Common::AlignDown(mapped_size, index_size), 0xFFFFFFFFu & ~3u));
+        if (index_buffer_size == 0) {
+            static std::atomic<u32> noted{0};
+            if (requested_size != 0 && noted.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Backports: unmapped index buffer at %#llx (%u indices), zero "
+                            "indices bound (#5358)\n",
+                            static_cast<unsigned long long>(index_address), regs.num_indices);
+            }
+            const auto* null_buffer = buffer_cache.GetNullIndexBuffer();
+            index_bind = {null_buffer->Handle(), 0, index_type, null_buffer->SizeBytes()};
+            return;
+        }
+        const auto [buffer, offset] =
+            buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        index_bind = {buffer->Handle(), offset, index_type, index_buffer_size};
+        return;
+    }
+
+    const VAddr index_address = base_address + index_offset * index_size;
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [buffer, offset] =
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
-    index_bind = {buffer->Handle(), offset, index_type};
+    index_bind = {buffer->Handle(), offset, index_type, 0};
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
