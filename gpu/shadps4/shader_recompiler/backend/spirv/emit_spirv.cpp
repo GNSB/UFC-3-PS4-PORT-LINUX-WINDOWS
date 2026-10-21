@@ -486,6 +486,13 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }
+        // ufc3 (UFC-89, upstream #5264): DEPTH_BEFORE_SHADER is authoritative for early depth
+        // testing (radeonsi; Z_ORDER is a hint). Upstream asserts on a depth-exporting shader;
+        // here such a shader keeps late tests. Off by default (BB_BP5264=1).
+        if (ctx.runtime_info.hw.fs.depth_before_shader &&
+            !info.stores.GetAny(IR::Attribute::Depth)) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
+        }
         break;
     case SwStage::Geometry:
         execution_model = spv::ExecutionModel::Geometry;

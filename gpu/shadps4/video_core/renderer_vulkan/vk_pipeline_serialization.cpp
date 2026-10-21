@@ -15,7 +15,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 12u; // ufc3: loop guard, PORTHEON 44edf33 (11: DB_ALPHA_TO_MASK discard; 10: UFC-4 recompiler backports, NaN handling; 9: subgroup fences around LDS stores; 8: sacredfire GS ring slot fold, 1D images as 2D)
-static constexpr u32 ShaderMetaVersion = 11u; // ufc3: UFC-89 SwVertexRuntimeInfo::is_indirect (10: HwFragmentRuntimeInfo::alpha_to_mask; 9: RuntimeInfo::Properties bit-packed with dx10_clamp, #5257)
+static constexpr u32 ShaderMetaVersion = 11u; // ufc3: UFC-89 SwVertexRuntimeInfo::is_indirect, HwFragmentRuntimeInfo::depth_before_shader (10: HwFragmentRuntimeInfo::alpha_to_mask; 9: RuntimeInfo::Properties bit-packed with dx10_clamp, #5257)
 static constexpr u32 PipelineKeyVersion = 7u; // ufc3: alpha_to_coverage bit (6: sacredfire GS permutations re-indexed)
 // Intel profile bits occupy 16..20; UFC-89's shader-changing backports 21..23; bit 31 remains
 // owned by UFC-68's loop guard.
