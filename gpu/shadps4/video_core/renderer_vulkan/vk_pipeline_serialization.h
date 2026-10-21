@@ -20,5 +20,7 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 /// UFC-88: Intel profile/subgroup bits (0..4), stored in binary version bits 16..20.
 /// Variant zero preserves the existing version; UFC-68's loop guard owns bit 31.
 void SetShaderBinaryVariant(u32 variant);
+/// ufc3 (UFC-89): BbBackport::ShaderBits(), bits 21..23 of the shader binary version.
+void SetShaderBackportBits(u32 bits);
 
 } // namespace Vulkan

@@ -98,3 +98,10 @@ Backported for UFC-7 (T7 of docs/ufc3/MANCELLI-BACKPORT.md):
   created fighter's skin among them, were not read through memory: dithered, the layer shows the
   skin under it. Default now: no rule (=all is the same); BB_ALPHA_TO_MASK=colourmap brings the
   UFC-7 rule back. Cache versions unchanged.
+
+Backported for UFC-89 (shadPS4 upstream fixes already adapted by other ports of this family: CTR
+Nitro-Fueled "bbport (upstream #N)", the iss_pc catalog BP01-BP12 as a list only). One switch per
+fix (gpu/shim/bbport_backports.h): BB_BP<n>=0/1, BB_BACKPORTS=0 turns all of them off; "Backports:"
+line at start-up; shader-changing ones are bits 21..23 of the shader binary version.
+  0d4d829b (Marcin Mitura) CE/DE counter waits: ce - de without underflow, no wait without a CE
+    task (#5406, BB_BP5406, on).

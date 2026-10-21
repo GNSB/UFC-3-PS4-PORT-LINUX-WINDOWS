@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 
 namespace Vulkan {
 
@@ -448,6 +449,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                         required_subgroup_sizes[4], required_subgroup_sizes[5], variant);
         }
     }
+    // ufc3 (UFC-89): the backports that change generated shaders are part of the binary version.
+    BbBackport::LogOnce();
+    SetShaderBackportBits(BbBackport::ShaderBits());
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
