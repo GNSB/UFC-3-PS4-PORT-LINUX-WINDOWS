@@ -120,7 +120,10 @@ line at start-up; shader-changing ones are bits 21..23 of the shader binary vers
   145932bf (Lucas Daniel Duarte Cabral) FindImageFromRange looks only at the images of the
     address's first page (ForEachImageWithAddress; here the page lists hold plain ImageIds, so
     the address is compared) (#5240, BB_BP5240, on).
-  65b0faa6 (raphaelthegreat) vertex, index and indirect (args, count) buffers are tracked like
+  c09fa46a (raphaelthegreat) vertex, index and indirect (args, count) buffers are tracked like
     shader buffers, so a later write to them waits for the read; bound_buffers keeps the source
     access and becomes a vector. Not taken: the db_desc rename and GDS in bound_buffers (ufc3
     never tracked GDS there) (#5262, BB_BP5262, on).
+  643c7997 (junminlee2004) vertex and instance ids unbiased in every indirect draw whose fetch
+    shader does not add the base (SwVertexRuntimeInfo::is_indirect, set only with the switch on);
+    shader binary version bit 21, ShaderMetaVersion 11 (#5348, BB_BP5348, on).

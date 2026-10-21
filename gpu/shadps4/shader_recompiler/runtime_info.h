@@ -73,6 +73,8 @@ struct SwVertexRuntimeInfo {
     u32 step_rate_1;
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
+    /// ufc3 (UFC-89, upstream #5348): an indirect draw (set only with BB_BP5348 on).
+    bool is_indirect{};
     bool tess_emulated_primitive{};
 
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
