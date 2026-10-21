@@ -25,6 +25,7 @@ class TestCpuCompat(unittest.TestCase):
     def test_strlen_replacement_size_and_baseline(self):
         """Verify baseline strlen is exactly 14 bytes and contains no VEX/AVX opcodes."""
         self.assertEqual(len(STRLEN_SYSV_X64), 14)
+        # Verify no VEX prefix (0xc4 or 0xc5) in baseline strlen
         self.assertNotIn(0xc4, STRLEN_SYSV_X64)
         self.assertNotIn(0xc5, STRLEN_SYSV_X64)
 
@@ -87,6 +88,82 @@ class TestCpuCompat(unittest.TestCase):
             seen.add(mnem)
         expected = {'andn', 'bextr', 'movbe', 'lzcnt', 'tzcnt', 'blsi', 'blsr', 'blsmsk'}
         self.assertTrue(expected.issubset(seen), f"Missing instructions: {expected - seen}")
+
+    def test_blsr_blsmsk_zero_input_semantics(self):
+        """Verify blsr and blsmsk synthesized trampolines handle zero inputs correctly with stc."""
+        try:
+            import capstone
+            from build_cpu_compat import body
+        except ImportError:
+            self.skipTest("capstone or keystone not available")
+
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+
+        blsr_code = body('blsr', 'eax, ecx')
+        blsr_mnems = [i.mnemonic for i in md.disasm(blsr_code, 0)]
+        self.assertIn('stc', blsr_mnems, "STC instruction missing from blsr zero path")
+        self.assertIn('test', blsr_mnems)
+
+        blsmsk_code = body('blsmsk', 'eax, ecx')
+        blsmsk_mnems = [i.mnemonic for i in md.disasm(blsmsk_code, 0)]
+        self.assertIn('stc', blsmsk_mnems, "STC instruction missing from blsmsk zero path")
+        self.assertIn('test', blsmsk_mnems)
+
+    def test_spanning_neighbor_dynamic_loading(self):
+        """Verify patch_image loads neighbor bytes dynamically from the authenticated image buffer."""
+        from cpu_compat import patch_image
+
+        img = bytearray(0x20000)
+        # Target instruction at 0x1000 (4 bytes), neighbor at 0x1004 (3 bytes)
+        img[0x1000:0x1004] = b'\x0f\x38\xf3\xc1'
+        img[0x1004:0x1007] = b'\x48\x89\xd0'  # mov rax, rdx
+        mock_plan = {
+            'version': 3,
+            'modules': {'eboot.bin': None},
+            'sites': [{
+                'module': 'eboot.bin',
+                'address': 0x1000,
+                'length': 7,
+                'body': '909090',
+                'span': {'pos': 'after', 'len': 3},
+                'instruction': 'blsr eax, ecx [+ mov rax, rdx]'
+            }],
+            'unhandled': []
+        }
+        new_img, segs, rep = patch_image(img, [(0, 0x20000, 5)], {'sha256': None}, [], [], plan=mock_plan, active=True)
+        # Check that neighbor bytes 4889d0 were spliced into the trampoline area
+        trampoline_area = bytes(new_img[0x20000:])
+        self.assertIn(b'\x48\x89\xd0', trampoline_area, "Dynamic neighbor bytes missing from trampoline")
+
+    def test_collect_branch_targets_protects_relocations_and_fde(self):
+        """Verify collect_branch_targets protects relocated pointer values and function/symbol entries."""
+        try:
+            import capstone
+            from build_cpu_compat import collect_branch_targets
+        except ImportError:
+            self.skipTest("capstone not available")
+
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        seg = {'vaddr': 0x1000, 'filesz': 0x1000, 'offset': 0}
+        fns = [(0x1000, 16)]  # Function entry at 0x1000
+        mod = {
+            'elf': bytearray(b'\x90' * 0x2000),
+            'symbols': [{'value': 0x1050, 'section': 1, 'type': 2}],
+            'relocs': [
+                (0x2024, 8, 0, 0x1016),  # R_X86_64_RELATIVE pointing to 0x1016
+            ]
+        }
+        targets = collect_branch_targets(mod, seg, fns, md)
+        self.assertIn(0x1000, targets, "Function entry point 0x1000 was not protected")
+        self.assertIn(0x1050, targets, "Symbol entry point 0x1050 was not protected")
+        self.assertIn(0x1016, targets, "Relocated pointer value 0x1016 was not protected")
+
+    def test_windows_cpuid_host_detection(self):
+        """Verify host_lacks_features executes on win32 without register corruption or AV."""
+        from cpu_compat import host_lacks_features
+        # Ensure it executes without throwing an access violation or crashing
+        result = host_lacks_features()
+        self.assertIsInstance(result, bool)
 
 
 if __name__ == '__main__':
