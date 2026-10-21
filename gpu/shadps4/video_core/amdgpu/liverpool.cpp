@@ -882,6 +882,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // ufc3 (UFC-89, upstream #5258): the finished frame was leaked (BB_BP5258=0 keeps it).
+            if (BbBackport::On(BbBackport::IbFrameFree5258)) {
+                task.handle.destroy();
+            }
             break;
         }
         default:
@@ -1891,6 +1895,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // ufc3 (UFC-89, upstream #5258): the finished frame was leaked (BB_BP5258=0 keeps it).
+                if (BbBackport::On(BbBackport::IbFrameFree5258)) {
+                    task.handle.destroy();
+                }
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -2057,6 +2065,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
+            }
+            // ufc3 (UFC-89, upstream #5258): the finished frame was leaked (BB_BP5258=0 keeps it).
+            if (BbBackport::On(BbBackport::IbFrameFree5258)) {
+                task.handle.destroy();
             }
             break;
         }
