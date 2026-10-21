@@ -117,3 +117,6 @@ line at start-up; shader-changing ones are bits 21..23 of the shader binary vers
   43e4c470 (Chris Chreece) the scheduler part only, as in CTR: every submit wait covers all
     stages (the second one held only colour output; a third or fourth read past the array).
     Not taken: the presenter barrier change (ufc3's presenter differs) (#5231, BB_BP5231, on).
+  145932bf (Lucas Daniel Duarte Cabral) FindImageFromRange looks only at the images of the
+    address's first page (ForEachImageWithAddress; here the page lists hold plain ImageIds, so
+    the address is compared) (#5240, BB_BP5240, on).

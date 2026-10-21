@@ -349,6 +349,22 @@ public:
         }
     }
 
+    /// ufc3 (UFC-89, upstream #5240): the images starting exactly at cpu_addr. Every image is
+    /// registered in all of its pages, so they are all in the first page's list.
+    template <typename Func>
+    void ForEachImageWithAddress(VAddr cpu_addr, Func&& func) {
+        const auto it = page_table.find(cpu_addr >> Traits::PageBits);
+        if (it == nullptr) {
+            return;
+        }
+        for (const ImageId image_id : *it) {
+            Image& image = slot_images[image_id];
+            if (image.info.guest_address == cpu_addr && !(image.flags & ImageFlagBits::Picked)) {
+                func(image_id, image);
+            }
+        }
+    }
+
 private:
     /// Iterate over all page indices in a range
     template <typename Func>

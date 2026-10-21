@@ -9,6 +9,7 @@
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
+#include "bbport_backports.h"
 #include "bbport_free_check.h"
 #include "bbport_clobber.h"
 #include "common/assert.h"
@@ -1293,7 +1294,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+    const auto collect = [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
         }
@@ -1301,7 +1302,15 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
             return;
         }
         image_ids.push_back(image_id);
-    });
+    };
+    // ufc3 (UFC-89, upstream #5240): only images starting at the address are accepted, and they
+    // are all in its first page; walking every page of a large range cost tens of microseconds
+    // per call. BB_BP5240=0 walks the whole range as before.
+    if (BbBackport::On(BbBackport::ImageRange5240)) {
+        ForEachImageWithAddress(address, collect);
+    } else {
+        ForEachImageInRegion(address, size, collect);
+    }
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
