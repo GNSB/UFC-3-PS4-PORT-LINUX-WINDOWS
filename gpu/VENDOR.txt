@@ -111,3 +111,6 @@ line at start-up; shader-changing ones are bits 21..23 of the shader binary vers
     mapped part is bound (vkCmdBindIndexBuffer2 with its size where VK_KHR_maintenance5 is), a
     16-byte zero buffer when nothing is; adapted as in CTR (no max_index_size here) (#5358,
     #5327, BB_BP5358, on).
+  1a0f5be8 (nikmparis217-ux) S# with undefined fields (anisotropy > 16x, filter mode, mip filter,
+    custom border with no table): as in CTR they are clamped to the nearest defined value rather
+    than replaced by a default sampler (#5137, BB_BP5137, on).

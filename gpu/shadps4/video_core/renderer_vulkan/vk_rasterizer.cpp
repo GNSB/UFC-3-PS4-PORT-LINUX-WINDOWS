@@ -3658,6 +3658,36 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, const PreparedStage* pr
         const auto& sampler = stage.samplers[sampler_index];
         auto ssharp =
             prepared ? prepared->sampler_sharps[sampler_index] : sampler.GetSharp(stage);
+        // ufc3 (UFC-89, after upstream #5137, as in CTR): undefined field values (a garbage S#
+        // from a reused command buffer) are clamped to the nearest defined one, and a custom
+        // border colour with no border colour table becomes transparent black, so no Vulkan
+        // sampler is made from values the hardware lacks. BB_BP5137=0 passes them through.
+        if (BbBackport::On(BbBackport::SamplerClamp5137) &&
+            (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                 Regs().ta_bc_base.Address() == 0))) {
+            static std::atomic<u32> clamped{0};
+            if (clamped.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::printf("Backports: S# with undefined fields (aniso %u, filter mode %u, mip "
+                            "filter %u, border %u) clamped (#5137)\n",
+                            static_cast<u32>(ssharp.max_aniso.Value()),
+                            static_cast<u32>(ssharp.filter_mode.Value()),
+                            static_cast<u32>(ssharp.mip_filter.Value()),
+                            static_cast<u32>(ssharp.border_color_type.Value()));
+            }
+            if (ssharp.max_aniso.Value() > AmdGpu::AnisoRatio::Sixteen) {
+                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::Sixteen);
+            }
+            if (ssharp.filter_mode.Value() > AmdGpu::FilterMode::Max) {
+                ssharp.filter_mode.Assign(AmdGpu::FilterMode{});
+            }
+            if (ssharp.mip_filter.Value() > AmdGpu::MipFilter::Linear) {
+                ssharp.mip_filter.Assign(AmdGpu::MipFilter::Linear);
+            }
+            if (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                Regs().ta_bc_base.Address() == 0) {
+                ssharp.border_color_type.Assign(AmdGpu::BorderColor{});
+            }
+        }
         ForceAnisotropy(ssharp, sampler.is_depth);
         const auto vk_sampler = texture_cache.GetSampler(
             ssharp, Regs().ta_bc_base, sampler.is_depth, sampler.is_depth ? 0.0f : sampler_lod_bias);
