@@ -454,9 +454,14 @@ private:
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
-        bool is_written;
+        vk::AccessFlags2 src_access; ///< ufc3 (UFC-89, upstream #5262): was is_written
     };
-    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    /// ufc3 (UFC-89, upstream #5262): also vertex, index and indirect buffers, hence a vector.
+    std::vector<BoundBuffer> bound_buffers;
+    /// ufc3 (UFC-89, upstream #5262): a vertex, index or indirect buffer read by this draw or
+    /// dispatch, so a later write to it waits (BB_BP5262=0: not tracked, as before).
+    void NoteInputBuffer(const VideoCore::Buffer* buffer, u64 offset, u64 size,
+                         vk::AccessFlags2 access);
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
