@@ -4,6 +4,10 @@
 #pragma once
 
 #include <memory>
+#include <future>
+#include <functional>
+#include <deque>
+#include <filesystem>
 #include <unordered_map>
 #include <shared_mutex>
 #include <variant>
@@ -119,7 +123,11 @@ struct PreparedDraw;
 
 class PipelineCompiler;
 
+/// Window-close checkpoint: the native host terminates without C++ destructors.
+void SaveDriverPipelineCaches();
+
 class PipelineCache {
+    friend void SaveDriverPipelineCaches();
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
@@ -175,6 +183,13 @@ public:
     }
 
 private:
+    void StartWarmup();
+    void CreateDriverCache();
+    void SaveDriverCache();
+    void SubmitWarmup(std::function<std::unique_ptr<Pipeline>()> build,
+                      const GraphicsPipelineKey& graphics, const ComputePipelineKey& compute,
+                      bool is_compute);
+    void PumpWarmup(bool wait = false);
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
@@ -212,6 +227,19 @@ private:
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    std::mutex driver_save_mutex;
+    std::filesystem::path driver_cache_path;
+    u64 warmup_loaded = 0, warmup_failed = 0;
+    struct WarmupJob {
+        GraphicsPipelineKey graphics{};
+        ComputePipelineKey compute{};
+        bool is_compute = false;
+        std::array<const Shader::Info*, MaxShaderStages> originals{};
+        std::future<std::unique_ptr<Pipeline>> result;
+    };
+    std::deque<WarmupJob> warmup_jobs;
+    std::unique_ptr<PipelineCompiler> warmup_compiler;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

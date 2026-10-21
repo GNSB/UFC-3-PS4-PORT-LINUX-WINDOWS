@@ -185,14 +185,17 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         return false;
     }
 
-    // bbport: built before it is inserted: a pipeline the driver rejects while preloading throws
-    // (Serialization::CorruptData) and leaves no empty entry behind.
-    auto pipeline =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *sel.infos[0], sel.modules[0], sdata, true);
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
-    ASSERT(is_new);
-    it.value() = std::move(pipeline);
+    if (warmup_compiler) {
+        auto info = std::make_shared<Shader::Info>(*sel.infos[0]);
+        SubmitWarmup([this, key = compute_key, info, module = sel.modules[0], sdata]() mutable {
+            return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                *pipeline_cache, key, *info, module, sdata, true);
+        }, {}, compute_key, true);
+    } else if (!compute_pipelines.contains(compute_key)) {
+        auto pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+            *pipeline_cache, compute_key, *sel.infos[0], sel.modules[0], sdata, true);
+        compute_pipelines.emplace(compute_key, std::move(pipeline));
+    }
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -262,12 +265,28 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         }
     }
 
-    auto pipeline = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
-    const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
-    ASSERT(is_new);
-    it.value() = std::move(pipeline);
+    if (warmup_compiler) {
+        auto snapshots = std::make_shared<std::array<std::optional<Shader::Info>, MaxShaderStages>>();
+        for (size_t i = 0; i < MaxShaderStages; ++i) {
+            if (sel.infos[i]) {
+                (*snapshots)[i] = *sel.infos[i];
+            }
+        }
+        SubmitWarmup([this, key = sel.graphics_key, snapshots, runtime = sel.runtime_infos,
+                      fetch = sel.fetch_shader, modules = sel.modules, sdata]() mutable {
+            std::array<const Shader::Info*, MaxShaderStages> infos{};
+            for (size_t i = 0; i < MaxShaderStages; ++i) {
+                infos[i] = (*snapshots)[i] ? &*(*snapshots)[i] : nullptr;
+            }
+            return std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile,
+                key, *pipeline_cache, infos, runtime, fetch, modules, sdata, true);
+        }, sel.graphics_key, {}, false);
+    } else if (!graphics_pipelines.contains(sel.graphics_key)) {
+        auto pipeline = std::make_unique<GraphicsPipeline>(instance, scheduler, desc_heap, profile,
+            sel.graphics_key, *pipeline_cache, sel.infos, sel.runtime_infos, sel.fetch_shader,
+            sel.modules, sdata, true);
+        graphics_pipelines.emplace(sel.graphics_key, std::move(pipeline));
+    }
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -315,7 +334,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
-        module = compile();
+        try {
+            module = compile();
+        } catch (...) {
+            program_cache.erase(it_pgm); // never leave a null program after driver rejection
+            throw;
+        }
         it_pgm.value() = std::move(program);
     } else {
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
@@ -336,6 +360,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             module = compile();
         }
     }
+    sel.runtime_infos[stage] = spec.runtime_info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 
     sel.infos[stage] = &it_pgm.value()->info;
@@ -385,6 +410,7 @@ void PipelineCache::WarmUp() {
         return;
     }
 
+    StartWarmup();
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     u32 num_damaged{};
@@ -392,6 +418,10 @@ void PipelineCache::WarmUp() {
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            sel.infos.fill(nullptr);
+            sel.modules.fill(nullptr);
+            sel.runtime_infos.fill({});
+            sel.fetch_shader.reset();
             // bbport: a damaged entry (cut short by a crash or a power loss, or rejected by the
             // driver) used to stop the game at every start until the cache was deleted by hand
             // (issues #28, #38, #39). It is counted here and the cache is rebuilt below.
@@ -429,6 +459,8 @@ void PipelineCache::WarmUp() {
         });
 
     if (num_damaged) {
+        // Finish builds before destroying any program/module they reference.
+        PumpWarmup(true);
         // Nothing preloaded is trusted: modules of a damaged entry may sit in programs that later
         // lookups would reuse. Start as with no cache and write a fresh one.
         LOG_WARNING(Render, "Pipeline cache: {} damaged entries, rebuilding it", num_damaged);
@@ -458,7 +490,11 @@ void PipelineCache::WarmUp() {
         return;
     }
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (!EmulatorSettings.IsBackgroundWarmupEnabled()) {
+        PumpWarmup(true);
+    }
+    LOG_INFO(Render, "Preloaded/queued {} pipelines ({} background builds pending)",
+             num_pipelines, warmup_jobs.size());
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
@@ -468,6 +504,8 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    PumpWarmup(true);
+    SaveDriverCache();
     Storage::DataBase::Instance().Close();
 }
 

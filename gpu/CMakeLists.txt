@@ -361,3 +361,8 @@ add_executable(copy-bounds-test EXCLUDE_FROM_ALL ../tests/test_copy_bounds.cpp)
 target_compile_options(copy-bounds-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-missing-field-initializers)
 target_include_directories(copy-bounds-test PRIVATE shadps4)
 target_link_libraries(copy-bounds-test PRIVATE Vulkan::Headers)
+
+# UFC-90: reject corrupt/incompatible driver blobs without loading Vulkan or the game.
+add_executable(driver-cache-blob-test EXCLUDE_FROM_ALL ../tests/test_driver_cache_blob.cpp)
+target_include_directories(driver-cache-blob-test PRIVATE shadps4)
+target_compile_options(driver-cache-blob-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)

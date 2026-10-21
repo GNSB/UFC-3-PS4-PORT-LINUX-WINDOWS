@@ -26,6 +26,7 @@ class Scheduler;
 class DescriptorHeap;
 
 class Pipeline {
+    friend class PipelineCache; // publish warmup with the live program references
 public:
     Pipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
              const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
