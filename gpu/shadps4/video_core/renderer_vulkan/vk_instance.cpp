@@ -456,6 +456,15 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    if (IsIntelDriver()) {
+        std::printf("GPU: Intel device vendor=0x%04x device=0x%04x driver=%s %s; "
+                    "subgroup default/min/max=%u/%u/%u, size control %s, required stages %s\n",
+                    properties.vendorID, properties.deviceID, vk::to_string(driver_id).c_str(),
+                    GetDriverVersionName().c_str(), vk11_props.subgroupSize,
+                    vk13_props.minSubgroupSize, vk13_props.maxSubgroupSize,
+                    vk13_features.subgroupSizeControl ? "on" : "off",
+                    vk::to_string(vk13_props.requiredSubgroupSizeStages).c_str());
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,

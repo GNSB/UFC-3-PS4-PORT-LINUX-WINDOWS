@@ -34,6 +34,19 @@ void EmitBarrier(EmitContext& ctx) {
 }
 
 void EmitWorkgroupMemoryBarrier(EmitContext& ctx) {
+    if (ctx.profile.lds_divergent_barriers) {
+        // ufc4 (Intel, mancelli's 8034718c): keeps GCN's lockstep LDS steps in order inside a
+        // subgroup (SharedMemoryBarrierPass puts these between LDS writes and reads in divergent
+        // code). A memory barrier only orders one invocation's accesses; Intel may run a
+        // 32-wide subgroup as two SIMD16 passes, so the lanes are synchronized with a
+        // subgroup-scope control barrier, shared memory semantics only.
+        const auto semantics{spv::MemorySemanticsMask::AcquireRelease |
+                             spv::MemorySemanticsMask::WorkgroupMemory};
+        ctx.OpControlBarrier(ctx.ConstU32(static_cast<u32>(spv::Scope::Subgroup)),
+                             ctx.ConstU32(static_cast<u32>(spv::Scope::Workgroup)),
+                             ctx.ConstU32(static_cast<u32>(semantics)));
+        return;
+    }
     MemoryBarrier(ctx, spv::Scope::Workgroup);
 }
 

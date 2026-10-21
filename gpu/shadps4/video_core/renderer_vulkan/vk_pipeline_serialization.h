@@ -17,5 +17,8 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+/// UFC-88: Intel profile/subgroup bits (0..4), stored in binary version bits 16..20.
+/// Variant zero preserves the existing version; UFC-68's loop guard owns bit 31.
+void SetShaderBinaryVariant(u32 variant);
 
 } // namespace Vulkan

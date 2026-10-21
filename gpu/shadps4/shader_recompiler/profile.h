@@ -50,6 +50,13 @@ struct Profile {
     /// bbport: NVIDIA without fragment shader barycentrics (Pascal and older).
     bool needs_integer_interpolation_fix{};
     bool needs_lds_barriers{};
+    /// ufc4 (mancelli's 8034718c, Intel Arc; vk_pipeline_cache.cpp sets them): NaN in float
+    /// colour exports and float storage image writes becomes 0 (blur chains spread one into black
+    /// squares); compute workgroups declared 1D with the 3D local id rebuilt from the flat index
+    /// (GCN's wave packing); LDS barriers inside divergent control flow (lockstep LDS code).
+    bool sanitize_nan_outputs{};
+    bool flatten_compute_workgroups{};
+    bool lds_divergent_barriers{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};

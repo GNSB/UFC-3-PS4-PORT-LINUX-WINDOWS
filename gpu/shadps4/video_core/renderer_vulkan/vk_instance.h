@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <span>
 #include <unordered_map>
 
@@ -264,6 +265,45 @@ public:
     /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported() const {
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+    }
+
+    /// ufc4 (mancelli's 8034718c): the subgroup size a shader stage requires, 0 = the driver's
+    /// choice. 64 where the GPU has it (as before); on Intel without wave64, 32 where the driver
+    /// could otherwise pick a smaller one (SIMD8/16/32 per shader), because wave64 lowering and
+    /// the LDS barriers assume 32-wide subgroups. BB_SUBGROUP32=0 turns the second case off.
+    u32 RequiredSubgroupSize(vk::ShaderStageFlagBits stage) const {
+        if (IsSubgroupSize64Supported()) {
+            return 64;
+        }
+        if (IntelWorkaroundEnabled("BB_SUBGROUP32") && vk13_features.subgroupSizeControl &&
+            vk13_props.maxSubgroupSize == 32 &&
+            vk13_props.minSubgroupSize < 32 && vk11_props.subgroupSize == 32 &&
+            (vk13_props.requiredSubgroupSizeStages & stage)) {
+            return 32;
+        }
+        return 0;
+    }
+
+    /// ufc4: Intel's Windows driver or Mesa's ANV (the Intel Arc workarounds).
+    bool IsIntelDriver() const {
+        return driver_id == vk::DriverId::eIntelProprietaryWindows ||
+               driver_id == vk::DriverId::eIntelOpenSourceMESA;
+    }
+
+    /// UFC-88: overrides only affect Intel's Windows driver and Mesa ANV. Individual switches
+    /// take precedence over BB_INTEL_FIXES, as in PORTHEON d7b35aa.
+    bool IntelWorkaroundEnabled(const char* name) const {
+        if (!IsIntelDriver()) {
+            return false;
+        }
+        bool on = true;
+        if (const char* all = std::getenv("BB_INTEL_FIXES"); all && all[0]) {
+            on = all[0] == '1';
+        }
+        if (const char* one = std::getenv(name); one && one[0]) {
+            on = one[0] == '1';
+        }
+        return on;
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.

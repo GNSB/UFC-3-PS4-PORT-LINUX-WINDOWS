@@ -496,10 +496,17 @@ void EmitContext::DefineInputs() {
                 DefineVariable(U32[3], spv::BuiltIn::NumWorkgroups, spv::StorageClass::Input);
         }
         if (info.loads.GetAny(IR::Attribute::LocalInvocationId)) {
-            local_invocation_id =
-                DefineVariable(U32[3], spv::BuiltIn::LocalInvocationId, spv::StorageClass::Input);
+            if (profile.flatten_compute_workgroups) {
+                // ufc4 (Intel): the 3D id is rebuilt from the flat index (1D workgroups).
+                local_invocation_index = DefineVariable(U32[1], spv::BuiltIn::LocalInvocationIndex,
+                                                        spv::StorageClass::Input);
+            } else {
+                local_invocation_id = DefineVariable(U32[3], spv::BuiltIn::LocalInvocationId,
+                                                     spv::StorageClass::Input);
+            }
         }
-        if (info.loads.Get(IR::Attribute::LocalInvocationIndex)) {
+        if (info.loads.Get(IR::Attribute::LocalInvocationIndex) &&
+            !Sirit::ValidId(local_invocation_index)) {
             local_invocation_index = DefineVariable(U32[1], spv::BuiltIn::LocalInvocationIndex,
                                                     spv::StorageClass::Input);
         }
