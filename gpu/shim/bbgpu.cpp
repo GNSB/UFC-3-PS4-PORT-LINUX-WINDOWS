@@ -293,6 +293,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         while (window->PollEvents()) {
             SDL_Delay(2);
         }
+        Vulkan::SaveDriverPipelineCaches();
         // ufc3 (UFC-47): printed whatever the log level, so that "exited with code 0" in a
         // log reads as a closed window (the X, Alt+F4, the menu's Quit), not a crash.
         std::fflush(stdout);

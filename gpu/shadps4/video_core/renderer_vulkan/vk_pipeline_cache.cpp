@@ -15,6 +15,9 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -30,6 +33,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/renderer_vulkan/vk_driver_cache_blob.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -345,6 +349,200 @@ private:
     bool stop = false;
 };
 
+// UFC-90: independent of the shader store, whose keys and versions stay unchanged.
+namespace {
+std::mutex driver_caches_mutex;
+std::vector<PipelineCache*> driver_caches;
+void CacheInfo(const std::string& message) {
+    std::printf("GPU: %s\n", message.c_str());
+}
+} // namespace
+
+void SaveDriverPipelineCaches() {
+    std::scoped_lock lock{driver_caches_mutex};
+    for (auto* cache : driver_caches) {
+        cache->SaveDriverCache();
+    }
+}
+
+void PipelineCache::CreateDriverCache() {
+    using namespace Common::FS;
+    std::vector<u8> data;
+    if (EmulatorSettings.IsDriverPipelineCacheEnabled()) {
+        try {
+            std::string uuid;
+            for (u8 b : instance.GetPipelineCacheUUID()) {
+                uuid += fmt::format("{:02x}", b);
+            }
+            driver_cache_path = GetUserPath(PathType::CacheDir) / "driver_pipeline_cache" /
+                fmt::format("{:04x}-{:04x}-{:08x}-{}.bin", instance.GetVendorID(),
+                            instance.GetDeviceID(), instance.GetDriverVersion(), uuid);
+            std::filesystem::create_directories(driver_cache_path.parent_path());
+            const IOFile file{driver_cache_path, FileAccessMode::Read};
+            std::string reason;
+            if (!file.IsOpen()) {
+                CacheInfo(fmt::format("Driver pipeline cache: no blob at {}", driver_cache_path.string()));
+            } else {
+                const u64 size = file.GetSize();
+                if (size < 16 + 32 || size > DriverCacheBlob::MaxBytes + 16) {
+                    reason = "invalid file size";
+                } else {
+                    u64 magic{}, checksum{};
+                    if (!file.Read(magic) || !file.Read(checksum)) {
+                        reason = "truncated envelope";
+                    } else {
+                        data.resize(size - 16);
+                        if (file.Read(data) != data.size()) {
+                            reason = "truncated blob";
+                        } else {
+                            const auto uuid = instance.GetPipelineCacheUUID();
+                            reason = DriverCacheBlob::Validate(magic, checksum, data,
+                                instance.GetVendorID(), instance.GetDeviceID(),
+                                std::span<const u8, 16>{uuid.data(), 16});
+                        }
+                    }
+                }
+                if (!reason.empty()) {
+                    data.clear();
+                    LOG_WARNING(Render_Vulkan, "Driver pipeline cache: discarded {}: {}",
+                                driver_cache_path.string(), reason);
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_WARNING(Render_Vulkan, "Driver pipeline cache: cannot load: {}", e.what());
+            data.clear();
+            driver_cache_path.clear(); // persistence unavailable; rendering still works
+        }
+    } else {
+        CacheInfo(fmt::format("Driver pipeline cache: disabled (BB_DRIVER_PIPELINE_CACHE=1 to enable)"));
+    }
+    auto [result, cache] = instance.GetDevice().createPipelineCacheUnique(
+        {.initialDataSize = data.size(), .pInitialData = data.empty() ? nullptr : data.data()});
+    if (result != vk::Result::eSuccess && !data.empty()) {
+        LOG_WARNING(Render_Vulkan, "Driver pipeline cache: discarded, driver rejected blob: {}", vk::to_string(result));
+        data.clear();
+        auto retry = instance.GetDevice().createPipelineCacheUnique({});
+        result = retry.result;
+        cache = std::move(retry.value);
+    }
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create empty pipeline cache: {}", vk::to_string(result));
+    pipeline_cache = std::move(cache);
+    if (!data.empty()) {
+        CacheInfo(fmt::format("Driver pipeline cache: loaded {} bytes from {}", data.size(), driver_cache_path.string()));
+    } else if (!driver_cache_path.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(driver_cache_path, ec);
+    }
+    if (!driver_cache_path.empty()) {
+        std::scoped_lock lock{driver_caches_mutex};
+        driver_caches.push_back(this);
+    }
+}
+
+void PipelineCache::SaveDriverCache() {
+    using namespace Common::FS;
+    std::scoped_lock lock{driver_save_mutex};
+    if (driver_cache_path.empty() || !pipeline_cache) {
+        return;
+    }
+    auto temp = driver_cache_path;
+    temp += ".tmp";
+    try {
+        // No EXTERNALLY_SYNCHRONIZED flag: Vulkan synchronizes cache access internally,
+        // including concurrent pipeline creation. INCOMPLETE is retried on the next save.
+        const auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+        if (result != vk::Result::eSuccess || data.size() > DriverCacheBlob::MaxBytes) {
+            LOG_WARNING(Render_Vulkan, "Driver pipeline cache: snapshot unavailable ({})", vk::to_string(result));
+            return;
+        }
+        bool written;
+        {
+            const IOFile file{temp, FileAccessMode::Create};
+            written = file.IsOpen() && file.Write(DriverCacheBlob::Magic) == 1 &&
+                      file.Write(DriverCacheBlob::Checksum(data)) == 1 && file.Write(data) == data.size() && file.Flush();
+        }
+        std::error_code ec;
+        if (written) {
+#ifdef _WIN32
+            // std::filesystem::rename does not replace an existing target on Windows.
+            if (!MoveFileExW(temp.c_str(), driver_cache_path.c_str(),
+                             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                ec = std::error_code(GetLastError(), std::system_category());
+            }
+#else
+            std::filesystem::rename(temp, driver_cache_path, ec);
+#endif
+        }
+        if (!written || ec) {
+            LOG_WARNING(Render_Vulkan, "Driver pipeline cache: save failed: {}", ec.message());
+            std::filesystem::remove(temp, ec);
+        } else {
+            CacheInfo(fmt::format("Driver pipeline cache: saved {} bytes to {}", data.size(), driver_cache_path.string()));
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "Driver pipeline cache: save failed: {}", e.what());
+        std::error_code ec;
+        std::filesystem::remove(temp, ec);
+    }
+}
+
+// Adapted from GPL SpartanPort's parallel warmup: serial stage loading, worker builds,
+// GPU-thread publication. Each build owns Info snapshots so runtime user data cannot race it.
+void PipelineCache::StartWarmup() {
+    if (!EmulatorSettings.IsBackgroundWarmupEnabled() && !EmulatorSettings.IsParallelWarmupEnabled()) {
+        return;
+    }
+    const u32 threads = EmulatorSettings.IsParallelWarmupEnabled()
+        ? std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u) : 1u;
+    warmup_compiler = std::make_unique<PipelineCompiler>(threads);
+    CacheInfo(fmt::format("Pipeline warmup: {} worker(s), {} (stage loading remains synchronous)",
+             threads, EmulatorSettings.IsBackgroundWarmupEnabled() ? "background" : "wait at startup"));
+}
+
+void PipelineCache::SubmitWarmup(std::function<std::unique_ptr<Pipeline>()> build,
+                                const GraphicsPipelineKey& graphics,
+                                const ComputePipelineKey& compute, bool is_compute) {
+    auto task = std::make_shared<std::packaged_task<std::unique_ptr<Pipeline>()>>(std::move(build));
+    warmup_jobs.push_back({graphics, compute, is_compute, sel.infos, task->get_future()});
+    warmup_compiler->Submit([task] { (*task)(); });
+}
+
+void PipelineCache::PumpWarmup(bool wait) {
+    size_t published = 0;
+    for (auto it = warmup_jobs.begin(); it != warmup_jobs.end() && (wait || published < 8);) {
+        if (!wait && it->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            break; // FIFO, bounded work per draw; never scan the entire pending cache
+        }
+        ++published;
+        try {
+            auto pipeline = it->result.get();
+            if (it->is_compute) {
+                pipeline->stages[u32(Shader::SwStage::Compute)] = it->originals[0];
+                if (!compute_pipelines.contains(it->compute)) {
+                    compute_pipelines.emplace(it->compute, std::unique_ptr<ComputePipeline>(
+                        static_cast<ComputePipeline*>(pipeline.release())));
+                    ++warmup_loaded;
+                }
+            } else {
+                std::copy(it->originals.begin(), it->originals.end(), pipeline->stages.begin());
+                if (!graphics_pipelines.contains(it->graphics)) {
+                    graphics_pipelines.emplace(it->graphics, std::unique_ptr<GraphicsPipeline>(
+                        static_cast<GraphicsPipeline*>(pipeline.release())));
+                    ++warmup_loaded;
+                }
+            }
+        } catch (const std::exception& e) {
+            ++warmup_failed;
+            LOG_WARNING(Render_Vulkan, "Warmup pipeline rejected; compile on demand: {}", e.what());
+        }
+        it = warmup_jobs.erase(it);
+    }
+    if (warmup_jobs.empty() && warmup_compiler) {
+        warmup_compiler.reset();
+        CacheInfo(fmt::format("Warmup completed: {} published, {} rejected", warmup_loaded, warmup_failed));
+    }
+}
+
 // UFC-88: PORTHEON d7b35aa / mancelli 8034718c. Keep these shader workarounds
 // confined to Intel's Windows driver and Mesa ANV (including explicit env overrides).
 // sacredfire: defined after PipelineCompiler, which the unique_ptr member needs complete here (libc++).
@@ -457,12 +655,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // ufc3 (UFC-89): the backports that change generated shaders are part of the binary version.
     BbBackport::LogOnce();
     SetShaderBackportBits(BbBackport::ShaderBits());
+    CreateDriverCache();
     WarmUp();
-
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
 }
 
 struct PipelineCache::PendingPipeline {
@@ -474,11 +668,20 @@ struct PipelineCache::PendingPipeline {
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
 };
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    compiler.reset();
+    warmup_compiler.reset();
+    PumpWarmup(true);
+    // Serialize against the window-close checkpoint before destroying the Vulkan cache.
+    std::scoped_lock lock{driver_caches_mutex};
+    SaveDriverCache();
+    std::erase(driver_caches, this);
+}
 
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
+std::atomic<u32> g_bb_hot_pipelines;
 namespace {
 struct CompileTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -711,6 +914,7 @@ void TraceAlphaToMaskDraw(const PipelineSelection& sel, const char* mode) {
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
                                                            bool indirect) {
+    PumpWarmup();
     used_prepared = nullptr;
     NoteDrawTarget(liverpool->regs);
     if (prepared && !TracingAlphaToMask()) {
@@ -763,6 +967,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         job->modules = sel.modules;
         pending_graphics.emplace(sel.graphics_key, job);
         ++async_started;
+        ++g_bb_hot_pipelines;
         ++g_bb_compiles;
         compiler->Submit([this, job, key = sel.graphics_key, infos = sel.infos,
                           runtime_infos = sel.runtime_infos, fetch = sel.fetch_shader,
@@ -784,6 +989,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(sel.graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        ++g_bb_hot_pipelines;
         CompileTimer timer;
 
         GraphicsPipeline::SerializationSupport sdata{};
@@ -881,6 +1087,7 @@ bool PipelineCache::AsyncSkippable(const PipelineSelection& selection, bool indi
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    PumpWarmup();
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -888,6 +1095,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        ++g_bb_hot_pipelines;
         CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};

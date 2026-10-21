@@ -62,6 +62,9 @@ public:
     bool IsPatchShaders() { static const auto value = Flag("BB_PATCH_SHADERS", true); return value; } // ufc3: patches/shaders
     bool IsPipelineCacheArchived() { return false; }
     bool IsPipelineCacheEnabled() { static const auto value = Flag("BB_PIPELINE_CACHE", true); return value; }
+    bool IsDriverPipelineCacheEnabled() { static const auto value = Flag("BB_DRIVER_PIPELINE_CACHE", false); return value; }
+    bool IsBackgroundWarmupEnabled() { static const auto value = Flag("BB_BACKGROUND_WARMUP", false); return value; }
+    bool IsParallelWarmupEnabled() { static const auto value = Flag("BB_PARALLEL_WARMUP", false); return value; }
     bool IsRcasEnabled() { static const auto value = Flag("BB_RCAS", true); return value; }
     bool IsReadbackLinearImagesEnabled() { static const auto value = Flag("BB_READBACK_LINEAR", false); return value; }
     bool IsRenderdocEnabled() { return false; }
