@@ -12,4 +12,4 @@ from legacy_plan_p3 import PART3
 def get_plan():
     """Returns the decompressed compatibility plan dictionary."""
     combined = PART1 + PART2 + PART3
-    return json.loads(lzma.decompress(base64.b64decode(combined.encode('ascii'))))
+    return json.loads(lzma.decompress(base64.b64decode(combined.encode("ascii"))))
