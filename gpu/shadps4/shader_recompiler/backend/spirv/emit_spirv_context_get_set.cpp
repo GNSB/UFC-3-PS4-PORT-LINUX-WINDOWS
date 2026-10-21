@@ -230,6 +230,20 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     case IR::Attribute::WorkgroupId:
         return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.workgroup_id), comp);
     case IR::Attribute::LocalInvocationId:
+        if (ctx.profile.flatten_compute_workgroups) {
+            // ufc4 (Intel): the 3D id of a flattened (1D) workgroup, in GCN's order.
+            const auto& size = ctx.runtime_info.hw.cs.workgroup_size;
+            const Id index = ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index);
+            switch (comp) {
+            case 0:
+                return ctx.OpUMod(ctx.U32[1], index, ctx.ConstU32(size[0]));
+            case 1:
+                return ctx.OpUMod(ctx.U32[1], ctx.OpUDiv(ctx.U32[1], index, ctx.ConstU32(size[0])),
+                                  ctx.ConstU32(size[1]));
+            default:
+                return ctx.OpUDiv(ctx.U32[1], index, ctx.ConstU32(size[0] * size[1]));
+            }
+        }
         return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id),
                                       comp);
     case IR::Attribute::LocalInvocationIndex:
@@ -306,6 +320,11 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         if (element < 3 && ctx.runtime_info.hw.fs.color_buffers[index].blend_self_scale) {
             // Emulates GCN's factor-scaled min/max blend: min/max(src*src, dst*dst).
             value = ctx.OpFMul(ctx.F32[1], value, value);
+        }
+        if (ctx.profile.sanitize_nan_outputs && !info.is_integer) {
+            // ufc4 (Intel): a stray NaN stops here, before blur/downsample chains spread it.
+            value =
+                ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1[1], value), ctx.f32_zero_value, value);
         }
         if (info.num_components == 1) {
             return op_store(info.id);

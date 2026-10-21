@@ -17,13 +17,20 @@ namespace Serialization {
 static constexpr u32 ShaderBinaryVersion = 12u; // ufc3: loop guard, PORTHEON 44edf33 (11: DB_ALPHA_TO_MASK discard; 10: UFC-4 recompiler backports, NaN handling; 9: subgroup fences around LDS stores; 8: sacredfire GS ring slot fold, 1D images as 2D)
 static constexpr u32 ShaderMetaVersion = 10u; // ufc3: HwFragmentRuntimeInfo::alpha_to_mask (9: RuntimeInfo::Properties bit-packed with dx10_clamp, #5257)
 static constexpr u32 PipelineKeyVersion = 7u; // ufc3: alpha_to_coverage bit (6: sacredfire GS permutations re-indexed)
-// The loop guard changes the SPIR-V; BB_SHADER_LOOP_GUARD=0 keeps its shaders apart in the cache.
+// Intel profile bits occupy 16..20; bit 31 remains owned by UFC-68's loop guard.
+// Variant zero keeps NVIDIA/AMD's existing version and cached binaries unchanged.
+static u32 shader_binary_variant = 0;
 static u32 ShaderBinaryVersionInUse() {
-    return ShaderBinaryVersion | (Shader::Backend::SPIRV::LoopGuardEnabled() ? 0u : 0x80000000u);
+    return ShaderBinaryVersion | (shader_binary_variant << 16) |
+           (Shader::Backend::SPIRV::LoopGuardEnabled() ? 0u : 0x80000000u);
 }
 } // namespace Serialization
 
 namespace Vulkan {
+
+void SetShaderBinaryVariant(u32 variant) {
+    Serialization::shader_binary_variant = variant & 0x1fu;
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {

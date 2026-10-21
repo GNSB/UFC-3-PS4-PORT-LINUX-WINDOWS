@@ -340,6 +340,8 @@ private:
     bool stop = false;
 };
 
+// UFC-88: PORTHEON d7b35aa / mancelli 8034718c. Keep these shader workarounds
+// confined to Intel's Windows driver and Mesa ANV (including explicit env overrides).
 // sacredfire: defined after PipelineCompiler, which the unique_ptr member needs complete here (libc++).
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
@@ -403,12 +405,49 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
         }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp ||
+                              instance.IntelWorkaroundEnabled("BB_INTEL_LDS_BARRIERS"),
+        .sanitize_nan_outputs = instance.IntelWorkaroundEnabled("BB_NAN_GUARD"),
+        .flatten_compute_workgroups = instance.IntelWorkaroundEnabled("BB_FLATTEN_WG"),
+        .lds_divergent_barriers = instance.IntelWorkaroundEnabled("BB_LDS_DIVERGENT"),
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    {
+        const bool intel_lds = profile.needs_lds_barriers &&
+                               instance.GetDriverID() != vk::DriverId::eNvidiaProprietary &&
+                               instance.GetDriverID() != vk::DriverId::eMesaKosmickrisp;
+        const std::array required_subgroup_sizes{
+            instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eVertex),
+            instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eTessellationControl),
+            instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eTessellationEvaluation),
+            instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eGeometry),
+            instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eFragment),
+            instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eCompute),
+        };
+        const bool subgroup32 = instance.IsIntelDriver() &&
+                                std::ranges::find(required_subgroup_sizes, 32u) !=
+                                    required_subgroup_sizes.end();
+        const u32 variant = (profile.sanitize_nan_outputs ? 1u : 0u) |
+                            (profile.flatten_compute_workgroups ? 2u : 0u) |
+                            (profile.lds_divergent_barriers ? 4u : 0u) | (intel_lds ? 8u : 0u) |
+                            (subgroup32 ? 16u : 0u);
+        SetShaderBinaryVariant(variant);
+        if (variant || instance.IsIntelDriver()) {
+            std::printf("GPU: Intel workarounds: NaN guard %s, 1D compute workgroups %s, LDS "
+                        "barriers %s/%s; required subgroup VS/TCS/TES/GS/FS/CS=%u/%u/%u/%u/%u/%u "
+                        "(0=driver choice), shader variant 0x%02x; "
+                        "BB_INTEL_FIXES=0 disables defaults, per-fix overrides take precedence\n",
+                        profile.sanitize_nan_outputs ? "on" : "off",
+                        profile.flatten_compute_workgroups ? "on" : "off",
+                        intel_lds ? "on" : "off", profile.lds_divergent_barriers ? "on" : "off",
+                        required_subgroup_sizes[0], required_subgroup_sizes[1],
+                        required_subgroup_sizes[2], required_subgroup_sizes[3],
+                        required_subgroup_sizes[4], required_subgroup_sizes[5], variant);
+        }
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
