@@ -128,6 +128,11 @@ public:
     template <bool track>
     void UpdatePageWatchers(VAddr addr, u64 size) const;
 
+    /// ufc3 (UFC-91, BB_DEFERRED_READBACK): pending image readbacks guard the pages touching
+    /// [addr, +size) against writes (`writes`) and reads (`reads`): +1 adds a guard, -1 drops
+    /// one, 0 leaves them. A guarded access faults into Rasterizer::ResolveReadbackFault.
+    void WatchReadback(VAddr addr, u64 size, s32 writes, s32 reads) const;
+
     /// Updates watches in the pages touching the specified region using a mask.
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;

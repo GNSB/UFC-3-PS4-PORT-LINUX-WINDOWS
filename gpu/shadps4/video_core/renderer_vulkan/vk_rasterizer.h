@@ -238,6 +238,9 @@ public:
     /// UFC-48: the GPU-modified ranges in [addr, addr + size) (BufferCache::GpuModifiedRangesIn).
     std::vector<std::pair<VAddr, VAddr>> GpuModifiedRangesIn(VAddr addr, u64 size) const;
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// ufc3 (UFC-91, BB_DEFERRED_READBACK): a fault on a page a pending image readback guards
+    /// (any thread); true when the access may run again.
+    bool ResolveReadbackFault(VAddr addr, bool write);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);

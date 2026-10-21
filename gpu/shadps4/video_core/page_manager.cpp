@@ -29,6 +29,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #ifndef _WIN32
@@ -1107,6 +1108,11 @@ struct PageManager::Impl {
         if (is_gpu_thread) {
             BbStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
         }
+        // ufc3 (UFC-91, BB_DEFERRED_READBACK): a pending image readback guards the page; once it
+        // is in guest memory the access runs again (and faults again if other watchers ask).
+        if (rasterizer->ResolveReadbackFault(addr, Common::IsWriteError(context))) {
+            return true;
+        }
         if (Common::IsWriteError(context)) {
             BbStats::Timer timer{BbStats::t_write_faults};
             const u64 rip = Common::GetFaultRegister(context, Common::FaultRegister::Rip);
@@ -1317,7 +1323,7 @@ struct PageManager::Impl {
                 // Protected first: a write after this faults (a new window), none is lost.
                 const size_t page_index = page >> PM_PAGE_BITS;
                 std::scoped_lock lk{self->locks[page_index / PAGES_PER_LOCK]};
-                self->Protect(page, PM_PAGE_SIZE, self->cached_pages[page_index].Perms());
+                self->Protect(page, PM_PAGE_SIZE, self->PagePerms(page_index));
             }
             runtime_memory_read_backing(page, after.data(), PM_PAGE_SIZE);
             // The CPU's words win over GPU bytes they touch (WindowMerge, from_window).
@@ -1513,7 +1519,7 @@ struct PageManager::Impl {
             }
             const size_t page_index = page >> PM_PAGE_BITS;
             std::scoped_lock lk{self->locks[page_index / PAGES_PER_LOCK]};
-            self->Protect(page, PM_PAGE_SIZE, self->cached_pages[page_index].Perms());
+            self->Protect(page, PM_PAGE_SIZE, self->PagePerms(page_index));
         }
         slot->count = 0;
         slot->tid.store(0, std::memory_order_release);
@@ -1532,7 +1538,7 @@ struct PageManager::Impl {
         const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
         Common::RangeLockGuard lk(lock_start, lock_end);
 
-        auto perms = cached_pages[page].Perms();
+        auto perms = PagePerms(page);
         u64 range_begin = 0;
         u64 range_bytes = 0;
         u64 potential_range_bytes = 0;
@@ -1562,7 +1568,7 @@ struct PageManager::Impl {
             // Apply the change to the page state
             const u8 new_count = state.AddDelta<track ? 1 : -1, is_read>();
 
-            if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
+            if (auto new_perms = PagePerms(page); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
                 release_pending();
                 perms = new_perms;
@@ -1603,7 +1609,7 @@ struct PageManager::Impl {
         size_t base_page = (base_addr >> PM_PAGE_BITS);
         ASSERT(base_page % PAGES_PER_LOCK == 0);
         std::scoped_lock lk(locks[base_page / PAGES_PER_LOCK]);
-        auto perms = cached_pages[base_page + start_range.first].Perms();
+        auto perms = PagePerms(base_page + start_range.first);
         u64 range_begin = 0;
         u64 range_bytes = 0;
         u64 potential_range_bytes = 0;
@@ -1627,7 +1633,7 @@ struct PageManager::Impl {
             const u8 new_count =
                 update ? state.AddDelta<track ? 1 : -1, is_read>() : state.AddDelta<0, is_read>();
 
-            if (auto new_perms = state.Perms(); new_perms != perms) [[unlikely]] {
+            if (auto new_perms = PagePerms(base_page + page); new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
                 release_pending();
                 perms = new_perms;
@@ -1656,6 +1662,81 @@ struct PageManager::Impl {
         // Add pending (un)protect action
         release_pending();
     }
+
+    /// The access a page allows: its watchers', less what pending image readbacks deny.
+    /// Called with the page's lock held.
+    Core::MemoryPermission PagePerms(size_t page) {
+        const auto perms = cached_pages[page].Perms();
+        if (readback_guard_pages.load(std::memory_order_acquire) == 0) {
+            return perms;
+        }
+        std::scoped_lock lk{readback_guards_mutex};
+        const auto it = readback_guards.find(page);
+        if (it == readback_guards.end()) {
+            return perms;
+        }
+        if (it->second.reads) {
+            return Core::MemoryPermission::None;
+        }
+        return it->second.writes ? perms & Core::MemoryPermission::Read : perms;
+    }
+
+    /// ufc3 (UFC-91, BB_DEFERRED_READBACK): changes the guards pending image readbacks keep on
+    /// the pages touching [addr, +size): `writes` against writes, `reads` against reads (each
+    /// +1 adds one, -1 drops one, 0 leaves them), and re-protects the pages that changed.
+    void WatchReadback(VAddr addr, u64 size, s32 writes, s32 reads) {
+        if (size == 0) {
+            return;
+        }
+        const size_t first = addr >> PM_PAGE_BITS;
+        const size_t end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        Common::RangeLockGuard lk(locks.begin() + (first / PAGES_PER_LOCK),
+                                  locks.begin() + Common::DivCeil(end, PAGES_PER_LOCK));
+        size_t run = first;
+        auto run_perms = Core::MemoryPermission::None;
+        bool run_changed = false;
+        const auto flush = [&](size_t to) {
+            if (run_changed && to > run) {
+                Protect(run << PM_PAGE_BITS, (to - run) << PM_PAGE_BITS, run_perms);
+            }
+        };
+        for (size_t page = first; page != end; ++page) {
+            const auto before = PagePerms(page);
+            {
+                std::scoped_lock gl{readback_guards_mutex};
+                const auto [it, inserted] = readback_guards.try_emplace(page);
+                if (inserted) {
+                    readback_guard_pages.fetch_add(1, std::memory_order_release);
+                }
+                auto& guard = it->second;
+                ASSERT_MSG(s32(guard.writes) + writes >= 0 && s32(guard.reads) + reads >= 0,
+                           "Readback guard underflow");
+                guard.writes = u16(guard.writes + writes);
+                guard.reads = u16(guard.reads + reads);
+                if (guard.writes == 0 && guard.reads == 0) {
+                    readback_guards.erase(it);
+                    readback_guard_pages.fetch_sub(1, std::memory_order_release);
+                }
+            }
+            const auto after = PagePerms(page);
+            const bool changed = after != before;
+            if (page == first || after != run_perms || changed != run_changed) {
+                flush(page);
+                run = page;
+                run_perms = after;
+                run_changed = changed;
+            }
+        }
+        flush(end);
+    }
+
+    struct ReadbackGuard {
+        u16 writes = 0;
+        u16 reads = 0;
+    };
+    std::mutex readback_guards_mutex; ///< taken after the page locks
+    std::unordered_map<size_t, ReadbackGuard> readback_guards;
+    std::atomic<u32> readback_guard_pages{0};
 
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
@@ -1799,7 +1880,7 @@ public:
             }
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
-            {
+            if (!rasterizer->ResolveReadbackFault(addr, true)) {
                 BbStats::Timer timer{BbStats::t_write_faults};
                 rasterizer->OnWriteFault(addr, rasterizer->IsGpuSideThreadId(ptid));
             }
@@ -1971,6 +2052,10 @@ void PageManager::OnGpuMap(VAddr address, size_t size) {
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+}
+
+void PageManager::WatchReadback(VAddr addr, u64 size, s32 writes, s32 reads) const {
+    impl->WatchReadback(addr, size, writes, reads);
 }
 
 template <bool track>
