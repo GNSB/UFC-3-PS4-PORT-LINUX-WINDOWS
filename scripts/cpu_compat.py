@@ -70,22 +70,31 @@ def host_lacks_features():
 
     if sys.platform == 'win32':
         try:
+            # Assembly stub for Windows x64 ABI:
+            # Arguments: RCX = leaf (eax), RDX = uint32[4] output pointer
+            # Note: CPUID clobbers EAX, EBX, ECX, EDX.
+            # RBX and RSI are non-volatile registers in Windows x64 ABI and must be preserved.
             code = bytes.fromhex(
                 '53'                  # push rbx
-                '4889d3'              # mov rbx, rdx
+                '56'                  # push rsi
+                '4889d6'              # mov rsi, rdx
                 '89c8'                # mov eax, ecx
                 '31c9'                # xor ecx, ecx
                 '0fa2'                # cpuid
-                '8903'                # mov [rbx], eax
-                '895b04'              # mov [rbx+4], ebx
-                '894b08'              # mov [rbx+8], ecx
-                '89530c'              # mov [rbx+12], edx
+                '8906'                # mov [rsi], eax
+                '895e04'              # mov [rsi+4], ebx
+                '894e08'              # mov [rsi+8], ecx
+                '89560c'              # mov [rsi+12], edx
+                '5e'                  # pop rsi
                 '5b'                  # pop rbx
                 'c3'                  # ret
             )
             valloc = ctypes.windll.kernel32.VirtualAlloc
+            valloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
             valloc.restype = ctypes.c_void_p
             vfree = ctypes.windll.kernel32.VirtualFree
+            vfree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+            vfree.restype = ctypes.c_int
             MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE = 0x1000, 0x2000, 0x40
             ptr = valloc(None, len(code), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
             if ptr:
@@ -262,6 +271,19 @@ def patch_image(image, segments, main, modules, relocations, *, plan=None, activ
             continue
 
         body_bytes = bytes.fromhex(site['body'])
+
+        # Load neighbor bytes from authenticated module at link time for spanned sites
+        span_info = site.get('span') or site.get('neighbor')
+        if span_info:
+            pos = span_info.get('pos')
+            nlen = span_info.get('len', 0)
+            if pos == 'after':
+                neighbor_bytes = bytes(image[end - nlen:end])
+                body_bytes = body_bytes + neighbor_bytes
+            elif pos == 'before':
+                neighbor_bytes = bytes(image[start:start + nlen])
+                body_bytes = neighbor_bytes + body_bytes
+
         if cursor - arena + len(body_bytes) + 5 > MAX_TRAMPOLINE_SIZE:
             print("ERROR: Trampoline area exceeded maximum size")
             skipped_count += 1
