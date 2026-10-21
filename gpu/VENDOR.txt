@@ -114,3 +114,6 @@ line at start-up; shader-changing ones are bits 21..23 of the shader binary vers
   1a0f5be8 (nikmparis217-ux) S# with undefined fields (anisotropy > 16x, filter mode, mip filter,
     custom border with no table): as in CTR they are clamped to the nearest defined value rather
     than replaced by a default sampler (#5137, BB_BP5137, on).
+  43e4c470 (Chris Chreece) the scheduler part only, as in CTR: every submit wait covers all
+    stages (the second one held only colour output; a third or fourth read past the array).
+    Not taken: the presenter barrier change (ufc3's presenter differs) (#5231, BB_BP5231, on).
