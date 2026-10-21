@@ -51,9 +51,10 @@ jobs:
         run: BB_ALLOW_DIRTY=1 bash scripts/package-windows.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: SacredFire-windows-x86_64-candidate
+          name: UFC3Native-windows-x86_64-candidate
           path: |
-            dist/SacredFire-windows-x86_64.zip
-            dist/SacredFire-windows-x86_64.zip.sha256
-            dist/SacredFire-windows-x86_64.zip.build.txt
+            dist/UFC3Native-windows-x86_64.zip
+            dist/UFC3Native-windows-x86_64.zip.sha256
+            dist/UFC3Native-windows-x86_64.zip.build.txt
+            out/windows/bin/*.exe
             out/windows/tests/*.exe

@@ -124,7 +124,8 @@ static int language_index_of(const wchar_t *id) {
 static const wchar_t *const managed_env[] = {
     L"BB_FULLSCREEN", L"BB_VK_VALIDATION", L"BB_FRAME_STATS", L"BB_MENU_TRACE", L"BB_GAMEPAD", L"BB_NEO",
     L"BB_READBACKS", L"BB_READBACK_LINEAR", L"BB_GPU_WRITE_TWINS", L"BB_WRITE_WINDOW", L"BB_FLIP_RATE", L"BB_VBLANK_HZ",
-    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT", L"BB_PRESENT_MODE",
+    L"BB_Z16S8_AS_D16", L"BB_PREUPLOAD", L"BB_WRITE_STEP", L"BB_COPY_GPU_BUFFERS", L"BB_FPS_LIMIT",
+    L"BB_GUEST_FPS_LIMIT", L"BB_PRESENT_MODE",
     L"BB_INTERNAL_WIDTH", L"BB_INTERNAL_HEIGHT", L"BB_WINDOW_SIZE", L"BB_USER_NAME", L"BB_SKIP_MOVIES", L"BB_SKIP_MOVIE_FILE", L"BB_FSR1", L"BB_RCAS", L"BB_RCAS_ATTENUATION",
     L"BB_LANGUAGE", L"BB_ONLINE_SERVER", L"BB_FRAME_LOG", L"BB_READBACK_LOG", L"BB_PATCHES_DIR", L"BB_PATCHES_CONFIG",
 };
@@ -935,8 +936,12 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     /* Write windows and single-stepped writes on, as on Linux (run.sh): UFC-48 made the windows
      * coherent (the heap corruption of 0.1.4 is gone). Validated on Windows 2026-10-16 (RTX 3060):
      * Career fight ~47 FPS, blood and sweat, created fighter's skin, second fight and contract
-     * without a crash. Their audit (BB_WRITE_WINDOW_DIAG) stays in the test launcher only. */
-    game_env(L"BB_WRITE_WINDOW", L"1"); game_env(L"BB_WRITE_STEP", L"1");
+     * without a crash. Since 0.1.8 the exact ranges (mode 2) no longer overwrite GPU data next to
+     * a CPU write, so mode 2 is the default here: it removes the per-frame readbacks of the
+     * Map(WRITE_DISCARD) + memcpy at guest +0x431c4f and the stores at +0x4219b8 (PR #13,
+     * validated on an RX 580 8 GB). BB_WRITE_WINDOW=1 restores the old behaviour. Their audit
+     * (BB_WRITE_WINDOW_DIAG) stays in the test launcher only. */
+    game_env(L"BB_WRITE_WINDOW", L"2"); game_env(L"BB_WRITE_STEP", L"1");
     game_env(L"BB_FLIP_RATE", L"0"); game_env(L"BB_VBLANK_HZ", L"480");
     game_env(L"BB_Z16S8_AS_D16", L"1");
     /* Pre-upload restores blood and sweat on hits (UFC-49); validated on Windows together with
@@ -959,7 +964,12 @@ static DWORD play_impl(const wchar_t *const *extra, int extra_count) {
     SetEnvironmentVariableW(L"BB_WRITE_WINDOW_DIAG", L"1");
     SetEnvironmentVariableW(L"BB_WRITE_LOG", L"0");
 #endif
-    game_env(L"BB_FPS_LIMIT", fps_limits[settings.fps_mode]);
+    /* The guest frame limit (PR #13) caps the game's own frame loop once per frame in
+     * sceGnmSubmitDone instead of holding finished frames in the flip queue as BB_FPS_LIMIT
+     * does, so the limit adds no input latency. BB_FPS_LIMIT stays at 0 (the user's environment
+     * still wins through managed_env). */
+    game_env(L"BB_GUEST_FPS_LIMIT", fps_limits[settings.fps_mode]);
+    game_env(L"BB_FPS_LIMIT", L"0");
     game_env(L"BB_PRESENT_MODE", present_modes[settings.present_mode]);
     game_env(L"BB_INTERNAL_WIDTH", resolution_w[settings.resolution]);
     game_env(L"BB_INTERNAL_HEIGHT", resolution_h[settings.resolution]);
