@@ -1,6 +1,7 @@
 # UFC 3 — native PS4 port for Linux and Windows
 
 [![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/550-ea-sports-ufc-3/)
+[![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/gnsb34)
 
 **EA SPORTS UFC 3** (PlayStation 4, `CUSA06534`, update **1.14**) running as a **native x86-64**
 program on Linux and Windows. This is not a CPU emulator: the game's original code runs directly
