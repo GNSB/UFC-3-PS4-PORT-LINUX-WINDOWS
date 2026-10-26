@@ -3,6 +3,12 @@
 [![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/550-ea-sports-ufc-3/)
 [![Support me on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20me-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/gnsb34)
 
+> **Created and maintained by Gregori Sobrevía ([GNSB](https://github.com/GNSB))** ·
+> X: [@Gnsb34](https://x.com/Gnsb34) · Support: [Ko-fi](https://ko-fi.com/gnsb34)
+>
+> Forks are welcome under GPL-2.0-or-later. Please keep this credit and the copyright notices
+> (see [`AUTHORS`](AUTHORS)) and link back to this repository.
+
 **EA SPORTS UFC 3** (PlayStation 4, `CUSA06534`, update **1.14**) running as a **native x86-64**
 program on Linux and Windows. This is not a CPU emulator: the game's original code runs directly
 on the PC's processor, a dedicated runtime replaces the PS4 system libraries, and a renderer
@@ -349,4 +355,6 @@ Detailed release notes and patch credits: [`0.1.3`](docs/ufc3/releases/0.1.3.md)
 
 ## License
 
-GPL-2.0-or-later, like bbport, SacredFire and shadPS4 (see [`LICENSE`](LICENSE)).
+Copyright (C) 2026 Gregori Sobrevía (GNSB). The UFC 3 port is GPL-2.0-or-later, like bbport,
+SacredFire and shadPS4 (see [`LICENSE`](LICENSE)); the upstream projects keep their own copyright
+notices. Authors and contributors are listed in [`AUTHORS`](AUTHORS).
