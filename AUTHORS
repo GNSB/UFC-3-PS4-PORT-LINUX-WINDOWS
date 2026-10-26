@@ -1,0 +1,29 @@
+EA SPORTS UFC 3 (PS4) native port for Linux and Windows
+https://github.com/GNSB/UFC-3-PS4-PORT-LINUX-WINDOWS
+
+Copyright (C) 2026 Gregori Sobrevía (GNSB) <https://github.com/GNSB>
+
+Author and maintainer of the UFC 3 port: Gregori Sobrevía (GNSB).
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation; either version 2 of the License, or (at your option)
+any later version. See LICENSE.
+
+Redistributions and forks must keep this notice and the copyright notices
+of the upstream projects, and must mark the files they modify (GPL-2.0,
+sections 1 and 2a).
+
+Based on, with their own copyright notices:
+- SacredFire  https://github.com/T3CHNOLOG1C/SacredFire
+- bbport      https://github.com/deadinside28/bloodborne_pc
+- shadPS4     https://github.com/shadps4-emu/shadPS4 (see gpu/VENDOR.txt)
+
+Code contributors:
+- @luscamovi  AMD (RX 9070) patches, PS4 Pro mode, career save fix,
+              90 FPS option
+- mancelli    hair, created-fighter skin, depth bias and NaN fixes
+- @SinLeeke   exact write windows and the guest frame limit (PR #13)
+- @nomadsdad  Career menu lag fix (PR #41) and Windows exit fix (PR #42)
+
+Testers and everyone who sent logs are credited in README.md.

@@ -39,3 +39,16 @@ On 3.2.2 or newer, PORTHEON updates itself when you open it.
 
 - One window for every UFC: video, gameplay and controller settings written straight into each port.
 -
+
+## Credits and license
+
+The EA SPORTS UFC 3 native port that PORTHEON is built on was created and is maintained by
+**Gregori Sobrevía ([GNSB](https://github.com/GNSB))**:
+https://github.com/GNSB/UFC-3-PS4-PORT-LINUX-WINDOWS
+
+It is based on [SacredFire](https://github.com/T3CHNOLOG1C/SacredFire),
+[bbport](https://github.com/deadinside28/bloodborne_pc) and a renderer derived from
+[shadPS4](https://github.com/shadps4-emu/shadPS4). Code contributors to the UFC 3 port and the
+upstream copyright notices are listed in [`AUTHORS`](AUTHORS).
+
+All code is GPL-2.0-or-later (see [`LICENSE`](LICENSE)).
