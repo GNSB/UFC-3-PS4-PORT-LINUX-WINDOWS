@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Native 1280x720 scene resolution on base PS4 path (BB_NEO=0) for Steam Deck (1280x800).
+     Patches the 1600x900 immediates at eboot vaddr 0x53325f / 0x533264 (file/patch addr +0x400000):
+       0x53325a  b9 80 07 00 00   mov ecx, 1920
+       0x53325f  bf 40 06 00 00   mov edi, 1600 -> 1280 (0x00000500) at 0x00933260
+       0x533264  ba 84 03 00 00   mov edx, 900  -> 720  (0x000002d0) at 0x00933265
+       0x533269  0f 45 f9         cmovne edi, ecx
+       0x53326c  b9 38 04 00 00   mov ecx, 1080
+       0x533271  0f 45 d1         cmovne edx, ecx -->
+<Patch>
+    <TitleID>
+        <ID>CUSA06534</ID>
+    </TitleID>
+    <Metadata Title="EA SPORTS UFC 3"
+              Name="Steam Deck Native 720p Scene (1280x720)"
+              Note="Renders base PS4 3D scene at native 1280x720 instead of 1600x900 (matches Steam Deck 1280x800 16:9 display)."
+              Author="steamdeck-opt"
+              PatchVer="0.1"
+              AppVer="01.14"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="bytes32" Address="0x00933260" Value="0x00000500"
+                  Signature="b9 80 07 00 00 bf 40 06 00 00 ba 84 03 00 00 0f 45 f9 b9 38 04 00 00 0f 45 d1" SignatureOffset="0x06"/>
+            <Line Type="bytes32" Address="0x00933265" Value="0x000002d0"
+                  Signature="b9 80 07 00 00 bf 40 06 00 00 ba 84 03 00 00 0f 45 f9 b9 38 04 00 00 0f 45 d1" SignatureOffset="0x0b"/>
+            <Line Type="bytes32" Address="0x009332a4" Value="0x00000500"
+                  Signature="41 c7 46 58 80 07 00 00 41 c7 46 5c 38 04 00 00" SignatureOffset="0x04"/>
+            <Line Type="bytes32" Address="0x009332ac" Value="0x000002d0"
+                  Signature="41 c7 46 58 80 07 00 00 41 c7 46 5c 38 04 00 00" SignatureOffset="0x0c"/>
+            <Line Type="bytes32" Address="0x009332d5" Value="0x00000500"
+                  Signature="41 c7 47 78 80 07 00 00 41 c7 47 7c 38 04 00 00" SignatureOffset="0x04"/>
+            <Line Type="bytes32" Address="0x009332dd" Value="0x000002d0"
+                  Signature="41 c7 47 78 80 07 00 00 41 c7 47 7c 38 04 00 00" SignatureOffset="0x0c"/>
+        </PatchList>
+    </Metadata>
+</Patch>
