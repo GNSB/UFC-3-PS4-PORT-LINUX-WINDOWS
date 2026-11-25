@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 1152x648 (90% of 720p, 16:9) 3D scene resolution + 1280x720 UI/output on base PS4 path (BB_NEO=0).
+     1152 = 0x00000480, 648 = 0x00000288, 1280 = 0x00000500, 720 = 0x000002d0. -->
+<Patch>
+    <TitleID>
+        <ID>CUSA06534</ID>
+    </TitleID>
+    <Metadata Title="EA SPORTS UFC 3"
+              Name="Steam Deck 648p Scene + 720p UI (1152x648)"
+              Note="Renders base PS4 3D scene at 1152x648 (90% of 720p) with 1280x720 UI for locked 60 FPS on Steam Deck."
+              Author="steamdeck-opt"
+              PatchVer="0.1"
+              AppVer="01.14"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <Line Type="bytes32" Address="0x00933260" Value="0x00000480"
+                  Signature="b9 80 07 00 00 bf 40 06 00 00 ba 84 03 00 00 0f 45 f9 b9 38 04 00 00 0f 45 d1" SignatureOffset="0x06"/>
+            <Line Type="bytes32" Address="0x00933265" Value="0x00000288"
+                  Signature="b9 80 07 00 00 bf 40 06 00 00 ba 84 03 00 00 0f 45 f9 b9 38 04 00 00 0f 45 d1" SignatureOffset="0x0b"/>
+            <Line Type="bytes32" Address="0x009332a4" Value="0x00000500"
+                  Signature="41 c7 46 58 80 07 00 00 41 c7 46 5c 38 04 00 00" SignatureOffset="0x04"/>
+            <Line Type="bytes32" Address="0x009332ac" Value="0x000002d0"
+                  Signature="41 c7 46 58 80 07 00 00 41 c7 46 5c 38 04 00 00" SignatureOffset="0x0c"/>
+            <Line Type="bytes32" Address="0x009332d5" Value="0x00000500"
+                  Signature="41 c7 47 78 80 07 00 00 41 c7 47 7c 38 04 00 00" SignatureOffset="0x04"/>
+            <Line Type="bytes32" Address="0x009332dd" Value="0x000002d0"
+                  Signature="41 c7 47 78 80 07 00 00 41 c7 47 7c 38 04 00 00" SignatureOffset="0x0c"/>
+        </PatchList>
+    </Metadata>
+</Patch>
